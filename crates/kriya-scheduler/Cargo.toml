@@ -1,0 +1,12 @@
+[package]
+name = "kriya-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kriya-core = { path = "../kriya-core" }
+kriya-kv = { path = "../kriya-kv" }
+thiserror.workspace = true
+serde.workspace = true
+bytemuck.workspace = true

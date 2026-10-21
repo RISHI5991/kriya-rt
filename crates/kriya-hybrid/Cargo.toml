@@ -1,0 +1,10 @@
+[package]
+name = "kriya-hybrid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kriya-core = { path = "../kriya-core" }
+thiserror.workspace = true
+serde.workspace = true

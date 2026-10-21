@@ -1,0 +1,22 @@
+# Rust
+target/
+**/*.rs.bak
+Cargo.lock.orig
+
+# macOS
+.DS_Store
+*.metalair
+*.air
+
+# Build artifacts
+*.dylib
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Temp
+/tmp/
+temp/
