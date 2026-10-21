@@ -1,0 +1,3 @@
+# KriyaRT is Mac-only (Apple Silicon Metal). Default target is aarch64-apple-darwin.
+[build]
+target = "aarch64-apple-darwin"
