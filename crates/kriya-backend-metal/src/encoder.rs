@@ -1054,8 +1054,9 @@ impl MetalExecutor {
             let tgp_count = n.div_ceil(4) as u64;
             encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
         } else {
-            // Route M > 1 batches directly to the Metal 3.1 `simdgroup_float8x8` hardware matrix kernel!
-            let pso = pipeline_cache.get_or_compile("q4_g64_simdgroup_matrix_gemm")?;
+            // Route M > 1 batches to the threadgroup-tiled prefill GEMM kernel
+            // (verified against CPU reference; simdgroup_matrix variant has known transposition bugs)
+            let pso = pipeline_cache.get_or_compile("q4_g64_prefill_gemm")?;
             encoder.set_compute_pipeline_state(&pso);
             encoder.set_buffer(0, Some(weight_buf), 0);
             encoder.set_buffer(1, Some(input_buf), input_byte_offset);
@@ -1065,8 +1066,8 @@ impl MetalExecutor {
                 std::mem::size_of::<GemmParams>() as u64,
                 &params as *const _ as *const _,
             );
-            let grid = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(32) as u64, 1);
-            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+            let grid = MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
+            encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
         }
         Ok(())
     }
