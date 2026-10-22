@@ -427,6 +427,7 @@ fn test_bsr_paged_gqa_real_dimensions() {
             head_dim: D as u32,
             block_size_tokens: BLOCK_SZ,
             max_split_k_tiles: 1,
+            max_query_tokens: 1,
             sm_scale,
             logit_softcap: 0.0,
         };
@@ -734,19 +735,16 @@ fn test_prefill_batch_matches_token_by_token() {
     let mut kv_mgr_batch = PagedKvCacheManager::new(64, 32, 16);
     kv_mgr_batch.allocate_sequence(1, &[1, 2, 3]).unwrap();
 
-    // Build per-token prefix plans and keep them alive
-    let mut plan_storage = Vec::new();
-    for pos in 1..=3u32 {
-        let p = kv_mgr_batch.build_prefix_schedule_plan(1, pos, 16).unwrap();
-        plan_storage.push(p);
-    }
-    let plan_refs: Vec<&kriya_kv::bsr_paged::FlashInferSchedulePlan> = plan_storage.iter().collect();
+    // Build a single parallel prefill layout for the entire chunk
+    let prefix_plan = kv_mgr_batch
+        .build_parallel_prefill_layout(1, 3, 16)
+        .unwrap();
 
     let positions = vec![0u32, 1, 2];
     let tokens = vec![1u32, 2, 3];
 
     let tok_batch = executor2
-        .forward_prefill_batch(&desc, &tokens, &positions, &plan_refs, samp_cfg)
+        .forward_prefill_batch(&desc, &tokens, &positions, &prefix_plan, samp_cfg)
         .unwrap();
 
     // Batched result should match the last token-by-token result

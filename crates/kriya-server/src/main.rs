@@ -166,68 +166,57 @@ impl EngineRuntime {
             let req_tokens = &batch.selective_batch.flattened_input_tokens
                 [*tok_offset..(*tok_offset + *num_toks)];
 
-            // Prefill chunk (multiple tokens): batch into a single GPU command buffer.
-            // This eliminates N command-buffer round-trips for an N-token prefill chunk.
+            // Prefill chunk (multiple tokens): batch into a single GPU command buffer
+            // using parallel 2D causal attention. This eliminates N command-buffer
+            // round-trips for an N-token prefill chunk.
             if req_tokens.len() > 1 {
-                // Build per-token prefix schedule plans for causal attention.
-                let mut prefix_plan_storage: Vec<kriya_kv::bsr_paged::FlashInferSchedulePlan> = Vec::new();
-                let mut request_failed = false;
-
-                for (token_idx, _) in req_tokens.iter().enumerate() {
-                    let position = (start_pos + token_idx) as u32;
-                    let plan = self
-                        .scheduler
-                        .kv_manager
-                        .build_prefix_schedule_plan(
-                            *req_id,
-                            position + 1,
-                            self.scheduler.max_blocks_per_cta,
-                        );
-                    match plan {
-                        Ok(p) => {
-                            prefix_plan_storage.push(p);
-                        }
-                        Err(err) => {
-                            eprintln!("KriyaRT request {req_id} failed: {err}");
-                            let _ = self.scheduler.abort_request(*req_id);
-                            active_streams.remove(req_id);
-                            request_failed = true;
-                            break;
-                        }
+                // Build a single parallel prefill layout for the entire chunk,
+                // where each query token attends causally to its own prefix.
+                let prefix_plan = self
+                    .scheduler
+                    .kv_manager
+                    .build_parallel_prefill_layout(
+                        *req_id,
+                        req_tokens.len() as u32,
+                        self.scheduler.max_blocks_per_cta,
+                    );
+                let prefix_plan = match prefix_plan {
+                    Ok(p) => p,
+                    Err(err) => {
+                        eprintln!("KriyaRT request {req_id} failed: {err}");
+                        let _ = self.scheduler.abort_request(*req_id);
+                        active_streams.remove(req_id);
+                        continue;
                     }
-                }
+                };
 
-                if !request_failed {
-                    let prefix_plans: Vec<&kriya_kv::bsr_paged::FlashInferSchedulePlan> =
-                        prefix_plan_storage.iter().collect();
-                    let positions: Vec<u32> = req_tokens
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| (start_pos + i) as u32)
-                        .collect();
-                    let samp_cfg = SamplingConfig {
-                        vocab_size: self.descriptor.vocab_size,
-                        greedy: u32::from(temp <= 1e-5),
-                        temperature: temp,
-                        top_p: 0.95,
-                        top_k: 50,
-                        rng_seed: (*req_id as u32).wrapping_add(start_pos as u32),
-                    };
-                    match self.executor.forward_prefill_batch(
-                        &self.descriptor,
-                        req_tokens,
-                        &positions,
-                        &prefix_plans,
-                        samp_cfg,
-                    ) {
-                        Ok(target_tok) => {
-                            primary_outputs.push((*req_id, target_tok));
-                        }
-                        Err(err) => {
-                            eprintln!("KriyaRT prefill batch failed for request {req_id}: {err}");
-                            let _ = self.scheduler.abort_request(*req_id);
-                            active_streams.remove(req_id);
-                        }
+                let positions: Vec<u32> = req_tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| (start_pos + i) as u32)
+                    .collect();
+                let samp_cfg = SamplingConfig {
+                    vocab_size: self.descriptor.vocab_size,
+                    greedy: u32::from(temp <= 1e-5),
+                    temperature: temp,
+                    top_p: 0.95,
+                    top_k: 50,
+                    rng_seed: (*req_id as u32).wrapping_add(start_pos as u32),
+                };
+                match self.executor.forward_prefill_batch(
+                    &self.descriptor,
+                    req_tokens,
+                    &positions,
+                    &prefix_plan,
+                    samp_cfg,
+                ) {
+                    Ok(target_tok) => {
+                        primary_outputs.push((*req_id, target_tok));
+                    }
+                    Err(err) => {
+                        eprintln!("KriyaRT prefill batch failed for request {req_id}: {err}");
+                        let _ = self.scheduler.abort_request(*req_id);
+                        active_streams.remove(req_id);
                     }
                 }
                 continue;
@@ -343,65 +332,58 @@ impl EngineRuntime {
                     &topology,
                     &mut self.draft_rng,
                 ) {
-                    Ok(Some(accepted)) if !accepted.is_empty() => {
-                        speculative_work.push((req_id, accepted));
+                    Ok(Some((accepted, accepted_node_indices))) if !accepted.is_empty() => {
+                        // Collect (tree_node_idx, phys_blk_id, slot_in_blk) for each accepted bonus token
+                        let mut accepted_nodes: Vec<(u32, u32, u32)> = Vec::new();
+                        let Some((tx, _temp, mut pos)) = active_streams.get(&req_id).cloned() else {
+                            continue;
+                        };
+
+                        for (accepted_count, &bonus_tok) in accepted.iter().enumerate() {
+                            // Stream the accepted speculative token to the client
+                            let _ = tx.send(bonus_tok);
+                            self.total_tokens_emitted += 1;
+
+                            // Allocate a KV cache slot for this bonus token
+                            let _ = self
+                                .scheduler
+                                .kv_manager
+                                .append_token_slot(req_id);
+
+                            // Get the physical block and slot for this position
+                            let cache_pos = pos as u32;
+                            if let Ok((phys_blk_id, slot_in_blk)) = self
+                                .scheduler
+                                .kv_manager
+                                .block_for_position(req_id, cache_pos)
+                            {
+                                let tree_node_idx =
+                                    accepted_node_indices.get(accepted_count).copied().unwrap_or(0);
+                                accepted_nodes
+                                    .push((tree_node_idx, phys_blk_id, slot_in_blk));
+                            }
+
+                            pos += 1;
+                        }
+
+                        // Commit all accepted bonus tokens' K/V to the cache in one batch
+                        // (no redundant full forward passes per token)
+                        if !accepted_nodes.is_empty() {
+                            let _ = self.executor.commit_speculative_kv(
+                                &self.descriptor,
+                                &accepted_nodes,
+                            );
+                        }
+
+                        active_streams.get_mut(&req_id).map(|s| s.2 = pos);
+
+                        // Record bonus tokens in the scheduler's request state
+                        let _ = self
+                            .scheduler
+                            .commit_speculative_bonus_tokens(req_id, &accepted);
                     }
                     _ => {}
                 }
-            }
-
-            // Emit accepted bonus tokens and populate their KV cache entries
-            for (req_id, bonus_tokens) in speculative_work {
-                let Some((tx, temp, pos)) = active_streams.get(&req_id) else {
-                    continue;
-                };
-                let tx = tx.clone();
-                let temp = *temp;
-                let mut pos = *pos;
-
-                for &bonus_tok in &bonus_tokens {
-                    // Stream the accepted speculative token to the client
-                    let _ = tx.send(bonus_tok);
-                    self.total_tokens_emitted += 1;
-
-                    // Populate the KV cache for this bonus token so future
-                    // decode steps have the correct causal context.
-                    let prefix_plan = self
-                        .scheduler
-                        .kv_manager
-                        .build_prefix_schedule_plan(
-                            req_id,
-                            (pos + 1) as u32,
-                            self.scheduler.max_blocks_per_cta,
-                        );
-
-                    if let Ok(plan) = prefix_plan {
-                        let samp_cfg = SamplingConfig {
-                            vocab_size: self.descriptor.vocab_size,
-                            greedy: u32::from(temp <= 1e-5),
-                            temperature: temp,
-                            top_p: 0.95,
-                            top_k: 50,
-                            rng_seed: (req_id as u32).wrapping_add(pos as u32),
-                        };
-                        let _ = self.executor.forward_and_sample(
-                            &self.descriptor,
-                            &plan,
-                            &[bonus_tok],
-                            &[pos as u32],
-                            samp_cfg,
-                        );
-                    }
-
-                    pos += 1;
-                }
-
-                active_streams.get_mut(&req_id).map(|s| s.2 = pos);
-
-                // Record bonus tokens in the scheduler's request state
-                let _ = self
-                    .scheduler
-                    .commit_speculative_bonus_tokens(req_id, &bonus_tokens);
             }
         }
 

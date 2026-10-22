@@ -376,6 +376,7 @@ fn test_paged_attention_matches_cpu_reference_on_metal() {
         head_dim: D as u32,
         block_size_tokens: 16,
         max_split_k_tiles: 1,
+        max_query_tokens: 1,
         sm_scale: 1.0 / (D as f32).sqrt(),
         logit_softcap: 0.0,
     };

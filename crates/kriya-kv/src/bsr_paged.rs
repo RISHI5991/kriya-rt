@@ -449,6 +449,26 @@ impl PagedKvCacheManager {
         self.sequences.contains_key(&seq_id)
     }
 
+    /// Returns the (physical_block_id, slot_in_block) for a given sequence position.
+    /// Used by speculative decoding to commit accepted bonus tokens' K/V to the cache.
+    pub fn block_for_position(
+        &self,
+        seq_id: u64,
+        position: u32,
+    ) -> Result<(u32, u32), KvCacheError> {
+        let seq = self
+            .sequences
+            .get(&seq_id)
+            .ok_or(KvCacheError::InvalidSequenceId(seq_id))?;
+        let blk_sz = self.gpu_allocator.block_size_tokens() as usize;
+        let blk_idx = position as usize / blk_sz;
+        let slot_in_blk = position as usize % blk_sz;
+        if blk_idx >= seq.logical_blocks.len() {
+            return Err(KvCacheError::InvalidSequenceId(seq_id));
+        }
+        Ok((seq.logical_blocks[blk_idx], slot_in_blk as u32))
+    }
+
     /// Inspector-Executor `plan()` stage: builds the unified BSR page table and partitions
     /// long sequences into balanced `CtaWorkTile` chunks reusable across all attention layers.
     pub fn build_schedule_plan(
@@ -556,6 +576,81 @@ impl PagedKvCacheManager {
             },
             cta_work_tiles,
             max_blocks_per_cta: max_blk_cta,
+        })
+    }
+
+    /// Builds a parallel 2D causal prefill layout for a single sequence.
+    ///
+    /// Unlike `build_prefix_schedule_plan` (which builds a plan for one prefix length),
+    /// this builds a layout where every query token position has its own causal prefix.
+    ///
+    /// - `page_indptr[i]` = cumulative blocks needed for positions 0..i-1 (length M+1)
+    /// - `page_indices` = all block IDs for the full sequence
+    /// - `last_page_len[i]` = valid tokens in the last page for position i (causal clamp)
+    ///
+    /// This enables the `bsr_paged_gqa_prefill_stage1` kernel to process all M query
+    /// tokens in a single GPU dispatch instead of M sequential dispatches.
+    pub fn build_parallel_prefill_layout(
+        &self,
+        seq_id: u64,
+        num_tokens: u32,
+        max_blocks_per_cta: u32,
+    ) -> Result<FlashInferSchedulePlan, KvCacheError> {
+        let blk_sz = self.gpu_allocator.block_size_tokens();
+        let seq = self
+            .sequences
+            .get(&seq_id)
+            .ok_or(KvCacheError::InvalidSequenceId(seq_id))?;
+
+        if num_tokens == 0 || num_tokens > seq.total_tokens {
+            return Err(KvCacheError::InvalidSequenceId(seq_id));
+        }
+
+        // page_indptr: cumulative blocks per position
+        // page_indptr[0] = 0
+        // page_indptr[i+1] = ceil((i+1) / blk_sz) blocks needed for positions 0..i
+        let mut page_indptr = Vec::with_capacity(num_tokens as usize + 1);
+        page_indptr.push(0);
+        for i in 0..num_tokens {
+            let blocks_needed = ((i + 1) as u32).div_ceil(blk_sz);
+            page_indptr.push(blocks_needed as i32);
+        }
+
+        // page_indices: all block IDs for the full sequence
+        let page_indices: Vec<i32> = seq
+            .logical_blocks
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+
+        // last_page_len: valid tokens in last page per position (causal clamp)
+        let mut last_page_len = Vec::with_capacity(num_tokens as usize);
+        for i in 0..num_tokens {
+            let valid = ((i as u32) % blk_sz) + 1;
+            last_page_len.push(valid as i32);
+        }
+
+        // CTA work tiles: one per query token
+        let mut cta_work_tiles = Vec::new();
+        for i in 0..num_tokens {
+            let blocks_for_pos = ((i + 1) as u32).div_ceil(blk_sz);
+            let is_split_k = u32::from(blocks_for_pos > max_blocks_per_cta);
+            cta_work_tiles.push(CtaWorkTile {
+                request_idx: 0,
+                kv_block_start: 0,
+                kv_block_count: blocks_for_pos,
+                is_split_k,
+            });
+        }
+
+        Ok(FlashInferSchedulePlan {
+            bsr_layout: BsrKvLayout {
+                page_indptr,
+                page_indices,
+                last_page_len,
+            },
+            cta_work_tiles,
+            max_blocks_per_cta,
         })
     }
 }

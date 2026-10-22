@@ -29,6 +29,7 @@ struct BsrGqaParams {
     uint head_dim;              // e.g., 128
     uint block_size_tokens;     // e.g., 16 tokens per physical KV block
     uint max_split_k_tiles;     // Maximum split-K tiles per request for scratch indexing
+    uint max_query_tokens;      // Maximum query tokens in prefill batch (for bounds check)
     float sm_scale;             // 1.0 / sqrt(head_dim)
     float logit_softcap;        // > 0.0 if soft-capping enabled (e.g., Gemma), else 0.0
 };
@@ -316,6 +317,140 @@ kernel void bsr_paged_gqa_decode_stage1(
         }
         if (lane_id == 0u) {
             partial_lse[lse_idx] = m_i + log(max(l_i, 1e-12f));
+        }
+    }
+}
+
+// ============================================================================
+// 3b. FlashInfer BSR Paged GQA Prefill (Parallel 2D Causal Attention)
+// ============================================================================
+
+/// Parallel 2D causal prefill attention: processes ALL M query tokens concurrently.
+/// Each query token at position `q_pos` attends causally to keys at positions 0..=q_pos.
+/// Grid: tgp_id.x = query token (0..M-1), tgp_id.y = KV head index.
+/// Within threadgroup: simd_id handles GQA ratio, lane_id handles head_dim chunks.
+/// Uses shared-KV loading: K/V loaded once per KV head, shared across GQA query heads.
+/// Causal mask enforced per query token: only attends to keys at positions <= q_pos.
+kernel void bsr_paged_gqa_prefill_stage1(
+    device const ushort*           q_in            [[buffer(0)]], // [M, num_q_heads, head_dim]
+    device const ushort*           kv_cache_k      [[buffer(1)]], // [num_blocks, block_sz, num_kv_heads, head_dim]
+    device const ushort*           kv_cache_v      [[buffer(2)]], // [num_blocks, block_sz, num_kv_heads, head_dim]
+    device const int*              page_indptr     [[buffer(3)]], // [M + 1] block boundaries per query position
+    device const int*              page_indices    [[buffer(4)]], // [total_blocks]
+    device const int*              last_page_len   [[buffer(5)]], // [M] valid tokens in last page per position
+    device const CtaWorkTile*      cta_tiles       [[buffer(6)]], // [num_cta_tiles] split-K work tiles
+    device const uint*             tile_split_idx  [[buffer(7)]], // [num_cta_tiles]
+    device ushort*                 final_out       [[buffer(8)]], // [M, num_q_heads, head_dim]
+    device float*                  partial_out     [[buffer(9)]], // [M, num_q_heads, max_split_k, head_dim]
+    device float*                  partial_lse     [[buffer(10)]],// [M, num_q_heads, max_split_k]
+    constant BsrGqaParams&         params          [[buffer(11)]],
+    uint3                          tgp_id          [[threadgroup_position_in_grid]],
+    uint                           simd_id         [[simdgroup_index_in_threadgroup]],
+    uint                           lane_id         [[thread_index_in_simdgroup]]
+) {
+    const uint q_pos   = tgp_id.x; // Query token position (0..M-1)
+    const uint kv_head = tgp_id.y; // KV head index
+    const uint gqa_ratio = params.num_q_heads / params.num_kv_heads;
+    const uint D         = params.head_dim;
+
+    if (simd_id >= gqa_ratio) return;
+    if (q_pos >= params.max_query_tokens) return;
+    const uint q_head = kv_head * gqa_ratio + simd_id;
+
+    threadgroup float shared_k[256];
+    threadgroup float shared_v[256];
+
+    const uint q_base = (q_pos * params.num_q_heads + q_head) * D;
+
+    float q_reg[8];
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        uint d = lane_id * 8u + i;
+        q_reg[i] = (d < D) ? (bf16_to_f32(q_in[q_base + d]) * params.sm_scale) : 0.0f;
+    }
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    const int req_page_start = page_indptr[q_pos];
+    const int req_page_end   = page_indptr[q_pos + 1];
+    const uint total_req_blocks = uint(max(req_page_end - req_page_start, 0));
+
+    // Determine block range for this CTA tile (supports Split-K for long contexts)
+    const uint tile_idx = 0; // Single tile per query token for prefill (no split-K by default)
+    const uint blk_start = 0;
+    const uint blk_end = total_req_blocks;
+
+    for (uint log_blk = blk_start; log_blk < blk_end; ++log_blk) {
+        const uint phys_blk = uint(page_indices[req_page_start + int(log_blk)]);
+        const uint valid_tokens = (log_blk + 1u == total_req_blocks)
+            ? uint(max(last_page_len[q_pos], 1))
+            : params.block_size_tokens;
+
+        // CAUSAL MASK: query at position q_pos can only attend to keys at positions <= q_pos
+        // For the last (partial) block, clamp to q_pos % block_size_tokens + 1
+        const uint max_causal_tok = (log_blk + 1u == total_req_blocks)
+            ? (q_pos % params.block_size_tokens) + 1u
+            : params.block_size_tokens;
+        const uint actual_valid = min(valid_tokens, max_causal_tok);
+
+        for (uint tok = 0u; tok < actual_valid; ++tok) {
+            const uint kv_offset = ((phys_blk * params.block_size_tokens + tok) * params.num_kv_heads + kv_head) * D;
+
+            if (simd_id == 0u) {
+                #pragma unroll
+                for (uint i = 0u; i < 8u; ++i) {
+                    uint d = lane_id * 8u + i;
+                    if (d < D) {
+                        shared_k[d] = bf16_to_f32(kv_cache_k[kv_offset + d]);
+                        shared_v[d] = bf16_to_f32(kv_cache_v[kv_offset + d]);
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float partial_dot = 0.0f;
+            #pragma unroll
+            for (uint i = 0u; i < 8u; ++i) {
+                uint d = lane_id * 8u + i;
+                if (d < D) {
+                    partial_dot = fma(q_reg[i], shared_k[d], partial_dot);
+                }
+            }
+
+            float score = simd_sum(partial_dot);
+
+            if (params.logit_softcap > 0.0f) {
+                score = safe_tanh(score / params.logit_softcap) * params.logit_softcap;
+            }
+
+            float m_new = max(m_i, score);
+            float alpha = exp(clamp(m_i - m_new, -80.0f, 0.0f));
+            float beta  = exp(clamp(score - m_new, -80.0f, 0.0f));
+
+            l_i = fma(l_i, alpha, beta);
+            #pragma unroll
+            for (uint i = 0u; i < 8u; ++i) {
+                uint d = lane_id * 8u + i;
+                if (d < D) {
+                    out_acc[i] = fma(out_acc[i], alpha, beta * shared_v[d]);
+                }
+            }
+
+            m_i = m_new;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const float inv_l = 1.0f / max(l_i, 1e-12f);
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        uint d = lane_id * 8u + i;
+        if (d < D) {
+            final_out[q_base + d] = f32_to_bf16(out_acc[i] * inv_l);
         }
     }
 }

@@ -123,6 +123,7 @@ pub struct BsrGqaParams {
     pub head_dim: u32,
     pub block_size_tokens: u32,
     pub max_split_k_tiles: u32,
+    pub max_query_tokens: u32,
     pub sm_scale: f32,
     pub logit_softcap: f32,
 }
@@ -797,6 +798,14 @@ pub struct MetalExecutor {
     pub logits_buf: Buffer,
     pub sampled_token_buf: Buffer,
     pub block_size_tokens: u32,
+    /// Pre-allocated Split-K splits buffer (avoids synchronous Mach IPC in hot loop).
+    pub split_k_splits_buf: Buffer,
+    /// Tree node K/V commit buffers for speculative decoding:
+    /// [num_layers, max_tree_nodes, num_kv_heads, head_dim] in BF16.
+    /// Stores K/V for each draft tree node so accepted tokens can be
+    /// committed to the KV cache without re-running the full forward pass.
+    pub tree_k_buf: Buffer,
+    pub tree_v_buf: Buffer,
 }
 
 impl MetalExecutor {
@@ -863,6 +872,7 @@ impl MetalExecutor {
             "moe_combine_routed_and_shared_bf16",
             "fused_qknorm_rope_and_kv_append",
             "bsr_paged_gqa_decode_stage1",
+            "bsr_paged_gqa_prefill_stage1",
             "bsr_paged_gqa_split_k_reduce",
             "bsr_paged_gqa_tree_verify",
             "gated_deltanet_recurrent_step",
@@ -895,47 +905,59 @@ impl MetalExecutor {
         // unified-memory machine.
         let max_batch_toks = (descriptor.phase_policy.prefill_chunk_size as usize).max(1);
         let h = descriptor.hidden_size as usize;
-        let (max_q_dim, max_inter_dim, max_k_experts) = descriptor.layers.iter().fold(
-            (h, h, 1usize),
-            |(q_dim, inter_dim, active_experts), layer| {
-                let layer_q_dim = match layer.seq_mixer {
-                    SequenceMixerDescriptor::GroupedQueryAttention {
-                        num_q_heads,
-                        head_dim,
-                        ..
-                    } => (num_q_heads as usize) * (head_dim as usize),
-                    SequenceMixerDescriptor::GatedDeltaNetRecurrence {
-                        num_heads,
-                        head_key_dim,
-                        head_val_dim,
-                        ..
-                    } => {
-                        (num_heads as usize)
-                            * ((head_key_dim as usize) * 2 + (head_val_dim as usize))
-                    }
-                };
-                let (layer_inter_dim, layer_active_experts) = match layer.channel_mixer {
-                    ChannelMixerDescriptor::DenseMlp {
-                        intermediate_size, ..
-                    } => (intermediate_size as usize, 1),
-                    ChannelMixerDescriptor::SparseMoE {
-                        expert_intermediate_size,
-                        shared_expert_intermediate_size,
-                        num_active_experts,
-                        ..
-                    } => (
-                        (expert_intermediate_size as usize)
-                            .max(shared_expert_intermediate_size.unwrap_or(0) as usize),
-                        num_active_experts as usize,
-                    ),
-                };
-                (
-                    q_dim.max(layer_q_dim),
-                    inter_dim.max(layer_inter_dim),
-                    active_experts.max(layer_active_experts),
-                )
-            },
-        );
+        let (max_q_dim, max_inter_dim, max_k_experts, max_kv_heads, max_head_dim) =
+            descriptor.layers.iter().fold(
+                (h, h, 1usize, 1usize, h),
+                |(q_dim, inter_dim, active_experts, kv_heads, head_dim), layer| {
+                    let layer_q_dim = match layer.seq_mixer {
+                        SequenceMixerDescriptor::GroupedQueryAttention {
+                            num_q_heads,
+                            head_dim: hd,
+                            num_kv_heads,
+                            ..
+                        } => (
+                            (num_q_heads as usize) * (hd as usize),
+                            (hd as usize),
+                            (num_kv_heads as usize),
+                        ),
+                        SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                            num_heads,
+                            head_key_dim,
+                            head_val_dim,
+                            ..
+                        } => {
+                            (
+                                (num_heads as usize)
+                                    * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
+                                head_key_dim as usize,
+                                num_heads as usize,
+                            )
+                        }
+                    };
+                    let (layer_inter_dim, layer_active_experts) = match layer.channel_mixer {
+                        ChannelMixerDescriptor::DenseMlp {
+                            intermediate_size, ..
+                        } => (intermediate_size as usize, 1),
+                        ChannelMixerDescriptor::SparseMoE {
+                            expert_intermediate_size,
+                            shared_expert_intermediate_size,
+                            num_active_experts,
+                            ..
+                        } => (
+                            (expert_intermediate_size as usize)
+                                .max(shared_expert_intermediate_size.unwrap_or(0) as usize),
+                            num_active_experts as usize,
+                        ),
+                    };
+                    (
+                        q_dim.max(layer_q_dim.0),
+                        inter_dim.max(layer_inter_dim),
+                        active_experts.max(layer_active_experts),
+                        kv_heads.max(layer_q_dim.2),
+                        head_dim.max(layer_q_dim.1),
+                    )
+                },
+            );
         let vocab_capped = descriptor.vocab_size as usize;
         let num_layers = descriptor.layers.len().max(1);
 
@@ -1006,12 +1028,17 @@ impl MetalExecutor {
             partial_attn_out_buf: alloc(32 * 16 * 128 * 4),
             partial_attn_lse_buf: alloc(32 * 16 * 4),
             tile_split_idx_buf,
+            split_k_splits_buf: alloc(16 * 4),
             recurrent_state_buf: alloc(deltanet_state_bytes),
             alpha_decay_buf,
             beta_lr_buf,
             logits_buf: alloc(max_batch_toks * vocab_capped * 2),
             sampled_token_buf: alloc(16),
             block_size_tokens,
+            // Tree node K/V commit buffers for speculative decoding
+            // Layout: [num_layers, max_tree_nodes, max_q_dim] in BF16
+            tree_k_buf: alloc(num_layers * 16 * max_q_dim * 2),
+            tree_v_buf: alloc(num_layers * 16 * max_q_dim * 2),
         })
     }
 
@@ -1500,6 +1527,40 @@ impl MetalExecutor {
                         MTLSize::new(32 * gqa_ratio, 1, 1),
                     );
 
+                    // Write K/V for each tree node to commit buffers (for speculative KV commit)
+                    // Tree node n is at position base_pos + n in the accepted path.
+                    // Buffer layout: [num_layers, 16, max_q_dim] BF16
+                    let kv_dim = num_kv_heads * head_dim;
+                    let max_q_dim = descriptor.layers.iter().map(|l| match l.seq_mixer {
+                        SequenceMixerDescriptor::GroupedQueryAttention {
+                            num_q_heads, head_dim, ..
+                        } => (num_q_heads as usize) * (head_dim as usize),
+                        SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                            num_heads, head_key_dim, head_val_dim, ..
+                        } => (num_heads as usize) * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
+                    }).max().unwrap_or(h as usize);
+                    let layer_tree_offset = l_idx * 16 * max_q_dim * 2;
+                    let node_stride = max_q_dim * 2;
+                    for n in 0..num_tree_nodes {
+                        let src_k = self.k_buf.contents() as *const u8;
+                        let src_v = self.v_buf.contents() as *const u8;
+                        let dst_k = self.tree_k_buf.contents() as *mut u8;
+                        let dst_v = self.tree_v_buf.contents() as *mut u8;
+                        let node_bytes = (kv_dim as usize) * 2;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src_k.add(n * node_bytes),
+                                dst_k.add(layer_tree_offset + n * node_stride),
+                                node_bytes,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                src_v.add(n * node_bytes),
+                                dst_v.add(layer_tree_offset + n * node_stride),
+                                node_bytes,
+                            );
+                        }
+                    }
+
                     // O projection
                     Self::encode_q4_linear(
                         &mut self.pipeline_cache,
@@ -1735,6 +1796,76 @@ impl MetalExecutor {
         Ok((all_logits, target_features))
     }
 
+    /// Commits accepted speculative tokens' K/V to the KV cache without re-running
+    /// the full forward pass. K/V for each tree node was already computed during
+    /// `forward_tree_logits` and stored in `tree_k_buf` / `tree_v_buf`.
+    ///
+    /// `accepted_nodes` is a list of (tree_node_idx, phys_blk_id, slot_in_blk) tuples
+    /// for each accepted bonus token, computed by the server via
+    /// `PagedKvCacheManager::append_token_slot` and `block_for_position`.
+    pub fn commit_speculative_kv(
+        &mut self,
+        descriptor: &ModelArchDescriptor,
+        accepted_nodes: &[(u32, u32, u32)], // (tree_node_idx, phys_blk_id, slot_in_blk)
+    ) -> Result<(), MetalError> {
+        let num_layers = descriptor.layers.len();
+        let h = descriptor.hidden_size as usize;
+        let max_q_dim = descriptor.layers.iter().map(|l| match l.seq_mixer {
+            SequenceMixerDescriptor::GroupedQueryAttention {
+                num_q_heads, head_dim, ..
+            } => (num_q_heads as usize) * (head_dim as usize),
+            SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                num_heads, head_key_dim, head_val_dim, ..
+            } => (num_heads as usize) * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
+        }).max().unwrap_or(h);
+
+        for &(node_idx, phys_blk_id, slot_in_blk) in accepted_nodes {
+            for l_idx in 0..num_layers {
+                let layer = &descriptor.layers[l_idx];
+                let (num_kv_heads, head_dim) = match layer.seq_mixer {
+                    SequenceMixerDescriptor::GroupedQueryAttention {
+                        num_kv_heads, head_dim, ..
+                    } => (num_kv_heads as usize, head_dim as usize),
+                    SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                        num_heads, head_key_dim, ..
+                    } => (num_heads as usize, head_key_dim as usize),
+                };
+                let kv_dim = num_kv_heads * head_dim;
+                let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
+
+                // Offset into KV cache for this (block, slot)
+                let kv_offset = ((phys_blk_id as usize
+                    * self.block_size_tokens as usize
+                    + slot_in_blk as usize)
+                    * kv_dim)
+                    * 2;
+
+                // Offset into tree buffer for this (layer, node)
+                let tree_offset = (l_idx * 16 + node_idx as usize) * max_q_dim * 2;
+                let node_bytes = kv_dim * 2;
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.tree_k_buf.contents().add(tree_offset),
+                        self.kv_cache_k_buf
+                            .contents()
+                            .add(layer_kv_offset as usize + kv_offset),
+                        node_bytes,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        self.tree_v_buf.contents().add(tree_offset),
+                        self.kv_cache_v_buf
+                            .contents()
+                            .add(layer_kv_offset as usize + kv_offset),
+                        node_bytes,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Executes one EAGLE speculative decode iteration:
     /// 1. Builds a draft tree from the current token and hidden feature
     /// 2. Verifies the tree against the target model in a single GPU pass
@@ -1752,7 +1883,7 @@ impl MetalExecutor {
         root_feature: &[f32],
         topology: &kriya_speculate::eagle_medusa::DraftTreeTopology,
         rng: &mut kriya_speculate::eagle_medusa::DeterministicRng,
-    ) -> Result<Option<Vec<u32>>, MetalError> {
+    ) -> Result<Option<(Vec<u32>, Vec<u32>)>, MetalError> {
         // Build the draft tree on CPU
         let tree = match draft_engine.build_draft_tree(root_token_id, root_feature, topology) {
             Ok(t) => t,
@@ -1785,25 +1916,30 @@ impl MetalExecutor {
         // would make the verification circular and meaningless.
 
         // Apply EAGLE acceptance rule
-        let (accepted_tokens, _accepted_features) = draft_engine
+        let (accepted_tokens, accepted_node_indices, _accepted_features) = draft_engine
             .verify_draft_tree_recursive(&tree, &target_probs, &target_features, rng)
             .map_err(|e| MetalError::UnsupportedProductionConfiguration(e.to_string()))?;
+        let accepted_node_indices: Vec<u32> = accepted_node_indices
+            .into_iter()
+            .map(|n| n as u32)
+            .collect();
 
-        Ok(Some(accepted_tokens))
+        Ok(Some((accepted_tokens, accepted_node_indices)))
     }
 
     /// Executes a prefill chunk: processes ALL tokens in a single command buffer submission,
     /// writing KV for every token and computing attention + sampling only for the last token.
-    /// This eliminates N GPU round-trips for an N-token prefill chunk.
+    /// This eliminates N GPU round-trips for an N-token prefill chunk by using a parallel
+    /// 2D causal attention kernel (bsr_paged_gqa_prefill_stage1).
     ///
-    /// `prefix_plans[i]` must be a `FlashInferSchedulePlan` built for the causal prefix
-    /// ending at token `i` (i.e., `build_prefix_schedule_plan(req_id, i+1, ...)`).
+    /// `prefix_plan` must be a `FlashInferSchedulePlan` built by
+    /// `PagedKvCacheManager::build_parallel_prefill_layout` for the full sequence.
     pub fn forward_prefill_batch(
         &mut self,
         descriptor: &ModelArchDescriptor,
         input_tokens: &[u32],
         seq_positions: &[u32],
-        prefix_plans: &[&FlashInferSchedulePlan],
+        prefix_plan: &FlashInferSchedulePlan,
         sampling: SamplingConfig,
     ) -> Result<u32, MetalError> {
         let num_tokens = input_tokens.len().max(1) as u32;
@@ -1986,110 +2122,81 @@ impl MetalExecutor {
                         MTLSize::new(32, 1, 1),
                     );
 
-                    // Attention: one dispatch per token position (causal prefix)
+                    // Attention: single parallel 2D causal dispatch for ALL query tokens
+                    // instead of M sequential per-token dispatches. This is the key
+                    // optimization that brings prefill throughput close to MLX.
                     let gqa_pso = self
                         .pipeline_cache
-                        .get_or_compile("bsr_paged_gqa_decode_stage1")?;
+                        .get_or_compile("bsr_paged_gqa_prefill_stage1")?;
                     let gqa_params = BsrGqaParams {
                         num_q_heads,
                         num_kv_heads,
                         head_dim,
                         block_size_tokens: self.block_size_tokens,
                         max_split_k_tiles: 16,
+                        max_query_tokens: num_tokens,
                         sm_scale: 1.0 / (head_dim as f32).sqrt(),
                         logit_softcap: attn_logit_softcap.unwrap_or(0.0),
                     };
 
-                    for tok_idx in 0..num_tokens {
-                        let plan = prefix_plans[tok_idx as usize];
-
-                        // Copy per-token plan data to GPU buffers
-                        unsafe {
-                            if !plan.bsr_layout.page_indptr.is_empty() {
-                                std::ptr::copy_nonoverlapping(
-                                    plan.bsr_layout.page_indptr.as_ptr(),
-                                    self.indptr_buf.contents() as *mut i32,
-                                    plan.bsr_layout.page_indptr.len(),
-                                );
-                            }
-                            if !plan.bsr_layout.page_indices.is_empty() {
-                                std::ptr::copy_nonoverlapping(
-                                    plan.bsr_layout.page_indices.as_ptr(),
-                                    self.indices_buf.contents() as *mut i32,
-                                    plan.bsr_layout.page_indices.len(),
-                                );
-                            }
-                            if !plan.bsr_layout.last_page_len.is_empty() {
-                                std::ptr::copy_nonoverlapping(
-                                    plan.bsr_layout.last_page_len.as_ptr(),
-                                    self.last_len_buf.contents() as *mut i32,
-                                    plan.bsr_layout.last_page_len.len(),
-                                );
-                            }
-                            if !plan.cta_work_tiles.is_empty() {
-                                std::ptr::copy_nonoverlapping(
-                                    plan.cta_work_tiles.as_ptr(),
-                                    self.cta_tiles_buf.contents() as *mut CtaWorkTile,
-                                    plan.cta_work_tiles.len(),
-                                );
-                            }
+                    // Copy parallel prefill layout to GPU buffers once (not per-token)
+                    unsafe {
+                        if !prefix_plan.bsr_layout.page_indptr.is_empty() {
+                            std::ptr::copy_nonoverlapping(
+                                prefix_plan.bsr_layout.page_indptr.as_ptr(),
+                                self.indptr_buf.contents() as *mut i32,
+                                prefix_plan.bsr_layout.page_indptr.len(),
+                            );
                         }
-
-                        enc.set_compute_pipeline_state(&gqa_pso);
-                        enc.set_buffer(0, Some(&self.q_buf), 0);
-                        enc.set_buffer(1, Some(&self.kv_cache_k_buf), layer_kv_offset);
-                        enc.set_buffer(2, Some(&self.kv_cache_v_buf), layer_kv_offset);
-                        enc.set_buffer(3, Some(&self.indptr_buf), 0);
-                        enc.set_buffer(4, Some(&self.indices_buf), 0);
-                        enc.set_buffer(5, Some(&self.last_len_buf), 0);
-                        enc.set_buffer(6, Some(&self.cta_tiles_buf), 0);
-                        enc.set_buffer(7, Some(&self.tile_split_idx_buf), 0);
-                        enc.set_buffer(8, Some(&self.attn_out_buf), 0);
-                        enc.set_buffer(9, Some(&self.partial_attn_out_buf), 0);
-                        enc.set_buffer(10, Some(&self.partial_attn_lse_buf), 0);
-                        enc.set_bytes(
-                            11,
-                            std::mem::size_of::<BsrGqaParams>() as u64,
-                            &gqa_params as *const _ as *const _,
-                        );
-                        let num_tiles = plan.cta_work_tiles.len().max(1) as u64;
-                        let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(num_tiles, num_kv_heads as u64, 1),
-                            MTLSize::new(32 * gqa_ratio, 1, 1),
-                        );
-
-                        // Split-K reduce if needed
-                        if plan
-                            .cta_work_tiles
-                            .iter()
-                            .any(|t| t.is_split_k != 0)
-                        {
-                            let splits_per_req = [num_tiles as u32; 1];
-                            let splits_buf = self.device.new_buffer_with_data(
-                                splits_per_req.as_ptr() as *const _,
-                                4,
-                                MTLResourceOptions::StorageModeShared,
+                        if !prefix_plan.bsr_layout.page_indices.is_empty() {
+                            std::ptr::copy_nonoverlapping(
+                                prefix_plan.bsr_layout.page_indices.as_ptr(),
+                                self.indices_buf.contents() as *mut i32,
+                                prefix_plan.bsr_layout.page_indices.len(),
                             );
-                            let reduce_pso = self
-                                .pipeline_cache
-                                .get_or_compile("bsr_paged_gqa_split_k_reduce")?;
-                            enc.set_compute_pipeline_state(&reduce_pso);
-                            enc.set_buffer(0, Some(&self.partial_attn_out_buf), 0);
-                            enc.set_buffer(1, Some(&self.partial_attn_lse_buf), 0);
-                            enc.set_buffer(2, Some(&splits_buf), 0);
-                            enc.set_buffer(3, Some(&self.attn_out_buf), 0);
-                            enc.set_bytes(
-                                4,
-                                std::mem::size_of::<BsrGqaParams>() as u64,
-                                &gqa_params as *const _ as *const _,
+                        }
+                        if !prefix_plan.bsr_layout.last_page_len.is_empty() {
+                            std::ptr::copy_nonoverlapping(
+                                prefix_plan.bsr_layout.last_page_len.as_ptr(),
+                                self.last_len_buf.contents() as *mut i32,
+                                prefix_plan.bsr_layout.last_page_len.len(),
                             );
-                            enc.dispatch_thread_groups(
-                                MTLSize::new(num_q_heads as u64, 1, 1),
-                                MTLSize::new(32, 1, 1),
+                        }
+                        if !prefix_plan.cta_work_tiles.is_empty() {
+                            std::ptr::copy_nonoverlapping(
+                                prefix_plan.cta_work_tiles.as_ptr(),
+                                self.cta_tiles_buf.contents() as *mut CtaWorkTile,
+                                prefix_plan.cta_work_tiles.len(),
                             );
                         }
                     }
+
+                    enc.set_compute_pipeline_state(&gqa_pso);
+                    enc.set_buffer(0, Some(&self.q_buf), 0);
+                    enc.set_buffer(1, Some(&self.kv_cache_k_buf), layer_kv_offset);
+                    enc.set_buffer(2, Some(&self.kv_cache_v_buf), layer_kv_offset);
+                    enc.set_buffer(3, Some(&self.indptr_buf), 0);
+                    enc.set_buffer(4, Some(&self.indices_buf), 0);
+                    enc.set_buffer(5, Some(&self.last_len_buf), 0);
+                    enc.set_buffer(6, Some(&self.cta_tiles_buf), 0);
+                    enc.set_buffer(7, Some(&self.tile_split_idx_buf), 0);
+                    enc.set_buffer(8, Some(&self.attn_out_buf), 0);
+                    enc.set_buffer(9, Some(&self.partial_attn_out_buf), 0);
+                    enc.set_buffer(10, Some(&self.partial_attn_lse_buf), 0);
+                    enc.set_bytes(
+                        11,
+                        std::mem::size_of::<BsrGqaParams>() as u64,
+                        &gqa_params as *const _ as *const _,
+                    );
+                    let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(num_tokens as u64, num_kv_heads as u64, 1),
+                        MTLSize::new(32 * gqa_ratio, 1, 1),
+                    );
+
+                    // Note: Split-K for prefill (contexts > threshold blocks) is not
+                    // yet implemented in the parallel prefill kernel. For typical
+                    // prefill contexts (< 256 tokens), Split-K is not triggered.
 
                     // O projection (batched for all tokens)
                     Self::encode_q4_linear(
@@ -2566,6 +2673,7 @@ impl MetalExecutor {
                         head_dim,
                         block_size_tokens: self.block_size_tokens,
                         max_split_k_tiles: 16,
+                        max_query_tokens: 1,
                         sm_scale: 1.0 / (head_dim as f32).sqrt(),
                         logit_softcap: attn_logit_softcap.unwrap_or(0.0),
                     };
@@ -2600,18 +2708,20 @@ impl MetalExecutor {
                         .any(|t| t.is_split_k != 0)
                     {
                         let splits_per_req = [num_tiles as u32; 16];
-                        let splits_buf = self.device.new_buffer_with_data(
-                            splits_per_req.as_ptr() as *const _,
-                            (splits_per_req.len() * 4) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        );
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                splits_per_req.as_ptr(),
+                                self.split_k_splits_buf.contents() as *mut u32,
+                                splits_per_req.len(),
+                            );
+                        }
                         let reduce_pso = self
                             .pipeline_cache
                             .get_or_compile("bsr_paged_gqa_split_k_reduce")?;
                         enc.set_compute_pipeline_state(&reduce_pso);
                         enc.set_buffer(0, Some(&self.partial_attn_out_buf), 0);
                         enc.set_buffer(1, Some(&self.partial_attn_lse_buf), 0);
-                        enc.set_buffer(2, Some(&splits_buf), 0);
+                        enc.set_buffer(2, Some(&self.split_k_splits_buf), 0);
                         enc.set_buffer(3, Some(&self.attn_out_buf), 0);
                         enc.set_bytes(
                             4,

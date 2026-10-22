@@ -370,7 +370,7 @@ impl EagleDraftEngine {
         target_probs: &[Vec<f32>],
         target_features: &[Vec<f32>],
         rng: &mut DeterministicRng,
-    ) -> Result<(Vec<u32>, Vec<Vec<f32>>), SpeculateError> {
+    ) -> Result<(Vec<u32>, Vec<usize>, Vec<Vec<f32>>), SpeculateError> {
         if target_probs.len() < tree.nodes.len() || target_features.len() < tree.nodes.len() {
             return Err(SpeculateError::MissingTargetDistribution {
                 node_id: target_probs.len(),
@@ -378,6 +378,7 @@ impl EagleDraftEngine {
         }
 
         let mut accepted_tokens = Vec::new();
+        let mut accepted_node_indices = Vec::new();
         let mut accepted_features = Vec::new();
         let mut current_node_id = 0usize;
 
@@ -398,6 +399,7 @@ impl EagleDraftEngine {
                 let accept_prob = (p_x / q_x).min(1.0);
                 if rng.next_f32() < accept_prob {
                     accepted_tokens.push(candidate_tok as u32);
+                    accepted_node_indices.push(child_id);
                     accepted_features.push(target_features[child_id].clone());
                     accepted_child = Some(child_id);
                     break;
@@ -424,6 +426,7 @@ impl EagleDraftEngine {
                     let bonus_tok =
                         Self::sample_from_distribution(&target_probs[current_node_id], rng);
                     accepted_tokens.push(bonus_tok);
+                    accepted_node_indices.push(current_node_id);
                     accepted_features.push(target_features[current_node_id].clone());
                     break;
                 }
@@ -432,12 +435,13 @@ impl EagleDraftEngine {
                 // sample a replacement token from the adjusted residual distribution.
                 let replacement_tok = Self::sample_from_distribution(&residual_p, rng);
                 accepted_tokens.push(replacement_tok);
+                accepted_node_indices.push(current_node_id);
                 accepted_features.push(target_features[current_node_id].clone());
                 break;
             }
         }
 
-        Ok((accepted_tokens, accepted_features))
+        Ok((accepted_tokens, accepted_node_indices, accepted_features))
     }
 
     fn sample_from_distribution(probs: &[f32], rng: &mut DeterministicRng) -> u32 {
@@ -557,7 +561,7 @@ mod tests {
             .collect();
 
         let mut rng = DeterministicRng::new(42);
-        let (accepted_tokens, accepted_features) = engine
+        let (accepted_tokens, _accepted_node_indices, accepted_features) = engine
             .verify_draft_tree_recursive(&tree, &target_probs, &target_feats, &mut rng)
             .unwrap();
 
