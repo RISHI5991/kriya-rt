@@ -421,10 +421,11 @@ kernel void q4_g64_routed_moe_gemv(
     const uint assign_idx = tok_idx * params.num_active_experts + slot_idx;
     const uint expert_id  = selected_experts[assign_idx];
 
-    // Offset into the selected expert's weight matrix (wrapped safely within allocated expert pool)
-    const uint expert_base_blocks = (expert_id % 16u) * params.expert_stride_blks;
+    // Offset into the selected expert's weight matrix.
+    // expert_id is in [0, num_total_experts). The expert_weights buffer must be
+    // allocated with space for all experts (see MetalExecutor::allocate_for_descriptor).
     device const BlockQ4Group64* row_blocks =
-        expert_weights + expert_base_blocks + (row_idx * params.num_k_blocks);
+        expert_weights + (expert_id * params.expert_stride_blks) + (row_idx * params.num_k_blocks);
 
     const uint x_offset = (input_is_per_slot != 0u)
         ? (assign_idx * params.in_dim)

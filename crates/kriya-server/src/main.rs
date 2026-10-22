@@ -137,9 +137,6 @@ impl EngineRuntime {
     }
 
     /// Executes a single iteration tick across all concurrently running requests in the ORCA batch.
-    ///
-    /// Executes one ORCA iteration. Speculative decoding is not enabled here:
-    /// it will return only when it has a real target-logit acceptance algorithm.
     pub fn step_orca_iteration(
         &mut self,
         active_streams: &mut HashMap<u64, (mpsc::UnboundedSender<u32>, f32, usize)>,
@@ -169,67 +166,119 @@ impl EngineRuntime {
             let req_tokens = &batch.selective_batch.flattened_input_tokens
                 [*tok_offset..(*tok_offset + *num_toks)];
 
-            // Attention is causal per sequence position.  The Metal attention
-            // kernel has one query row per request, so a multi-token prompt
-            // must be appended one token at a time with a prefix-sized page
-            // table; flattening the whole prompt here overwrites the same KV
-            // slot and is numerically invalid.
-            let mut target_tok = None;
-            let mut request_failed = false;
-            for (token_idx, &input_token) in req_tokens.iter().enumerate() {
-                let position = start_pos + token_idx;
-                let prefix_plan = self
-                    .scheduler
-                    .kv_manager
-                    .build_prefix_schedule_plan(
-                        *req_id,
-                        (position + 1) as u32,
-                        self.scheduler.max_blocks_per_cta,
-                    )
-                    .map_err(|err| format!("causal KV schedule failed: {err}"));
-                let prefix_plan = match prefix_plan {
-                    Ok(plan) => plan,
-                    Err(err) => {
-                        eprintln!("KriyaRT request {req_id} failed: {err}");
-                        let _ = self.scheduler.abort_request(*req_id);
-                        active_streams.remove(req_id);
-                        request_failed = true;
-                        break;
-                    }
-                };
-                let samp_cfg = SamplingConfig {
-                    vocab_size: self.descriptor.vocab_size,
-                    greedy: u32::from(temp <= 1e-5),
-                    temperature: temp,
-                    top_p: 0.95,
-                    top_k: 50,
-                    rng_seed: (*req_id as u32).wrapping_add(position as u32),
-                };
-                let result = self
-                    .executor
-                    .forward_and_sample(
-                        &self.descriptor,
-                        &prefix_plan,
-                        &[input_token],
-                        &[position as u32],
-                        samp_cfg,
-                    )
-                    .map_err(|err| format!("Metal forward pass failed: {err}"));
-                match result {
-                    Ok(token) => target_tok = Some(token),
-                    Err(err) => {
-                        eprintln!("KriyaRT request {req_id} failed: {err}");
-                        let _ = self.scheduler.abort_request(*req_id);
-                        active_streams.remove(req_id);
-                        request_failed = true;
-                        break;
+            // Prefill chunk (multiple tokens): batch into a single GPU command buffer.
+            // This eliminates N command-buffer round-trips for an N-token prefill chunk.
+            if req_tokens.len() > 1 {
+                // Build per-token prefix schedule plans for causal attention.
+                let mut prefix_plan_storage: Vec<kriya_kv::bsr_paged::FlashInferSchedulePlan> = Vec::new();
+                let mut request_failed = false;
+
+                for (token_idx, _) in req_tokens.iter().enumerate() {
+                    let position = (start_pos + token_idx) as u32;
+                    let plan = self
+                        .scheduler
+                        .kv_manager
+                        .build_prefix_schedule_plan(
+                            *req_id,
+                            position + 1,
+                            self.scheduler.max_blocks_per_cta,
+                        );
+                    match plan {
+                        Ok(p) => {
+                            prefix_plan_storage.push(p);
+                        }
+                        Err(err) => {
+                            eprintln!("KriyaRT request {req_id} failed: {err}");
+                            let _ = self.scheduler.abort_request(*req_id);
+                            active_streams.remove(req_id);
+                            request_failed = true;
+                            break;
+                        }
                     }
                 }
+
+                if !request_failed {
+                    let prefix_plans: Vec<&kriya_kv::bsr_paged::FlashInferSchedulePlan> =
+                        prefix_plan_storage.iter().collect();
+                    let positions: Vec<u32> = req_tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| (start_pos + i) as u32)
+                        .collect();
+                    let samp_cfg = SamplingConfig {
+                        vocab_size: self.descriptor.vocab_size,
+                        greedy: u32::from(temp <= 1e-5),
+                        temperature: temp,
+                        top_p: 0.95,
+                        top_k: 50,
+                        rng_seed: (*req_id as u32).wrapping_add(start_pos as u32),
+                    };
+                    match self.executor.forward_prefill_batch(
+                        &self.descriptor,
+                        req_tokens,
+                        &positions,
+                        &prefix_plans,
+                        samp_cfg,
+                    ) {
+                        Ok(target_tok) => {
+                            primary_outputs.push((*req_id, target_tok));
+                        }
+                        Err(err) => {
+                            eprintln!("KriyaRT prefill batch failed for request {req_id}: {err}");
+                            let _ = self.scheduler.abort_request(*req_id);
+                            active_streams.remove(req_id);
+                        }
+                    }
+                }
+                continue;
             }
 
-            if !request_failed {
-                if let Some(target_tok) = target_tok {
-                    primary_outputs.push((*req_id, target_tok));
+            // Decode path: single token forward pass
+            let input_token = req_tokens[0];
+            let position = start_pos as u32;
+            let prefix_plan = self
+                .scheduler
+                .kv_manager
+                .build_prefix_schedule_plan(
+                    *req_id,
+                    position + 1,
+                    self.scheduler.max_blocks_per_cta,
+                )
+                .map_err(|err| format!("causal KV schedule failed: {err}"));
+            let prefix_plan = match prefix_plan {
+                Ok(plan) => plan,
+                Err(err) => {
+                    eprintln!("KriyaRT request {req_id} failed: {err}");
+                    let _ = self.scheduler.abort_request(*req_id);
+                    active_streams.remove(req_id);
+                    continue;
+                }
+            };
+            let samp_cfg = SamplingConfig {
+                vocab_size: self.descriptor.vocab_size,
+                greedy: u32::from(temp <= 1e-5),
+                temperature: temp,
+                top_p: 0.95,
+                top_k: 50,
+                rng_seed: (*req_id as u32).wrapping_add(position),
+            };
+            let result = self
+                .executor
+                .forward_and_sample(
+                    &self.descriptor,
+                    &prefix_plan,
+                    &[input_token],
+                    &[position],
+                    samp_cfg,
+                )
+                .map_err(|err| format!("Metal forward pass failed: {err}"));
+            match result {
+                Ok(token) => primary_outputs.push((*req_id, token)),
+                Err(err) => {
+                    eprintln!("KriyaRT request {req_id} failed: {err}");
+                    let _ = self.scheduler.abort_request(*req_id);
+                    active_streams.remove(req_id);
+                    continue;
                 }
             }
         }
