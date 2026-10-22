@@ -12,7 +12,7 @@ use kriya_core::quantizer::{
     bf16_bits_to_f32, dequantize_q4_group64_to_f32, f32_to_bf16_bits,
     quantize_f32_to_q4_group64,
 };
-use kriya_kv::bsr_paged::{CtaWorkTile, FlashInferSchedulePlan, PagedKvCacheManager};
+use kriya_kv::bsr_paged::{CtaWorkTile, PagedKvCacheManager};
 use metal::{Device, MTLResourceOptions, MTLSize};
 use std::time::Instant;
 
