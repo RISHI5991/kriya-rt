@@ -806,6 +806,12 @@ pub struct MetalExecutor {
     /// committed to the KV cache without re-running the full forward pass.
     pub tree_k_buf: Buffer,
     pub tree_v_buf: Buffer,
+    /// Shared event for GPU completion signaling (async pipeline).
+    /// Eliminates CPU stall from wait_until_completed() by allowing
+    /// the CPU to continue scheduling while the GPU executes.
+    pub shared_event: SharedEvent,
+    /// Signal value counter for tracking command buffer completion.
+    pub signal_value: u64,
 }
 
 impl MetalExecutor {
@@ -858,6 +864,7 @@ impl MetalExecutor {
             MetalError::DeviceInitFailed("No Apple Silicon Metal GPU found".into())
         })?;
         let command_queue = device.new_command_queue();
+        let shared_event = device.new_shared_event();
         let mut pipeline_cache = MetalPipelineCache::from_shader_dir(device.clone(), shader_dir)?;
 
         for kernel in [
@@ -865,7 +872,6 @@ impl MetalExecutor {
             "rms_norm_bf16",
             "q4_g64_decode_gemv",
             "q4_g64_prefill_gemm",
-            "q4_g64_simdgroup_matrix_gemm",
             "moe_router_topk_and_histogram",
             "moe_router_prefix_scan_and_scatter",
             "q4_g64_routed_moe_gemv",
@@ -1039,6 +1045,9 @@ impl MetalExecutor {
             // Layout: [num_layers, max_tree_nodes, max_q_dim] in BF16
             tree_k_buf: alloc(num_layers * 16 * max_q_dim * 2),
             tree_v_buf: alloc(num_layers * 16 * max_q_dim * 2),
+            // Shared event for async GPU completion signaling
+            shared_event,
+            signal_value: 0,
         })
     }
 
@@ -1216,9 +1225,14 @@ impl MetalExecutor {
             }
         }
 
+        self.signal_value += 1;
+        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         enc.end_encoding();
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        // Non-blocking poll: yield between polls to avoid CPU starvation
+        while self.shared_event.signaled_value() < self.signal_value {
+            std::thread::yield_now();
+        }
 
         // Dispatching attention alone is not verification.  Until this routine reads
         // target-model logits and applies EAGLE's acceptance rule, returning a draft
@@ -1349,15 +1363,8 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer layers (tree mode — no KV cache writes)
+        // All layers encoded in a single command buffer (no splitting) to avoid Mach IPC overhead.
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            // Flush every 8 layers to respect macOS watchdog
-            if l_idx > 0 && l_idx % 8 == 0 {
-                enc.end_encoding();
-                cmd_buf.commit();
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-            }
-
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let (eps, zero_off) = match layer.attn_norm {
@@ -1771,9 +1778,14 @@ impl MetalExecutor {
             h as u32,
         )?;
 
+        self.signal_value += 1;
+        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         enc.end_encoding();
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        // Non-blocking poll: yield between polls to avoid CPU starvation
+        while self.shared_event.signaled_value() < self.signal_value {
+            std::thread::yield_now();
+        }
 
         // Read back logits for all tree nodes (BF16 -> F32)
         let logits_slice = unsafe {
@@ -1989,14 +2001,8 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer layers
+        // All layers encoded in a single command buffer (no splitting).
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            if l_idx > 0 && l_idx % 8 == 0 {
-                enc.end_encoding();
-                cmd_buf.commit();
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-            }
-
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let (eps, zero_off) = match layer.attn_norm {
@@ -2401,9 +2407,14 @@ impl MetalExecutor {
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
+        self.signal_value += 1;
+        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         enc.end_encoding();
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        // Non-blocking poll: yield between polls to avoid CPU starvation
+        while self.shared_event.signaled_value() < self.signal_value {
+            std::thread::yield_now();
+        }
 
         let sampled_token = unsafe { *(self.sampled_token_buf.contents() as *const u32) };
         Ok(sampled_token)
@@ -2501,15 +2512,8 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
+        // All layers encoded in a single command buffer (no splitting).
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            // Flush and commit command buffer every 8 layers to keep single submissions under 500ms
-            if l_idx > 0 && l_idx % 8 == 0 {
-                enc.end_encoding();
-                cmd_buf.commit();
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-            }
-
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let (eps, zero_off) = match layer.attn_norm {
@@ -3205,9 +3209,14 @@ impl MetalExecutor {
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
+        self.signal_value += 1;
+        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         enc.end_encoding();
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        // Non-blocking poll: yield between polls to avoid CPU starvation
+        while self.shared_event.signaled_value() < self.signal_value {
+            std::thread::yield_now();
+        }
 
         let sampled_token = unsafe { *(self.sampled_token_buf.contents() as *const u32) };
         Ok(sampled_token)
