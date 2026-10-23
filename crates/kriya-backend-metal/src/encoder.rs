@@ -1225,9 +1225,9 @@ impl MetalExecutor {
             }
         }
 
+        enc.end_encoding();
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-        enc.end_encoding();
         cmd_buf.commit();
         // Non-blocking poll: yield between polls to avoid CPU starvation
         while self.shared_event.signaled_value() < self.signal_value {
@@ -1778,9 +1778,9 @@ impl MetalExecutor {
             h as u32,
         )?;
 
+        enc.end_encoding();
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-        enc.end_encoding();
         cmd_buf.commit();
         // Non-blocking poll: yield between polls to avoid CPU starvation
         while self.shared_event.signaled_value() < self.signal_value {
@@ -2407,9 +2407,9 @@ impl MetalExecutor {
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
+        enc.end_encoding();
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-        enc.end_encoding();
         cmd_buf.commit();
         // Non-blocking poll: yield between polls to avoid CPU starvation
         while self.shared_event.signaled_value() < self.signal_value {
@@ -3209,9 +3209,9 @@ impl MetalExecutor {
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
+        enc.end_encoding();
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-        enc.end_encoding();
         cmd_buf.commit();
         // Non-blocking poll: yield between polls to avoid CPU starvation
         while self.shared_event.signaled_value() < self.signal_value {

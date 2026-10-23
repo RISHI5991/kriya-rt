@@ -140,13 +140,11 @@ kernel void q4_g64_decode_gemv(
 /// Dequantizes 4-bit weight tiles directly inside threadgroup SRAM and computes
 /// Y[M, N] = X[M, K] * W^T[N, K] for bounded prefill chunks (e.g., M <= 2048).
 ///
-/// Uses 2D block tiling: each threadgroup computes a 32x32 output tile by
-/// cooperatively loading activation and weight tiles into SRAM, then accumulating
-/// via scalar FMA. Numerically verified and correct.
+/// Uses 2D block tiling: each threadgroup (16x16 threads) computes a 16x16 output tile
+/// by cooperatively loading activation and weight tiles into SRAM, then accumulating
+/// via scalar FMA. Each thread loads 8 elements of X and W tiles (2048/256 = 8).
 ///
 /// Grid: tgp_id.x = N tile index, tgp_id.y = M tile index
-/// Each threadgroup (16x16 threads) computes one 16x16 output tile.
-/// Each thread loads 8 elements of X and W tiles (2048/256 = 8).
 kernel void q4_g64_prefill_gemm(
     device const BlockQ4Group64* weights   [[buffer(0)]],
     device const ushort*         input_x   [[buffer(1)]], // bf16 [M, K]
@@ -177,10 +175,10 @@ kernel void q4_g64_prefill_gemm(
         const uint k_base = blk_idx * TILE_K;
 
         // Cooperatively load X tile [16, 64] into SRAM (bf16 -> f32)
-        // 1024 floats / 256 threads = 4 elements/thread via row-major mapping
+        // 1024 floats / 256 threads = 8 elements/thread via row-major mapping
         #pragma unroll
-        for (uint step = 0; step < 4; ++step) {
-            uint elem_idx = linear_tid * 4 + step;
+        for (uint step = 0; step < 8; ++step) {
+            uint elem_idx = linear_tid * 8 + step;
             if (elem_idx < TGP_M * TILE_K) {
                 uint tm = elem_idx / TILE_K;
                 uint tk = elem_idx % TILE_K;
@@ -193,10 +191,10 @@ kernel void q4_g64_prefill_gemm(
         }
 
         // Cooperatively dequantize W tile [64, 16] from Q4_G64 into SRAM
-        // 1024 float values / 256 threads = 4 values/thread via row-major mapping
+        // 1024 float values / 256 threads = 8 values/thread via row-major mapping
         #pragma unroll
-        for (uint step = 0; step < 4; ++step) {
-            uint elem_idx = linear_tid * 4 + step;
+        for (uint step = 0; step < 8; ++step) {
+            uint elem_idx = linear_tid * 8 + step;
             if (elem_idx < TILE_K * TGP_N) {
                 uint k = elem_idx / TGP_N;
                 uint n = elem_idx % TGP_N;
