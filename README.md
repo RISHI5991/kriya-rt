@@ -9,8 +9,8 @@ kernel research and developer-friendly ecosystems, delivering a fully autonomous
 
 | Goal | Implementation |
 |------|---------------|
-| **Mac-only optimization** | Native Metal 3.1 kernels targeting Apple Silicon SIMD matrix units |
-| **Better than MLX/Lily** | Handcrafted Q4_G64 kernels, BSR paged KV cache, ORCA continuous batching, EAGLE speculative decoding |
+| **Mac-only optimization** | Native Metal 3.1 kernels targeting Apple Silicon GPU vector hardware |
+| **Performance work** | Q4_G64 kernels, BSR paged KV cache, and ORCA continuous batching; MLX/Lily parity is not yet benchmark-verified |
 | **Zero Python GIL** | Pure Rust async server (Axum + Tokio), no Python dependencies |
 | **Memory-efficient** | Zero-copy `mmap` weight loading, 4-bit Group-64 quantization, Copy-on-Write KV prefix sharing |
 | **Production serving** | OpenAI-compatible `/v1/chat/completions` with SSE streaming, HF Hub auto-download |
@@ -37,7 +37,7 @@ HTTP Client → Axum Server → ORCA Scheduler → Metal Backend → Apple Silic
 | Model | Parameters | Attention | Activation | Special |
 |-------|-----------|-----------|------------|---------|
 | LLaMA-3.2-3B | 3.21B | GQA (24/8, D=128) | SwiGLU | Dense, 28 layers |
-| Qwen3.6-35B-A3B | 35.8B (3.2B active) | Hybrid GQA + DeltaNet | SwiGLU | MoE (256 experts, top-8) |
+| Qwen3.6-35B-A3B | 35.8B (3.2B active) | Hybrid GQA + DeltaNet | SwiGLU | Descriptor support; production checkpoint execution is not yet implemented |
 | Gemma-2-9B-It | 9.24B | GQA (16/8, D=256) | GeGLU | Logit softcap, 42 layers |
 | Mistral-7B-v0.3 | 7.25B | GQA (32/8, D=128) | SwiGLU | Sliding window 4096 |
 | DeepSeek-R1-Distill-7B | 7.61B | GQA (28/4, D=128) | SwiGLU | 18,944 intermediate |
@@ -63,7 +63,7 @@ cargo build --release --workspace
 cargo test --workspace
 ```
 
-All 41 tests pass (unit + hardware shader compilation).
+The suite includes unit tests plus Metal shader compilation and GPU reference tests.
 
 ### Convert a Model
 
@@ -112,11 +112,14 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
 Iteration-level selective batching with dynamic chunked-prefill (512 tokens). Large prompts are sliced and interleaved with decode steps, keeping TPOT under 10ms without starvation.
 
 ### 4. EAGLE Speculative Decoding
-Multi-token draft tree verification in a single GPU pass using tree-attention masks. Automatic roofline-gated dispatch (speculation enabled when batch size ≤ 4). Achieves up to 1.9x decode speedup.
+Multi-token draft-tree verification is experimental. It is disabled unless the
+checkpoint directory contains a trained, model-matched
+`kriya_eagle_draft_v1.bin` artifact. No speculative speedup is claimed until it
+is measured on a real checkpoint.
 
 ### 5. Metal 3.1 Kernels
 - 128-bit packed vector Q4_G64 dequantization
-- `simdgroup_float8x8` hardware matrix-core GEMM
+- Threadgroup-tiled scalar-FMA Q4 prefill GEMM (numerically validated)
 - GPU-resident MoE routing (top-K → histogram → prefix scan → scatter)
 - Split-K online softmax for long contexts (32K+)
 - Gated DeltaNet recurrent state mixer

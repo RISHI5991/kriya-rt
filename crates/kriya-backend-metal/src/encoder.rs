@@ -41,6 +41,8 @@ pub enum MetalError {
     SpeculativeVerificationNotImplemented,
     #[error("unsupported production configuration: {0}")]
     UnsupportedProductionConfiguration(String),
+    #[error("invalid execution input: {0}")]
+    InvalidExecutionInput(String),
 }
 
 // ============================================================================
@@ -1057,6 +1059,70 @@ impl MetalExecutor {
         (layer_idx as u64) * self.layer_kv_stride_bytes
     }
 
+    /// Checks every host-provided slice before it is copied into fixed-size shared
+    /// Metal buffers. These entry points are public, so scheduler policy alone
+    /// cannot be relied on to prevent an out-of-bounds host write.
+    fn validate_batch_inputs(
+        &self,
+        input_tokens: &[u32],
+        seq_positions: &[u32],
+        schedule_plan: &FlashInferSchedulePlan,
+    ) -> Result<(), MetalError> {
+        if input_tokens.is_empty() {
+            return Err(MetalError::InvalidExecutionInput(
+                "input_tokens must not be empty".into(),
+            ));
+        }
+        if input_tokens.len() != seq_positions.len() {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "input_tokens has {} entries but seq_positions has {}",
+                input_tokens.len(),
+                seq_positions.len()
+            )));
+        }
+
+        let check_capacity = |name: &str, len: usize, capacity: usize| {
+            if len > capacity {
+                Err(MetalError::InvalidExecutionInput(format!(
+                    "{name} has {len} entries but its GPU buffer holds {capacity}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        check_capacity(
+            "input_tokens",
+            input_tokens.len(),
+            self.input_tokens_buf.length() as usize / std::mem::size_of::<u32>(),
+        )?;
+        check_capacity(
+            "seq_positions",
+            seq_positions.len(),
+            self.seq_positions_buf.length() as usize / std::mem::size_of::<u32>(),
+        )?;
+        check_capacity(
+            "page_indptr",
+            schedule_plan.bsr_layout.page_indptr.len(),
+            self.indptr_buf.length() as usize / std::mem::size_of::<i32>(),
+        )?;
+        check_capacity(
+            "page_indices",
+            schedule_plan.bsr_layout.page_indices.len(),
+            self.indices_buf.length() as usize / std::mem::size_of::<i32>(),
+        )?;
+        check_capacity(
+            "last_page_len",
+            schedule_plan.bsr_layout.last_page_len.len(),
+            self.last_len_buf.length() as usize / std::mem::size_of::<i32>(),
+        )?;
+        check_capacity(
+            "cta_work_tiles",
+            schedule_plan.cta_work_tiles.len(),
+            self.cta_tiles_buf.length() as usize / std::mem::size_of::<CtaWorkTile>(),
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_q4_linear(
         pipeline_cache: &mut MetalPipelineCache,
@@ -1289,7 +1355,57 @@ impl MetalExecutor {
         tree_tokens: &[u32],
         tree_mask: &[bool],
     ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), MetalError> {
-        let num_tree_nodes = tree_tokens.len().max(1) as usize;
+        if tree_tokens.is_empty() {
+            return Err(MetalError::InvalidExecutionInput(
+                "tree_tokens must not be empty".into(),
+            ));
+        }
+        let num_tree_nodes = tree_tokens.len();
+        let expected_mask_len = num_tree_nodes.checked_mul(num_tree_nodes).ok_or_else(|| {
+            MetalError::InvalidExecutionInput("tree mask dimensions overflow usize".into())
+        })?;
+        if tree_mask.len() != expected_mask_len {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "tree_mask has {} entries; expected {expected_mask_len} for {num_tree_nodes} nodes",
+                tree_mask.len()
+            )));
+        }
+        let check_capacity = |name: &str, len: usize, capacity: usize| {
+            if len > capacity {
+                Err(MetalError::InvalidExecutionInput(format!(
+                    "{name} has {len} entries but its GPU buffer holds {capacity}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        // Tree K/V scratch space is deliberately bounded to the supported EAGLE tree.
+        check_capacity("tree_tokens", num_tree_nodes, 16)?;
+        check_capacity(
+            "tree_tokens",
+            num_tree_nodes,
+            self.input_tokens_buf.length() as usize / std::mem::size_of::<u32>(),
+        )?;
+        check_capacity(
+            "tree_mask",
+            tree_mask.len(),
+            self.tree_mask_buf.length() as usize,
+        )?;
+        check_capacity(
+            "page_indptr",
+            schedule_plan.bsr_layout.page_indptr.len(),
+            self.indptr_buf.length() as usize / std::mem::size_of::<i32>(),
+        )?;
+        check_capacity(
+            "page_indices",
+            schedule_plan.bsr_layout.page_indices.len(),
+            self.indices_buf.length() as usize / std::mem::size_of::<i32>(),
+        )?;
+        check_capacity(
+            "last_page_len",
+            schedule_plan.bsr_layout.last_page_len.len(),
+            self.last_len_buf.length() as usize / std::mem::size_of::<i32>(),
+        )?;
         let h = descriptor.hidden_size as usize;
         let vocab_capped = descriptor.vocab_size as usize;
         let num_k_blocks = h.div_ceil(64);
@@ -1954,6 +2070,7 @@ impl MetalExecutor {
         prefix_plan: &FlashInferSchedulePlan,
         sampling: SamplingConfig,
     ) -> Result<u32, MetalError> {
+        self.validate_batch_inputs(input_tokens, seq_positions, prefix_plan)?;
         let num_tokens = input_tokens.len().max(1) as u32;
         let h = descriptor.hidden_size;
         let num_k_blocks = h.div_ceil(64);
@@ -2431,6 +2548,7 @@ impl MetalExecutor {
         seq_positions: &[u32],
         sampling: SamplingConfig,
     ) -> Result<u32, MetalError> {
+        self.validate_batch_inputs(input_tokens, seq_positions, schedule_plan)?;
         let num_tokens = input_tokens.len().max(1) as u32;
         let h = descriptor.hidden_size;
         let num_k_blocks = h.div_ceil(64);

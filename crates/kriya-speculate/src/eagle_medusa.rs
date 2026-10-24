@@ -226,6 +226,12 @@ impl EagleDraftEngine {
             });
         }
 
+        if hidden_dim == 0 || vocab_size == 0 {
+            return Err(SpeculateError::InvalidTreeConfig(
+                "hidden_dim and vocab_size must both be non-zero".into(),
+            ));
+        }
+
         Ok(Self {
             hidden_dim,
             vocab_size,
@@ -467,6 +473,13 @@ impl EagleDraftEngine {
         cls_weight: f32,
         rng: &mut DeterministicRng,
     ) -> Result<(f32, f32, f32), SpeculateError> {
+        if target_next_feature.len() != self.hidden_dim {
+            return Err(SpeculateError::DimensionMismatch {
+                expected: self.hidden_dim,
+                actual: target_next_feature.len(),
+            });
+        }
+
         // Add random noise sampled from uniform distribution U(-0.1, 0.1) to target features
         let noisy_prev_feature: Vec<f32> = clean_prev_feature
             .iter()
@@ -499,6 +512,84 @@ impl EagleDraftEngine {
 
         let total_loss = l_reg + cls_weight * l_cls;
         Ok((total_loss, l_reg, l_cls))
+    }
+
+    /// File signature for trained EAGLE draft-head weights.
+    ///
+    /// The payload is intentionally independent from target weights: deployments must
+    /// train this head against the exact target checkpoint, then provide it separately.
+    const WEIGHTS_MAGIC: [u8; 8] = *b"KRYAEGL1";
+    const WEIGHTS_VERSION: u32 = 1;
+    const WEIGHTS_HEADER_BYTES: usize = 32;
+
+    /// Serializes trained FC and decoder weights with model dimensions and a versioned
+    /// header. This prevents accidentally loading a draft head trained for another model.
+    pub fn save_weights(&self) -> Vec<u8> {
+        let payload_bytes = (self.fc_fuse_weights.len() + self.decoder_layer_weights.len()) * 4;
+        let mut buf = Vec::with_capacity(Self::WEIGHTS_HEADER_BYTES + payload_bytes);
+        buf.extend_from_slice(&Self::WEIGHTS_MAGIC);
+        buf.extend_from_slice(&Self::WEIGHTS_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.hidden_dim as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.vocab_size as u64).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved for future format flags.
+        for &weight in self
+            .fc_fuse_weights
+            .iter()
+            .chain(self.decoder_layer_weights.iter())
+        {
+            buf.extend_from_slice(&weight.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Loads a trained EAGLE head. Rejects raw, wrong-model, truncated, and non-finite
+    /// artifacts rather than silently enabling speculation with invalid probabilities.
+    pub fn load_weights(&mut self, data: &[u8]) -> Result<(), SpeculateError> {
+        let payload_bytes = (self.fc_fuse_weights.len() + self.decoder_layer_weights.len()) * 4;
+        let expected_len = Self::WEIGHTS_HEADER_BYTES + payload_bytes;
+        if data.len() != expected_len {
+            return Err(SpeculateError::InvalidTreeConfig(format!(
+                "EAGLE weight artifact length mismatch: expected {expected_len}, got {}",
+                data.len()
+            )));
+        }
+        if data[..8] != Self::WEIGHTS_MAGIC {
+            return Err(SpeculateError::InvalidTreeConfig(
+                "invalid EAGLE weight artifact magic".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let hidden_dim = u64::from_le_bytes(data[12..20].try_into().unwrap()) as usize;
+        let vocab_size = u64::from_le_bytes(data[20..28].try_into().unwrap()) as usize;
+        if version != Self::WEIGHTS_VERSION
+            || hidden_dim != self.hidden_dim
+            || vocab_size != self.vocab_size
+        {
+            return Err(SpeculateError::InvalidTreeConfig(format!(
+                "EAGLE weight artifact is for version {version}, hidden_dim {hidden_dim}, vocab_size {vocab_size}; expected version {}, hidden_dim {}, vocab_size {}",
+                Self::WEIGHTS_VERSION, self.hidden_dim, self.vocab_size
+            )));
+        }
+
+        // Validate the complete payload before mutating this engine. A failed load
+        // must not leave a partially overwritten draft head behind.
+        let mut parsed = Vec::with_capacity(payload_bytes / 4);
+        let mut offset = Self::WEIGHTS_HEADER_BYTES;
+        while offset < data.len() {
+            let value = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            if !value.is_finite() {
+                return Err(SpeculateError::InvalidTreeConfig(
+                    "EAGLE weight artifact contains a non-finite value".into(),
+                ));
+            }
+            parsed.push(value);
+            offset += 4;
+        }
+        let split = self.fc_fuse_weights.len();
+        self.fc_fuse_weights.copy_from_slice(&parsed[..split]);
+        self.decoder_layer_weights.copy_from_slice(&parsed[split..]);
+
+        Ok(())
     }
 }
 
@@ -583,5 +674,40 @@ mod tests {
         assert!(total > 0.0);
         assert!(l_reg >= 0.0);
         assert!(l_cls > 0.0);
+    }
+
+    #[test]
+    fn test_trained_weight_artifact_round_trip_and_dimension_check() {
+        let source = create_test_eagle_engine();
+        let artifact = source.save_weights();
+
+        let mut loaded = create_test_eagle_engine();
+        loaded.fc_fuse_weights.fill(0.0);
+        loaded.decoder_layer_weights.fill(0.0);
+        loaded.load_weights(&artifact).unwrap();
+        assert_eq!(loaded.fc_fuse_weights, source.fc_fuse_weights);
+        assert_eq!(loaded.decoder_layer_weights, source.decoder_layer_weights);
+
+        let mut wrong_model = EagleDraftEngine::new(
+            4,
+            16,
+            vec![0.0; 64],
+            vec![0.0; 64],
+            vec![0.0; 32],
+            vec![0.0; 16],
+        )
+        .unwrap();
+        assert!(wrong_model.load_weights(&artifact).is_err());
+    }
+
+    #[test]
+    fn test_weight_artifact_rejects_non_finite_values() {
+        let source = create_test_eagle_engine();
+        let mut artifact = source.save_weights();
+        artifact[32..36].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mut destination = create_test_eagle_engine();
+        let before = destination.fc_fuse_weights.clone();
+        assert!(destination.load_weights(&artifact).is_err());
+        assert_eq!(destination.fc_fuse_weights, before);
     }
 }

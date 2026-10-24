@@ -88,10 +88,9 @@ impl EngineRuntime {
             kv_mgr,
         );
 
-        // Initialize EAGLE draft engine with target model weights.
-        // The draft engine reuses the target model's embedding and LM head weights,
-        // with a small trainable autoregression head (fc_fuse + decoder layer).
-        let draft_engine = Self::build_draft_engine(&descriptor, &executor);
+        // A trained, model-matched artifact is required before this expensive
+        // CPU-side draft path is enabled; synthetic constants are never used.
+        let draft_engine = Self::build_draft_engine(&descriptor, &executor, checkpoint_dir);
 
         Ok(Self {
             descriptor,
@@ -104,14 +103,34 @@ impl EngineRuntime {
         })
     }
 
-    /// Builds an `EagleDraftEngine` from the target model's dequantized weights.
-    /// Returns `None` if weights cannot be extracted (e.g., non-Q4 checkpoint).
+    /// Builds EAGLE only from an explicitly supplied, trained draft-head artifact.
+    /// Missing, malformed, and incompatible artifacts leave speculation disabled.
     fn build_draft_engine(
         descriptor: &ModelArchDescriptor,
         executor: &MetalExecutor,
+        checkpoint_dir: &Path,
     ) -> Option<EagleDraftEngine> {
         let h = descriptor.hidden_size as usize;
         let vocab = descriptor.vocab_size as usize;
+
+        let artifact_path = checkpoint_dir.join("kriya_eagle_draft_v1.bin");
+        let draft_weights = match std::fs::read(&artifact_path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "KriyaRT: speculative decoding disabled; no trained draft head at {}",
+                    artifact_path.display()
+                );
+                return None;
+            }
+            Err(err) => {
+                eprintln!(
+                    "KriyaRT: speculative decoding disabled; failed to read {}: {err}",
+                    artifact_path.display()
+                );
+                return None;
+            }
+        };
 
         let embedding = executor.get_embedding_weights_f32().ok()?;
         let lm_head = executor.get_lm_head_weights_f32().ok()?;
@@ -120,20 +139,25 @@ impl EngineRuntime {
             return None;
         }
 
-        // fc_fuse: [hidden_dim, 2 * hidden_dim] — small trainable projection
-        let fc_fuse = vec![0.05f32; h * (2 * h)];
-        // decoder_layer: [hidden_dim, hidden_dim] — single lightweight layer
-        let decoder_w = vec![0.02f32; h * h];
-
-        EagleDraftEngine::new(
+        // Zeroes are only construction storage. `load_weights` must succeed before
+        // the engine can be returned, so they can never act as a draft model.
+        let mut engine = EagleDraftEngine::new(
             h,
             vocab,
             embedding,
             lm_head,
-            fc_fuse,
-            decoder_w,
+            vec![0.0; h * (2 * h)],
+            vec![0.0; h * h],
         )
-        .ok()
+        .ok()?;
+        if let Err(err) = engine.load_weights(&draft_weights) {
+            eprintln!(
+                "KriyaRT: speculative decoding disabled; invalid trained draft head {}: {err}",
+                artifact_path.display()
+            );
+            return None;
+        }
+        Some(engine)
     }
 
     /// Executes a single iteration tick across all concurrently running requests in the ORCA batch.
@@ -294,8 +318,6 @@ impl EngineRuntime {
         //    Only activated when the draft engine is available and batch size is small
         //    (memory-bandwidth bound regime where speculation helps).
         if self.draft_engine.is_some() && batch_size <= 4 {
-            let mut speculative_work: Vec<(u64, Vec<u32>)> = Vec::new();
-
             for &(req_id, primary_tok) in &primary_outputs {
                 // Only speculate for requests still in the Decode phase
                 if !self.scheduler.is_request_decoding(req_id) {
