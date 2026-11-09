@@ -21,3 +21,11 @@ Cargo.lock.orig
 /tmp/
 temp/
 dist/
+
+# Large Model Checkpoints & Virtual Environments
+models/
+.venv/
+*.safetensors
+*.bin
+*.pt
+*.gguf
