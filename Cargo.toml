@@ -29,7 +29,7 @@ futures = "0.3"
 ring = "0.17"
 criterion = "0.5"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-hf-hub = { version = "0.3", features = ["tokio"] }
+hf-hub = { version = "0.5", features = ["tokio"] }
 
 [patch.crates-io]
 block = { path = "patches/block" }
