@@ -1075,7 +1075,7 @@ dependencies = [
  "kriya-kv",
  "kriya-scheduler",
  "kriya-speculate",
- "rand 0.8.8",
+ "rand 0.9.5",
  "ring",
  "serde",
  "serde_json",
