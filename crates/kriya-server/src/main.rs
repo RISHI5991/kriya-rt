@@ -142,6 +142,7 @@ impl EngineRuntime {
         descriptor: ModelArchDescriptor,
         shader_dir: &Path,
         checkpoint_dir: &Path,
+        draft_weights_path: Option<&Path>,
     ) -> Result<Self, String> {
         // The serving and benchmark paths must never degrade to synthetic weights or
         // token IDs.  A caller must provide a real checkpoint and a usable Metal GPU.
@@ -163,9 +164,7 @@ impl EngineRuntime {
             kv_mgr,
         );
 
-        // A trained, model-matched artifact is required before this expensive
-        // CPU-side draft path is enabled; synthetic constants are never used.
-        let draft_engine = Self::build_draft_engine(&descriptor, &executor, checkpoint_dir);
+        let draft_engine = Self::build_draft_engine(&descriptor, &executor, checkpoint_dir, draft_weights_path);
 
         Ok(Self {
             descriptor,
@@ -184,23 +183,26 @@ impl EngineRuntime {
         descriptor: &ModelArchDescriptor,
         executor: &MetalExecutor,
         checkpoint_dir: &Path,
+        explicit_draft_path: Option<&Path>,
     ) -> Option<EagleDraftEngine> {
         let h = descriptor.hidden_size as usize;
         let vocab = descriptor.vocab_size as usize;
 
-        let artifact_path = checkpoint_dir.join("kriya_eagle_draft_v1.bin");
-        let draft_weights = match std::fs::read(&artifact_path) {
-            Ok(data) => data,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!(
-                    "KriyaRT: speculative decoding disabled; no trained draft head at {}",
-                    artifact_path.display()
-                );
+        let artifact_path = if let Some(p) = explicit_draft_path {
+            p.to_path_buf()
+        } else {
+            let default_p = checkpoint_dir.join("kriya_eagle_draft_v1.bin");
+            if !default_p.exists() {
                 return None;
             }
+            default_p
+        };
+
+        let draft_weights = match std::fs::read(&artifact_path) {
+            Ok(data) => data,
             Err(err) => {
                 eprintln!(
-                    "KriyaRT: speculative decoding disabled; failed to read {}: {err}",
+                    "KriyaRT: speculative decoding disabled; failed to read draft head artifact at {}: {err}",
                     artifact_path.display()
                 );
                 return None;
@@ -1379,15 +1381,30 @@ async fn main() {
         .join("kernels")
         .join("metal");
 
-    let mut runtime = EngineRuntime::new(desc.clone(), &shader_dir, &checkpoint_dir)
-        .unwrap_or_else(|err| {
-            eprintln!("KriyaRT startup failed: {err}");
-            std::process::exit(1);
-        });
+    let draft_weights_path = args
+        .windows(2)
+        .find(|w| w[0] == "--draft-weights")
+        .map(|w| PathBuf::from(&w[1]));
+
+    let mut runtime = EngineRuntime::new(
+        desc.clone(),
+        &shader_dir,
+        &checkpoint_dir,
+        draft_weights_path.as_deref(),
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("KriyaRT startup failed: {err}");
+        std::process::exit(1);
+    });
 
     if args.iter().any(|arg| arg == "--no-speculation") {
-        println!("KriyaRT: Speculative decoding disabled via --no-speculation");
         runtime.draft_engine = None;
+    }
+
+    if runtime.draft_engine.is_some() {
+        println!("KriyaRT: Speculative decoding ACTIVE with EAGLE draft head.");
+    } else {
+        println!("KriyaRT: Speculative decoding INACTIVE (standard single-token autoregressive decode). Pass --draft-weights to enable EAGLE.");
     }
 
     let has_prompt = args.iter().any(|arg| arg == "--prompt");

@@ -292,11 +292,29 @@ impl EagleDraftEngine {
     }
 
     /// Projects a feature vector through the frozen target LM Head and applies Softmax.
+    /// Unrolled 4-way to allow LLVM auto-vectorization into ARM NEON fmla.4s SIMD on Apple Silicon.
     pub fn compute_lm_head_probs(&self, feature: &[f32]) -> Vec<f32> {
         let mut logits = vec![0.0f32; self.vocab_size];
+        let h_dim = self.hidden_dim;
         for (v, logit) in logits.iter_mut().enumerate() {
-            let row = &self.target_lm_head_weights[v * self.hidden_dim..(v + 1) * self.hidden_dim];
-            *logit = row.iter().zip(feature.iter()).map(|(w, f)| w * f).sum();
+            let row = &self.target_lm_head_weights[v * h_dim..(v + 1) * h_dim];
+            let chunks4 = h_dim / 4;
+            let mut acc0 = 0.0f32;
+            let mut acc1 = 0.0f32;
+            let mut acc2 = 0.0f32;
+            let mut acc3 = 0.0f32;
+            for i in 0..chunks4 {
+                let idx = i * 4;
+                acc0 += row[idx] * feature[idx];
+                acc1 += row[idx + 1] * feature[idx + 1];
+                acc2 += row[idx + 2] * feature[idx + 2];
+                acc3 += row[idx + 3] * feature[idx + 3];
+            }
+            let mut sum = (acc0 + acc1) + (acc2 + acc3);
+            for idx in (chunks4 * 4)..h_dim {
+                sum += row[idx] * feature[idx];
+            }
+            *logit = sum;
         }
         softmax(&logits)
     }

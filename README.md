@@ -62,8 +62,27 @@ No manual offline weight conversion required. Point `kriya-server` directly at a
 - **Vectorized BQ8 Prefill Dispatch:** Dispatches 8 query tokens per SIMD threadgroup with specialized fast paths for head dimensions $D=64$, $D=128$, and $D=256$ with online softmax computed entirely within threadgroup SRAM.
 
 ### 4. Continuous Batching & Async Engine Pipelining
-- **ORCA Iteration-Level Selective Batching:** Dynamically interleaves chunked prefills (512 tokens) with active decode forward passes, ensuring steady decode token latency without prefill head-of-line blocking.
+- **ORCA Iteration-Level Selective Batching:** Dynamically interleaves chunked prefills with active decode forward passes, ensuring steady decode token latency without prefill head-of-line blocking.
 - **Depth-2 Lookahead GPU Pipelining:** CPU prepares and encodes iteration $N+1$ command encoders asynchronously while the Apple Silicon GPU executes iteration $N$, fully saturating the Metal hardware pipeline.
+
+---
+
+## 🎯 Supported Architectures & Scope
+
+KriyaRT is laser-focused on delivering the highest possible throughput and lowest memory footprint for dense 4-bit autoregressive decoder models on Apple Silicon:
+
+- **Supported Models:**
+  - **Qwen 2.5** (0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B)
+  - **Llama 3 / 3.1 / 3.2** (1B, 3B, 8B, 70B)
+  - **Gemma 2** (2B, 9B, 27B) — including 4 RMSNorms per layer, $\sqrt{d}$ embedding scale, and dual attention/vocab logit softcapping
+  - **Mistral / SmolLM2**
+- **Quantization:**
+  - Native 4-bit Group-64 Affine quantization (`Q4_G64`). Directly loads MLX Community Hugging Face checkpoints without format conversion.
+- **Speculative Decoding (EAGLE):**
+  - Experimental opt-in feature enabled via `--draft-weights <path>` with tree-structured speculative verification.
+- **Current Limitations & Roadmap:**
+  - Custom architectures with fused QKV matrices (e.g., Spark X) or non-uniform quantization (OptiQ) require dedicated projection mapping currently in development.
+  - Long-context prefill ($M \ge 512$) currently runs on Metal ALU SIMDgroups (~56-65% of MLX); integration of Metal Performance Shaders (MPSGraph) tensor prefill is on the active roadmap.
 
 ---
 

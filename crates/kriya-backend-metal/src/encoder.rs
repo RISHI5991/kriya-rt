@@ -362,7 +362,7 @@ impl ModelGpuWeights {
         }
 
         Err(MetalError::UnsupportedProductionConfiguration(format!(
-            "checkpoint is missing valid Q4Group64 or MLX 4-bit affine weight for '{prefix}'"
+            "checkpoint is missing expected weight '{prefix}'. KriyaRT supports dense decoder architectures with standard separated Q/K/V and Gate/Up/Down projections (e.g. Qwen 2.5, Llama 3, Gemma 2, Mistral). Models with fused projections (e.g. Spark X fused q_k_v_proj) or custom non-uniform quantization (OptiQ) require dedicated projection mapping."
         )))
     }
 

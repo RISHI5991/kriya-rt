@@ -1042,15 +1042,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kriya-hybrid"
-version = "0.1.0"
-dependencies = [
- "kriya-core",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "kriya-kv"
 version = "0.1.0"
 dependencies = [

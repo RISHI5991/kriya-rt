@@ -4,7 +4,6 @@ members = [
     "crates/kriya-core",
     "crates/kriya-kv",
     "crates/kriya-backend-metal",
-    "crates/kriya-hybrid",
     "crates/kriya-speculate",
     "crates/kriya-scheduler",
     "crates/kriya-server",
