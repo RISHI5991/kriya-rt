@@ -1,0 +1,29 @@
+name: 💡 Feature Request / RFC
+description: Suggest an optimization, kernel enhancement, or new feature
+title: "[RFC / Feature]: "
+labels: ["enhancement", "discussion"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We welcome proposals for new Metal kernels, quantization algorithms, API enhancements, and serving optimizations!
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem or bottleneck?
+      description: A clear and concise description of the bottleneck or limitation.
+      placeholder: "e.g., Prefill latency at 1024 tokens on M3 Max could be accelerated using..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Describe the Solution You'd Like
+      description: Detailed technical proposal (MSL shaders, Rust architecture, buffer layouts, or API design).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Describe Alternatives You've Considered
+      description: Any alternative implementations or existing approaches in MLX, vLLM, or llama.cpp.

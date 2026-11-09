@@ -1,0 +1,33 @@
+name: ⚡ Benchmark Submission
+description: Submit physical hardware benchmarks from your Apple Silicon Mac
+title: "[Benchmark]: "
+labels: ["benchmark", "community"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us map real-world performance across the entire Apple Silicon lineup (M1 through M4, Pro, Max, and Ultra)!
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac Hardware & Specs
+      description: Exact Mac model, chip, GPU core count, and Unified Memory.
+      placeholder: "e.g., MacBook Pro 16\" (M3 Max, 40-core GPU, 64 GB Unified Memory)"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model Evaluated
+      description: Checkpoint name and quantization.
+      placeholder: "e.g., Qwen 2.5 7B Instruct (4-bit Group-64)"
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Benchmark Results (TTFT, TPOT, Memory)
+      description: Paste the output of `benchmarks/run_mlx_vs_kriya.py` or `kriya-server --bench-only`.
+      render: shell
+    validations:
+      required: true

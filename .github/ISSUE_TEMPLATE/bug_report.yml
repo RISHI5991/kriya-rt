@@ -1,0 +1,62 @@
+name: 🐛 Bug Report
+description: File a bug report to help us improve KriyaRT
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue! Please ensure you have tested on the latest `main` commit.
+  - type: input
+    id: macos_version
+    attributes:
+      label: macOS Version
+      description: Run `sw_vers -productVersion` in your terminal.
+      placeholder: "e.g., 14.6.1 (Sonoma) or 15.1 (Sequoia)"
+    validations:
+      required: true
+  - type: dropdown
+    id: chip
+    attributes:
+      label: Apple Silicon Chip
+      description: What processor is your Mac running?
+      options:
+        - "M1 (Base / 7-core / 8-core)"
+        - "M1 Pro / Max / Ultra"
+        - "M2 (Base / 8-core / 10-core)"
+        - "M2 Pro / Max / Ultra"
+        - "M3 (Base)"
+        - "M3 Pro / Max"
+        - "M4 (Base / Pro / Max)"
+    validations:
+      required: true
+  - type: input
+    id: memory
+    attributes:
+      label: Unified Memory Capacity
+      description: How much RAM does your machine have?
+      placeholder: "e.g., 8 GB, 16 GB, 32 GB, 64 GB, 128 GB"
+    validations:
+      required: true
+  - type: input
+    id: model_name
+    attributes:
+      label: Model Name & Quantization
+      description: Which Hugging Face or MLX model was being executed?
+      placeholder: "e.g., mlx-community/Qwen2.5-3B-Instruct-4bit"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Steps
+      description: Provide the exact command line invocation used.
+      placeholder: "./target/release/kriya-server --model <path> --prompt 'Hello'"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Log Output or Crash Backtrace
+      description: Please copy and paste any terminal output or backtraces (`RUST_BACKTRACE=1`).
+      render: shell
