@@ -1024,7 +1024,7 @@ dependencies = [
  "metal",
  "objc",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -1037,7 +1037,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
  "tokenizers",
 ]
 
@@ -1048,7 +1048,7 @@ dependencies = [
  "bytemuck",
  "kriya-core",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1059,7 +1059,7 @@ dependencies = [
  "kriya-core",
  "kriya-kv",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1079,7 +1079,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
  "tokio",
  "tower",
  "tower-http",
@@ -1091,7 +1091,7 @@ version = "0.1.0"
 dependencies = [
  "kriya-core",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
