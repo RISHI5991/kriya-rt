@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![CI](https://github.com/rishisharma/kriya-rt/actions/workflows/ci.yml/badge.svg)](https://github.com/rishisharma/kriya-rt/actions/workflows/ci.yml)
+[![CI](https://github.com/RISHI5991/kriya-rt/blob/main/.github/workflows/ci.yml)
 [![Release](https://img.shields.io/badge/Release-v0.1.0-emerald.svg)](https://github.com/rishisharma/kriya-rt/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon%20(M1--M4)-black.svg)](#hardware-requirements)
