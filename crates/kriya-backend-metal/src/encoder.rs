@@ -256,7 +256,7 @@ pub struct ModelGpuWeights {
 }
 
 impl ModelGpuWeights {
-    fn require_tensor(
+    pub fn require_tensor(
         loader: &ShardedCheckpointLoader,
         name: &str,
         expected_dtype: DType,
@@ -278,9 +278,97 @@ impl ModelGpuWeights {
         Ok(())
     }
 
-    /// Performs the minimum fail-closed validation required before an archive is
-    /// allowed to serve real requests. The executor currently implements only
-    /// dense GQA layers with the canonical Llama/Mistral tensor layout.
+    /// Verifies that a norm, scale, or bias vector exists with float16, bfloat16, or float32 data.
+    pub fn require_norm_tensor(
+        loader: &ShardedCheckpointLoader,
+        name: &str,
+        expected_len: usize,
+    ) -> Result<(), MetalError> {
+        let view = loader.get_tensor(name)?;
+        match view.descriptor.dtype {
+            DType::BF16 | DType::F16 | DType::F32 => {}
+            other => {
+                return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                    "tensor '{name}' has dtype {:?}; expected floating point",
+                    other
+                )));
+            }
+        }
+        if view.descriptor.shape != [expected_len] {
+            return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                "tensor '{name}' has shape {:?}; expected [{expected_len}]",
+                view.descriptor.shape
+            )));
+        }
+        Ok(())
+    }
+
+    /// Verifies that a quantized projection weight exists either as a unified `Q4Group64` tensor
+    /// or as an MLX 4-bit affine triplet (`.weight` + `.scales` + `.biases`) ready for zero-copy runtime loading.
+    pub fn require_q4_weight(
+        loader: &ShardedCheckpointLoader,
+        prefix: &str,
+        expected_shape: &[usize],
+    ) -> Result<(), MetalError> {
+        let weight_name = format!("{prefix}.weight");
+        // Path A: Unified Q4Group64 tensor from kriya_convert
+        if let Ok(view) = loader.get_tensor(&weight_name) {
+            if view.descriptor.dtype == DType::Q4Group64 {
+                if view.descriptor.shape == expected_shape {
+                    return Ok(());
+                } else {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "tensor '{weight_name}' shape {:?} does not match expected {:?}",
+                        view.descriptor.shape, expected_shape
+                    )));
+                }
+            }
+            // Path B: Native MLX 3-tensor triplet (.weight with .scales and .biases)
+            let s_name = format!("{prefix}.scales");
+            let b_name = format!("{prefix}.biases");
+            if loader.get_tensor(&s_name).is_ok() && loader.get_tensor(&b_name).is_ok() {
+                let rows = expected_shape[0];
+                let cols = expected_shape[1];
+                let num_blocks = rows * cols.div_ceil(64);
+                let w_bytes = view.data.len();
+                if w_bytes == num_blocks * 32 {
+                    return Ok(());
+                } else {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX weight tensor '{weight_name}' byte length {} does not match expected {}",
+                        w_bytes,
+                        num_blocks * 32
+                    )));
+                }
+            }
+        }
+
+        // Check bare prefix (some archives omit the .weight suffix)
+        if let Ok(view) = loader.get_tensor(prefix) {
+            if view.descriptor.dtype == DType::Q4Group64 && view.descriptor.shape == expected_shape {
+                return Ok(());
+            }
+            let s_name = format!("{prefix}.scales");
+            let b_name = format!("{prefix}.biases");
+            if loader.get_tensor(&s_name).is_ok() && loader.get_tensor(&b_name).is_ok() {
+                let rows = expected_shape[0];
+                let cols = expected_shape[1];
+                let num_blocks = rows * cols.div_ceil(64);
+                let w_bytes = view.data.len();
+                if w_bytes == num_blocks * 32 {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(MetalError::UnsupportedProductionConfiguration(format!(
+            "checkpoint is missing valid Q4Group64 or MLX 4-bit affine weight for '{prefix}'"
+        )))
+    }
+
+    /// Performs fail-closed validation required before an archive is
+    /// allowed to serve real requests. Supports both native unified `Q4Group64`
+    /// checkpoints and direct zero-conversion MLX community 4-bit checkpoints.
     pub fn validate_production_checkpoint<P: AsRef<Path>>(
         desc: &ModelArchDescriptor,
         checkpoint_dir: P,
@@ -313,45 +401,53 @@ impl ModelGpuWeights {
                     layer.layer_idx
                 )));
             }
-            if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
-                return Err(MetalError::UnsupportedProductionConfiguration(format!(
-                    "layer {} requires post-attention or post-FFN normalization that the production executor does not execute",
-                    layer.layer_idx
-                )));
-            }
         }
 
         let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
         let h = desc.hidden_size as usize;
-        Self::require_tensor(
+        Self::require_q4_weight(
             &loader,
-            "model.embed_tokens.weight",
-            DType::Q4Group64,
+            "model.embed_tokens",
             &[desc.vocab_size as usize, h],
         )?;
-        Self::require_tensor(&loader, "model.norm.weight", DType::BF16, &[h])?;
+        Self::require_norm_tensor(&loader, "model.norm.weight", h)?;
         if !desc.tie_word_embeddings {
-            Self::require_tensor(
+            Self::require_q4_weight(
                 &loader,
-                "lm_head.weight",
-                DType::Q4Group64,
+                "lm_head",
                 &[desc.vocab_size as usize, h],
             )?;
         }
         for layer in &desc.layers {
             let p = format!("model.layers.{}", layer.layer_idx);
-            Self::require_tensor(
+            Self::require_norm_tensor(
                 &loader,
                 &format!("{p}.input_layernorm.weight"),
-                DType::BF16,
-                &[h],
+                h,
             )?;
-            Self::require_tensor(
-                &loader,
-                &format!("{p}.post_attention_layernorm.weight"),
-                DType::BF16,
-                &[h],
-            )?;
+
+            // Support both standard FFN norm and Gemma 2 pre/post norm layouts
+            if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
+                if loader.get_tensor(&format!("{p}.pre_feedforward_layernorm.weight")).is_ok() {
+                    Self::require_norm_tensor(
+                        &loader,
+                        &format!("{p}.pre_feedforward_layernorm.weight"),
+                        h,
+                    )?;
+                } else {
+                    Self::require_norm_tensor(
+                        &loader,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        h,
+                    )?;
+                }
+            } else {
+                Self::require_norm_tensor(
+                    &loader,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    h,
+                )?;
+            }
 
             let SequenceMixerDescriptor::GroupedQueryAttention {
                 num_q_heads,
@@ -372,35 +468,31 @@ impl ModelGpuWeights {
                 ("v_proj", vec![kv_dim, h]),
                 ("o_proj", vec![h, q_dim]),
             ] {
-                Self::require_tensor(
+                Self::require_q4_weight(
                     &loader,
-                    &format!("{p}.self_attn.{suffix}.weight"),
-                    DType::Q4Group64,
+                    &format!("{p}.self_attn.{suffix}"),
                     &shape,
                 )?;
             }
             if qkv_bias {
                 for (suffix, shape) in [("q_proj", q_dim), ("k_proj", kv_dim), ("v_proj", kv_dim)] {
-                    Self::require_tensor(
+                    Self::require_norm_tensor(
                         &loader,
                         &format!("{p}.self_attn.{suffix}.bias"),
-                        DType::BF16,
-                        &[shape],
+                        shape,
                     )?;
                 }
             }
             if qk_norm.is_some() {
-                Self::require_tensor(
+                Self::require_norm_tensor(
                     &loader,
                     &format!("{p}.self_attn.q_norm.weight"),
-                    DType::BF16,
-                    &[head_dim as usize],
+                    head_dim as usize,
                 )?;
-                Self::require_tensor(
+                Self::require_norm_tensor(
                     &loader,
                     &format!("{p}.self_attn.k_norm.weight"),
-                    DType::BF16,
-                    &[head_dim as usize],
+                    head_dim as usize,
                 )?;
             }
 
@@ -416,10 +508,9 @@ impl ModelGpuWeights {
                 ("up_proj", vec![inter, h]),
                 ("down_proj", vec![h, inter]),
             ] {
-                Self::require_tensor(
+                Self::require_q4_weight(
                     &loader,
-                    &format!("{p}.mlp.{suffix}.weight"),
-                    DType::Q4Group64,
+                    &format!("{p}.mlp.{suffix}"),
                     &shape,
                 )?;
             }
@@ -476,10 +567,41 @@ impl ModelGpuWeights {
         };
 
         let try_bind_bf16 = |name: &str| -> Option<Buffer> {
-            let bytes = loader.get_tensor_bytes(name).ok()?;
+            let view = loader.get_tensor(name).ok()?;
+            let bf16_bytes: Vec<u8> = match view.descriptor.dtype {
+                DType::BF16 => view.data.to_vec(),
+                DType::F16 => {
+                    let num_elements = view.data.len() / 2;
+                    let mut converted = Vec::with_capacity(num_elements * 2);
+                    for i in 0..num_elements {
+                        let f16_val = u16::from_le_bytes([view.data[i * 2], view.data[i * 2 + 1]]);
+                        let f32_val = kriya_core::quantizer::f16_bits_to_f32(f16_val);
+                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
+                        converted.extend_from_slice(&bf16_val.to_le_bytes());
+                    }
+                    converted
+                }
+                DType::F32 => {
+                    let num_elements = view.data.len() / 4;
+                    let mut converted = Vec::with_capacity(num_elements * 2);
+                    for i in 0..num_elements {
+                        let bytes = [
+                            view.data[i * 4],
+                            view.data[i * 4 + 1],
+                            view.data[i * 4 + 2],
+                            view.data[i * 4 + 3],
+                        ];
+                        let f32_val = f32::from_le_bytes(bytes);
+                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
+                        converted.extend_from_slice(&bf16_val.to_le_bytes());
+                    }
+                    converted
+                }
+                _ => view.data.to_vec(),
+            };
             Some(device.new_buffer_with_data(
-                bytes.as_ptr() as *const _,
-                bytes.len() as u64,
+                bf16_bytes.as_ptr() as *const _,
+                bf16_bytes.len() as u64,
                 shared,
             ))
         };
@@ -2834,14 +2956,11 @@ impl MetalExecutor {
                         MTLSize::new(32, 1, 1),
                     );
 
-                    // Attention: FlashAttention 2D block-tiled for M >= 16,
-                    // otherwise scalar parallel 2D causal dispatch.
-                    // FlashAttention loads Q/K/V tiles into threadgroup SRAM
-                    // with online softmax, achieving 5-10x prefill speedup.
-                    let use_flashattn = num_tokens >= 16 && head_dim <= 256;
-                    let kernel_name = if use_flashattn {
-                        "bsr_paged_gqa_flashattn_prefill"
-                    } else if num_tokens >= 64 {
+                    // Attention: Vectorized Block-Query Prefill (bq8) for num_tokens >= 8,
+                    // otherwise scalar parallel causal dispatch.
+                    // Handles full head dimensions (64, 128, 256) with online softmax in SRAM.
+                    let use_bq8 = num_tokens >= 8;
+                    let kernel_name = if use_bq8 {
                         "bsr_paged_gqa_prefill_stage1_bq8"
                     } else {
                         "bsr_paged_gqa_prefill_stage1"
@@ -2876,21 +2995,12 @@ impl MetalExecutor {
                         &gqa_params as *const _ as *const _,
                     );
                     let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
-                    if use_flashattn {
-                        // FlashAttention: 16 query tokens per tile, 16x16 threadgroup
-                        let num_tiles = num_tokens.div_ceil(16) as u64;
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(num_tiles, num_kv_heads as u64, 1),
-                            MTLSize::new(16, 16, 1),
-                        );
-                    } else {
-                        let num_tiles =
-                            num_tokens.div_ceil(if num_tokens >= 64 { 8 } else { 4 }) as u64;
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(num_tiles, num_kv_heads as u64, 1),
-                            MTLSize::new(32 * gqa_ratio, 1, 1),
-                        );
-                    }
+                    let query_tokens_per_tile = if use_bq8 { 8 } else { 4 };
+                    let num_tiles = num_tokens.div_ceil(query_tokens_per_tile) as u64;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(num_tiles, num_kv_heads as u64, 1),
+                        MTLSize::new(32 * gqa_ratio, 1, 1),
+                    );
 
                     // Note: Split-K for prefill (contexts > threshold blocks) is not
                     // yet implemented in the parallel prefill kernel. For typical

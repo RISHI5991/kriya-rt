@@ -286,10 +286,10 @@ impl HuggingFaceModelConfig {
                 layer_idx: idx,
                 attn_norm: rms,
                 seq_mixer,
-                post_attn_norm: None,
+                post_attn_norm: if is_gemma { Some(rms) } else { None },
                 ffn_norm: rms,
-                channel_mixer,
-                post_ffn_norm: None,
+                channel_mixer: channel_mixer.clone(),
+                post_ffn_norm: if is_gemma { Some(rms) } else { None },
             });
         }
 

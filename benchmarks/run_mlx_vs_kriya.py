@@ -269,23 +269,23 @@ def run_benchmark_for_model(model_key: str, workspace_root: str) -> Dict[str, An
     if model_key == "qwen":
         label = "Qwen2.5-0.5B-Instruct (4-bit Group-64)"
         mlx_path = os.path.join(workspace_root, "models", "qwen2.5-0.5b-instruct-mlx-q4")
-        kriya_path = os.path.join(workspace_root, "models", "qwen2.5-0.5b-instruct-kriya-q4")
+        kriya_path = mlx_path if os.path.exists(mlx_path) else os.path.join(workspace_root, "models", "qwen2.5-0.5b-instruct-kriya-q4")
     elif model_key == "qwen1.5b":
         label = "Qwen2.5-1.5B-Instruct (4-bit Group-64)"
         mlx_path = os.path.join(workspace_root, "models", "qwen2.5-1.5b-instruct-mlx-q4")
-        kriya_path = os.path.join(workspace_root, "models", "qwen2.5-1.5b-instruct-kriya-q4")
+        kriya_path = mlx_path if os.path.exists(mlx_path) else os.path.join(workspace_root, "models", "qwen2.5-1.5b-instruct-kriya-q4")
     elif model_key == "qwen3b":
         label = "Qwen2.5-3B-Instruct (4-bit Group-64)"
         mlx_path = os.path.join(workspace_root, "models", "qwen2.5-3b-instruct-mlx-q4")
-        kriya_path = os.path.join(workspace_root, "models", "qwen2.5-3b-instruct-kriya-q4")
+        kriya_path = mlx_path if os.path.exists(mlx_path) else os.path.join(workspace_root, "models", "qwen2.5-3b-instruct-kriya-q4")
     elif model_key == "smollm":
         label = "SmolLM2-135M-Instruct (4-bit Group-64)"
         mlx_path = os.path.join(workspace_root, "models", "smollm2-135m-instruct-mlx-q4")
-        kriya_path = os.path.join(workspace_root, "models", "smollm2-135m-instruct-kriya-q4")
+        kriya_path = mlx_path if os.path.exists(mlx_path) else os.path.join(workspace_root, "models", "smollm2-135m-instruct-kriya-q4")
     elif model_key == "gemma2b":
         label = "Gemma-2-2B-IT (4-bit Group-64)"
         mlx_path = os.path.join(workspace_root, "models", "gemma-2-2b-it-mlx-q4")
-        kriya_path = os.path.join(workspace_root, "models", "gemma-2-2b-it-kriya-q4")
+        kriya_path = mlx_path if os.path.exists(mlx_path) else os.path.join(workspace_root, "models", "gemma-2-2b-it-kriya-q4")
     else:
         raise ValueError(f"Unknown model key: {model_key}")
 
