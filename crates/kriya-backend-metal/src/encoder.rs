@@ -1760,19 +1760,19 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
                 self.signal_value += 1;
                 cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
                 self.wait_for_gpu(self.signal_value).await?;
-                if !is_last_layer {
-                    cmd_buf = self.command_queue.new_command_buffer();
-                    enc = cmd_buf.new_compute_command_encoder();
-                    layers_in_chunk = 0;
-                }
+                cmd_buf = self.command_queue.new_command_buffer();
+                enc = cmd_buf.new_compute_command_encoder();
+                layers_in_chunk = 0;
             }
         }
+
+        enc.end_encoding();
 
         // Dispatching attention alone is not verification.  Until this routine reads
         // target-model logits and applies EAGLE's acceptance rule, returning a draft
@@ -2390,17 +2390,15 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
                 self.signal_value += 1;
                 cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
                 self.wait_for_gpu(self.signal_value).await?;
-                if !is_last_layer {
-                    cmd_buf = self.command_queue.new_command_buffer();
-                    enc = cmd_buf.new_compute_command_encoder();
-                    layers_in_chunk = 0;
-                }
+                cmd_buf = self.command_queue.new_command_buffer();
+                enc = cmd_buf.new_compute_command_encoder();
+                layers_in_chunk = 0;
             }
         }
 
@@ -3305,17 +3303,15 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
                 self.signal_value += 1;
                 cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
                 self.wait_for_gpu(self.signal_value).await?;
-                if !is_last_layer {
-                    cmd_buf = self.command_queue.new_command_buffer();
-                    enc = cmd_buf.new_compute_command_encoder();
-                    layers_in_chunk = 0;
-                }
+                cmd_buf = self.command_queue.new_command_buffer();
+                enc = cmd_buf.new_compute_command_encoder();
+                layers_in_chunk = 0;
             }
         }
 
@@ -4207,17 +4203,15 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
                 self.signal_value += 1;
                 cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
                 self.wait_for_gpu(self.signal_value).await?;
-                if !is_last_layer {
-                    cmd_buf = self.command_queue.new_command_buffer();
-                    enc = cmd_buf.new_compute_command_encoder();
-                    layers_in_chunk = 0;
-                }
+                cmd_buf = self.command_queue.new_command_buffer();
+                enc = cmd_buf.new_compute_command_encoder();
+                layers_in_chunk = 0;
             }
         }
 

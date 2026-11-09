@@ -488,8 +488,8 @@ fn test_bsr_paged_gqa_real_dimensions() {
             &gqa_params as *const _ as *const _,
         );
         enc.dispatch_thread_groups(
-            MTLSize::new(1, NUM_KV_HEADS as u64, 1),
-            MTLSize::new(32 * gqa_ratio as u64, 1, 1),
+            MTLSize::new(1, NUM_Q_HEADS as u64, 1),
+            MTLSize::new(32, 1, 1),
         );
         enc.end_encoding();
         cmd.commit();
@@ -802,7 +802,7 @@ fn test_prefill_batch_matches_token_by_token() {
 
     // Build a single parallel prefill layout for the entire chunk
     let prefix_plan = kv_mgr_batch
-        .build_parallel_prefill_layout(1, 3, 16, 16)
+        .build_parallel_prefill_layout(1, 0, 3, 16)
         .unwrap();
 
     let positions = vec![0u32, 1, 2];
