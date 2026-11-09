@@ -9,7 +9,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum GraphError {
-    #[error("Workspace allocation failure: required {required_bytes} bytes exceeds budget {budget_bytes}")]
+    #[error(
+        "Workspace allocation failure: required {required_bytes} bytes exceeds budget {budget_bytes}"
+    )]
     OomBudgetExceeded {
         required_bytes: usize,
         budget_bytes: usize,

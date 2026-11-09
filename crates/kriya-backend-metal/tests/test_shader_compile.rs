@@ -1,5 +1,6 @@
 //! Hardware Metal Shader Compilation & Live Apple Silicon GPU Execution Verification Suite.
 
+use futures::executor::block_on;
 use metal::{Device, MTLResourceOptions, MTLSize};
 use std::path::PathBuf;
 use std::process::Command;
@@ -206,22 +207,21 @@ fn test_production_executor_runs_complete_dense_q4_fixture_on_metal() {
     let mut kv = kriya_kv::bsr_paged::PagedKvCacheManager::new(16, 16, 16);
     kv.allocate_sequence(7, &[1, 2]).unwrap();
     let schedule = kv.build_schedule_plan(&[7], 2).unwrap();
-    let sampled = executor
-        .forward_and_sample(
-            &descriptor,
-            &schedule,
-            &[1, 2],
-            &[0, 1],
-            kriya_backend_metal::encoder::SamplingConfig {
-                vocab_size: descriptor.vocab_size,
-                greedy: 1,
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 64,
-                rng_seed: 123,
-            },
-        )
-        .expect("strict production executor must complete its Metal forward pass");
+    let sampled = block_on(executor.forward_and_sample(
+        &descriptor,
+        &schedule,
+        &[1, 2],
+        &[0, 1],
+        kriya_backend_metal::encoder::SamplingConfig {
+            vocab_size: descriptor.vocab_size,
+            greedy: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 64,
+            rng_seed: 123,
+        },
+    ))
+    .expect("strict production executor must complete its Metal forward pass");
     assert!(sampled < descriptor.vocab_size);
 }
 
@@ -583,32 +583,31 @@ fn test_kv_layer_stride_and_kriya_convert_q4_binding() {
     let mut kv_mgr = kriya_kv::bsr_paged::PagedKvCacheManager::new(64, 16, 16);
     kv_mgr.allocate_sequence(1, &[10, 20, 30]).unwrap();
     let plan = kv_mgr.build_schedule_plan(&[1], 8).unwrap();
-    let tok = exec
-        .forward_and_sample(
-            &desc,
-            &plan,
-            &[10, 20, 30],
-            &[0, 1, 2],
-            kriya_backend_metal::encoder::SamplingConfig {
-                vocab_size: desc.vocab_size,
-                greedy: 1,
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 50,
-                rng_seed: 1,
-            },
-        )
-        .unwrap();
+    let tok = block_on(exec.forward_and_sample(
+        &desc,
+        &plan,
+        &[10, 20, 30],
+        &[0, 1, 2],
+        kriya_backend_metal::encoder::SamplingConfig {
+            vocab_size: desc.vocab_size,
+            greedy: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 50,
+            rng_seed: 1,
+        },
+    ))
+    .unwrap();
     assert!(tok < desc.vocab_size);
 
     // The GPU tree kernel remains available for development, but production
     // speculative decoding must reject it until target-logit acceptance is wired.
-    let verification = exec.verify_eagle_draft_tree_gpu(
+    let verification = block_on(exec.verify_eagle_draft_tree_gpu(
         &desc,
         &plan,
         &[tok, (tok + 1) % 100, (tok + 2) % 100],
         &[true, false, false, true, true, false, true, false, true],
-    );
+    ));
     assert!(matches!(
         verification,
         Err(kriya_backend_metal::encoder::MetalError::SpeculativeVerificationNotImplemented)
@@ -637,9 +636,11 @@ fn test_full_model_descriptors_and_weight_precision_policy() {
             .validate()
             .is_ok()
     );
-    assert!(kriya_core::descriptor::ModelArchDescriptor::gemma_2_9b()
-        .validate()
-        .is_ok());
+    assert!(
+        kriya_core::descriptor::ModelArchDescriptor::gemma_2_9b()
+            .validate()
+            .is_ok()
+    );
     assert!(
         kriya_core::descriptor::ModelArchDescriptor::deepseek_r1_distill_qwen_7b()
             .validate()

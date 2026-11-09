@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: Rustfmt Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy Lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Run clippy with warnings as errors
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check compilation
+        run: cargo check --workspace
+
+  test-unit:
+    name: Unit Tests (non-GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run unit tests (excluding GPU tests)
+        run: cargo test --workspace --lib --tests --exclude kriya-backend-metal --exclude kriya-server
+
+  test-metal:
+    name: Metal GPU Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Xcode Command Line Tools
+        run: xcode-select --install || true
+      - name: Check Metal shader compilation
+        run: cargo test -p kriya-backend-metal --test test_shader_compile -- --test-threads=1
+      - name: Run Metal GPU execution tests
+        run: cargo test -p kriya-backend-metal --test test_real_qwen -- --test-threads=1
+      - name: Run real-world validation tests
+        run: cargo test -p kriya-backend-metal --test real_world_validation -- --test-threads=1
+
+  bench:
+    name: Benchmark Harness
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Python dependencies
+        run: pip install mlx mlx-lm
+      - name: Build release binary
+        run: cargo build --release -p kriya-server
+      - name: Run MLX vs KriyaRT comparison
+        run: python3 benchmarks/run_mlx_vs_kriya.py --model qwen
+        env:
+          MLX_LOG_LEVEL: warn

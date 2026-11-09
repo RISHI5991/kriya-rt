@@ -11,6 +11,7 @@ kriya-scheduler = { path = "../kriya-scheduler" }
 kriya-speculate = { path = "../kriya-speculate" }
 bytemuck.workspace = true
 thiserror.workspace = true
+tokio = { version = "1.40", features = ["sync", "rt"] }
 
 # metal-rs crate provides safe Rust bindings to Apple's Metal API.
 # This crate only compiles on macOS/iOS targets.
@@ -20,3 +21,4 @@ objc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"
+futures = "0.3"

@@ -1,0 +1,71 @@
+{
+  "timestamp": "2026-10-25T20:32:50.336541",
+  "model_key": "qwen",
+  "model_label": "Qwen2.5-0.5B-Instruct (4-bit Group-64)",
+  "hardware": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm"
+  },
+  "mlx_results": {
+    "engine": "MLX",
+    "version": "0.32.4",
+    "load_time_s": 0.7498209476470947,
+    "peak_mem_mb": 647.515625,
+    "samples": [
+      {
+        "prompt_tokens": 64,
+        "ttft_ms": 61.93575001088902,
+        "prefill_tok_s": 1033.328893066574,
+        "tpot_ms": 7.680938866299887,
+        "decode_tok_s": 130.19241754253497,
+        "output_text": "In computer science and artificial intelligence, inference engines optimize tensor operations to achieve low latency"
+      },
+      {
+        "prompt_tokens": 255,
+        "ttft_ms": 182.9788329778239,
+        "prefill_tok_s": 1393.603816627821,
+        "tpot_ms": 7.758886134251952,
+        "decode_tok_s": 128.88447938235038,
+        "output_text": "and 4-bit block quantization to maximize hardware performance and memory bandwidth utilization."
+      },
+      {
+        "prompt_tokens": 512,
+        "ttft_ms": 344.9421660043299,
+        "prefill_tok_s": 1484.3067924423397,
+        "tpot_ms": 7.7174139325506985,
+        "decode_tok_s": 129.57708485509315,
+        "output_text": "in parallel with a single forward pass of the larger target model. The synergistic"
+      }
+    ]
+  },
+  "kriya_results": {
+    "engine": "KriyaRT",
+    "model_name": "HF-Auto-qwen2",
+    "model_layers": 24,
+    "total_run_time_s": 2.842852830886841,
+    "samples": [
+      {
+        "prompt_tokens": 64,
+        "ttft_ms": 92.110125,
+        "prefill_tok_s": 694.8204662625309,
+        "tpot_ms": 7.8135972,
+        "decode_tok_s": 127.98202599949738
+      },
+      {
+        "prompt_tokens": 256,
+        "ttft_ms": 362.993042,
+        "prefill_tok_s": 705.2476779981915,
+        "tpot_ms": 8.5531278,
+        "decode_tok_s": 116.9162934757037
+      },
+      {
+        "prompt_tokens": 512,
+        "ttft_ms": 771.9422500000001,
+        "prefill_tok_s": 663.2620510148265,
+        "tpot_ms": 7.934397200000001,
+        "decode_tok_s": 126.03351896726318
+      }
+    ]
+  }
+}

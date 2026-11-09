@@ -298,13 +298,12 @@ impl ModelArchDescriptor {
                 num_active_experts,
                 ..
             } = layer.channel_mixer
+                && (num_active_experts == 0 || num_active_experts > num_total_experts)
             {
-                if num_active_experts == 0 || num_active_experts > num_total_experts {
-                    return Err(DescriptorError::InvalidConfig(format!(
-                        "Layer {}: invalid MoE active experts ({}/{})",
-                        layer.layer_idx, num_active_experts, num_total_experts
-                    )));
-                }
+                return Err(DescriptorError::InvalidConfig(format!(
+                    "Layer {}: invalid MoE active experts ({}/{})",
+                    layer.layer_idx, num_active_experts, num_total_experts
+                )));
             }
         }
         Ok(())
@@ -694,14 +693,18 @@ mod tests {
 
         // Verify canonical weight names for a recurrent MoE layer vs a GQA MoE layer
         let l0_names = desc.layers[0].canonical_weight_names();
-        assert!(l0_names
-            .seq_mixer_tensors
-            .contains(&"model.layers.0.linear_attn.conv1d.weight".to_string()));
+        assert!(
+            l0_names
+                .seq_mixer_tensors
+                .contains(&"model.layers.0.linear_attn.conv1d.weight".to_string())
+        );
 
         let l3_names = desc.layers[3].canonical_weight_names();
-        assert!(l3_names
-            .seq_mixer_tensors
-            .contains(&"model.layers.3.self_attn.q_norm.weight".to_string()));
+        assert!(
+            l3_names
+                .seq_mixer_tensors
+                .contains(&"model.layers.3.self_attn.q_norm.weight".to_string())
+        );
     }
 
     #[test]

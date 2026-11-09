@@ -1,3 +1,4 @@
+use futures::executor::block_on;
 use kriya_backend_metal::encoder::{MetalExecutor, SamplingConfig};
 use kriya_core::quantizer::HuggingFaceModelConfig;
 use kriya_core::tokenizer::KriyaTokenizer;
@@ -52,7 +53,9 @@ fn test_real_qwen_inference() {
     // Prefill: process prompt tokens one by one
     let mut last_tok = input_ids[0];
     for (i, &tok) in input_ids.iter().enumerate() {
-        let plan = kv_mgr.build_prefix_schedule_plan(req_id, (i + 1) as u32, 128).unwrap();
+        let plan = kv_mgr
+            .build_prefix_schedule_plan(req_id, (i + 1) as u32, 128)
+            .unwrap();
         let samp = SamplingConfig {
             vocab_size: desc.vocab_size,
             greedy: 1,
@@ -61,7 +64,8 @@ fn test_real_qwen_inference() {
             top_k: 50,
             rng_seed: 42,
         };
-        last_tok = exec.forward_and_sample(&desc, &plan, &[tok], &[i as u32], samp).unwrap();
+        last_tok =
+            block_on(exec.forward_and_sample(&desc, &plan, &[tok], &[i as u32], samp)).unwrap();
         current_pos = i + 1;
     }
 
@@ -70,7 +74,9 @@ fn test_real_qwen_inference() {
     // Decode 8 tokens
     for step in 0..8 {
         kv_mgr.append_token_slot(req_id).unwrap();
-        let plan = kv_mgr.build_prefix_schedule_plan(req_id, (current_pos + 1) as u32, 128).unwrap();
+        let plan = kv_mgr
+            .build_prefix_schedule_plan(req_id, (current_pos + 1) as u32, 128)
+            .unwrap();
         let samp = SamplingConfig {
             vocab_size: desc.vocab_size,
             greedy: 1,
@@ -79,13 +85,14 @@ fn test_real_qwen_inference() {
             top_k: 50,
             rng_seed: 42 + step as u32,
         };
-        let next_tok = exec.forward_and_sample(
+        let next_tok = block_on(exec.forward_and_sample(
             &desc,
             &plan,
             &[generated.last().copied().unwrap()],
             &[current_pos as u32],
             samp,
-        ).unwrap();
+        ))
+        .unwrap();
         generated.push(next_tok);
         current_pos += 1;
     }

@@ -1,0 +1,71 @@
+{
+  "timestamp": "2026-11-01T14:06:22.912500",
+  "model_key": "gemma2b",
+  "model_label": "Gemma-2-2B-IT (4-bit Group-64)",
+  "hardware": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm"
+  },
+  "mlx_results": {
+    "engine": "MLX",
+    "version": "0.32.4",
+    "load_time_s": 2.190035104751587,
+    "peak_mem_mb": 600.890625,
+    "samples": [
+      {
+        "prompt_tokens": 65,
+        "ttft_ms": 235.58425001101568,
+        "prefill_tok_s": 275.90978597661206,
+        "tpot_ms": 33.973477800221495,
+        "decode_tok_s": 29.434725696333636,
+        "output_text": "dog. \n\nLet's break down the two questions:\n\n**Question"
+      },
+      {
+        "prompt_tokens": 257,
+        "ttft_ms": 699.7224579681642,
+        "prefill_tok_s": 367.28848284542687,
+        "tpot_ms": 30.428688934383292,
+        "decode_tok_s": 32.86372285563829,
+        "output_text": "caches, and 4-bit block quantization to maximize hardware performance and memory bandwidth"
+      },
+      {
+        "prompt_tokens": 513,
+        "ttft_ms": 1338.8087920029648,
+        "prefill_tok_s": 383.1764498890921,
+        "tpot_ms": 31.843444464417797,
+        "decode_tok_s": 31.403637917292855,
+        "output_text": "them in parallel with a single forward pass of the larger target model. Explain the"
+      }
+    ]
+  },
+  "kriya_results": {
+    "engine": "KriyaRT",
+    "model_name": "HF-Auto-gemma2",
+    "model_layers": 26,
+    "total_run_time_s": 16.31221318244934,
+    "samples": [
+      {
+        "prompt_tokens": 64,
+        "ttft_ms": 344.808,
+        "prefill_tok_s": 185.61054267882415,
+        "tpot_ms": 41.04276386666667,
+        "decode_tok_s": 24.364830868813904
+      },
+      {
+        "prompt_tokens": 256,
+        "ttft_ms": 1401.736334,
+        "prefill_tok_s": 182.63063729644324,
+        "tpot_ms": 43.941377800000005,
+        "decode_tok_s": 22.757593185892315
+      },
+      {
+        "prompt_tokens": 512,
+        "ttft_ms": 2982.3273329999997,
+        "prefill_tok_s": 171.67800272445817,
+        "tpot_ms": 43.75985553333333,
+        "decode_tok_s": 22.85199500346309
+      }
+    ]
+  }
+}

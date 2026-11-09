@@ -370,10 +370,10 @@ impl HybridDagCoordinator {
         table: &NeuronPlacementTable,
     ) {
         for (i, &compact_row) in active_cpu_compact_rows.iter().enumerate() {
-            if let Some(&orig_row) = table.cpu_cold_indices.get(compact_row as usize) {
-                if let Some(dst) = gpu_layer_output.get_mut(orig_row as usize) {
-                    *dst += cpu_cold_results[i];
-                }
+            if let Some(&orig_row) = table.cpu_cold_indices.get(compact_row as usize)
+                && let Some(dst) = gpu_layer_output.get_mut(orig_row as usize)
+            {
+                *dst += cpu_cold_results[i];
             }
         }
     }

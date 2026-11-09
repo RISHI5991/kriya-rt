@@ -20,4 +20,8 @@ thiserror.workspace = true
 rand.workspace = true
 futures-util.workspace = true
 bytemuck.workspace = true
+ring.workspace = true
 hf-hub.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

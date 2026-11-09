@@ -1,0 +1,71 @@
+{
+  "timestamp": "2026-10-25T11:27:14.003122",
+  "model_key": "smollm",
+  "model_label": "SmolLM2-135M-Instruct (4-bit Group-64)",
+  "hardware": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm"
+  },
+  "mlx_results": {
+    "engine": "MLX",
+    "version": "0.32.4",
+    "load_time_s": 0.29494810104370117,
+    "peak_mem_mb": 257.734375,
+    "samples": [
+      {
+        "prompt_tokens": 64,
+        "ttft_ms": 35.38004099391401,
+        "prefill_tok_s": 1808.9295038128737,
+        "tpot_ms": 3.687497267189125,
+        "decode_tok_s": 271.1866416547264,
+        "output_text": ". In computer science and artificial intelligence, inference engines optimize tensor operations to achieve low"
+      },
+      {
+        "prompt_tokens": 256,
+        "ttft_ms": 77.93475000653416,
+        "prefill_tok_s": 3284.7991425973214,
+        "tpot_ms": 3.82339166632543,
+        "decode_tok_s": 261.5478839919835,
+        "output_text": "Row paged key-value caches, and 4-bit block quant"
+      },
+      {
+        "prompt_tokens": 512,
+        "ttft_ms": 129.0446249768138,
+        "prefill_tok_s": 3967.619729159537,
+        "tpot_ms": 4.026222199900076,
+        "decode_tok_s": 248.37178634224867,
+        "output_text": "algorithms leverage smaller draft heads or speculative trees to propose multiple candidate tokens per step,"
+      }
+    ]
+  },
+  "kriya_results": {
+    "engine": "KriyaRT",
+    "model_name": "HF-Auto-llama",
+    "model_layers": 30,
+    "total_run_time_s": 3.5625150203704834,
+    "samples": [
+      {
+        "prompt_tokens": 64,
+        "ttft_ms": 201.71824999999998,
+        "prefill_tok_s": 317.2742178756756,
+        "tpot_ms": 11.241891666666668,
+        "decode_tok_s": 88.95300094067798
+      },
+      {
+        "prompt_tokens": 256,
+        "ttft_ms": 508.131792,
+        "prefill_tok_s": 503.80630385748424,
+        "tpot_ms": 19.120727733333336,
+        "decode_tok_s": 52.299264648630036
+      },
+      {
+        "prompt_tokens": 512,
+        "ttft_ms": 1373.7332079999999,
+        "prefill_tok_s": 372.70701255407084,
+        "tpot_ms": 18.440033333333336,
+        "decode_tok_s": 54.22983689472723
+      }
+    ]
+  }
+}

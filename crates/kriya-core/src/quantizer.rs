@@ -275,11 +275,7 @@ impl HuggingFaceModelConfig {
                         scaling_factor: rope_scaling_factor,
                     },
                     mask_variant: AttentionMaskVariant::Causal,
-                    qk_norm: if uses_qk_norm || is_gemma {
-                        Some(rms)
-                    } else {
-                        None
-                    },
+                    qk_norm: if uses_qk_norm { Some(rms) } else { None },
                     qkv_bias: uses_qkv_bias,
                     attn_logit_softcap: self.attn_logit_softcapping,
                     split_k_decode_threshold: 32_768,
@@ -304,7 +300,7 @@ impl HuggingFaceModelConfig {
             hidden_size: self.hidden_size,
             max_position_embeddings: self.max_position_embeddings,
             weight_dtype: DType::Q4Group64,
-            tie_word_embeddings: self.tie_word_embeddings,
+            tie_word_embeddings: self.tie_word_embeddings || is_gemma,
             final_norm: rms,
             final_logit_softcap: self.attn_logit_softcapping,
             phase_policy: PhaseRoutingPolicy::default(),

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "engine": "KriyaRT",
+  "model_name": "HF-Auto-qwen2",
+  "model_family": "qwen2",
+  "model_weight_format": "Q4_G64 + BF16 norms/biases",
+  "model_layers": 24,
+  "speculative_decoding_enabled": false,
+  "measured_at_unix_s": 1792857570,
+  "samples": [
+    {
+      "prompt_tokens": 64,
+      "ttft_ms": 591.021291,
+      "prefill_tokens_per_second": 108.28713106377754,
+      "tpot_ms": 17.763377799999997,
+      "decode_tokens_per_second": 56.29559936511625,
+      "sampled_token_ids": [
+        82,
+        430,
+        82,
+        11,
+        714,
+        807,
+        525,
+        537,
+        14312,
+        279,
+        1852,
+        13,
+        576,
+        11652,
+        374,
+        264
+      ]
+    },
+    {
+      "prompt_tokens": 256,
+      "ttft_ms": 1213.8474999999999,
+      "prefill_tokens_per_second": 210.89963936985498,
+      "tpot_ms": 30.138925000000004,
+      "decode_tokens_per_second": 33.17968374784435,
+      "sampled_token_ids": [
+        284,
+        311,
+        311,
+        69376,
+        311,
+        311,
+        90840,
+        14224,
+        311,
+        1140,
+        311,
+        1140,
+        11,
+        311,
+        1140,
+        311
+      ]
+    },
+    {
+      "prompt_tokens": 512,
+      "ttft_ms": 2666.25225,
+      "prefill_tokens_per_second": 192.02984263773243,
+      "tpot_ms": 30.007625,
+      "decode_tokens_per_second": 33.32486326392042,
+      "sampled_token_ids": [
+        82,
+        13,
+        682,
+        86,
+        13,
+        289,
+        13,
+        220,
+        73345,
+        13343,
+        9370,
+        11,
+        220,
+        16,
+        13,
+        220
+      ]
+    }
+  ]
+}

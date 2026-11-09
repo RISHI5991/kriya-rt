@@ -15,6 +15,10 @@ pub enum SpeculateError {
     MissingTargetDistribution { node_id: usize },
 }
 
+/// Target-verified speculative output: accepted token IDs, their tree-node
+/// indices, and the corresponding target-model features.
+pub type VerifiedDraftBranch = (Vec<u32>, Vec<usize>, Vec<Vec<f32>>);
+
 /// Deterministic pseudo-random number generator (xorshift64*) for reproducible
 /// speculative acceptance/rejection sampling and training noise injection.
 #[derive(Debug, Clone)]
@@ -376,7 +380,7 @@ impl EagleDraftEngine {
         target_probs: &[Vec<f32>],
         target_features: &[Vec<f32>],
         rng: &mut DeterministicRng,
-    ) -> Result<(Vec<u32>, Vec<usize>, Vec<Vec<f32>>), SpeculateError> {
+    ) -> Result<VerifiedDraftBranch, SpeculateError> {
         if target_probs.len() < tree.nodes.len() || target_features.len() < tree.nodes.len() {
             return Err(SpeculateError::MissingTargetDistribution {
                 node_id: target_probs.len(),
@@ -567,7 +571,9 @@ impl EagleDraftEngine {
         {
             return Err(SpeculateError::InvalidTreeConfig(format!(
                 "EAGLE weight artifact is for version {version}, hidden_dim {hidden_dim}, vocab_size {vocab_size}; expected version {}, hidden_dim {}, vocab_size {}",
-                Self::WEIGHTS_VERSION, self.hidden_dim, self.vocab_size
+                Self::WEIGHTS_VERSION,
+                self.hidden_dim,
+                self.vocab_size
             )));
         }
 

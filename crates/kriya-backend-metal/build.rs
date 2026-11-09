@@ -40,10 +40,7 @@ fn main() {
 
     let mut code = String::new();
     for (name, src) in &shader_sources {
-        let var_name = name
-            .replace('.', "_")
-            .replace('-', "_")
-            .to_uppercase();
+        let var_name = name.replace(['.', '-'], "_").to_uppercase();
         code.push_str(&format!(
             "pub const {}: &str = r#\"{}\"#;\n\n",
             var_name, src
@@ -54,7 +51,10 @@ fn main() {
 
     // Re-run build if any shader changes.
     for file in &shader_files {
-        println!("cargo:rerun-if-changed={}", kernels_dir.join(file).display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            kernels_dir.join(file).display()
+        );
     }
     println!("cargo:rerun-if-changed=build.rs");
 }

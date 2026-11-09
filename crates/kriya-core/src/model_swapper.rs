@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[cfg(unix)]
-extern "C" {
+unsafe extern "C" {
     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
 }
 
@@ -79,13 +79,12 @@ impl DynamicModelSwapper {
             return Err(TensorError::TensorNotFound(target_id.to_string()));
         }
 
-        if let Some(prev_id) = self.active_model_id.take() {
-            if prev_id != target_id {
-                if let Some(prev_slot) = self.models.get_mut(&prev_id) {
-                    Self::advise_pages(&prev_slot.archive, ModelResidencyState::ParkedCold);
-                    prev_slot.state = ModelResidencyState::ParkedCold;
-                }
-            }
+        if let Some(prev_id) = self.active_model_id.take()
+            && prev_id != target_id
+            && let Some(prev_slot) = self.models.get_mut(&prev_id)
+        {
+            Self::advise_pages(&prev_slot.archive, ModelResidencyState::ParkedCold);
+            prev_slot.state = ModelResidencyState::ParkedCold;
         }
 
         let slot = self.models.get_mut(target_id).unwrap();

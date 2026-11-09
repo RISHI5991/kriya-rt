@@ -45,6 +45,14 @@ pub enum DType {
     Q4Group64,
     /// FlexGen-style 4-bit KV cache / activation group-32 compression: 16 bytes payload + f16 scale/min.
     Q4KvGroup32,
+    /// 32-bit unsigned integer (used for MLX packed 4-bit weights).
+    U32,
+    /// 8-bit unsigned integer (used for quantized byte weights).
+    U8,
+    /// 32-bit signed integer.
+    I32,
+    /// 8-bit signed integer.
+    I8,
 }
 
 impl DType {
@@ -52,7 +60,14 @@ impl DType {
     #[inline]
     pub const fn block_elements(&self) -> usize {
         match self {
-            DType::F32 | DType::F16 | DType::BF16 | DType::FP8E4M3 => 1,
+            DType::F32
+            | DType::F16
+            | DType::BF16
+            | DType::FP8E4M3
+            | DType::U32
+            | DType::U8
+            | DType::I32
+            | DType::I8 => 1,
             DType::Q4Group64 => 64,
             DType::Q4KvGroup32 => 32,
         }
@@ -62,9 +77,9 @@ impl DType {
     #[inline]
     pub const fn block_byte_size(&self) -> usize {
         match self {
-            DType::F32 => 4,
+            DType::F32 | DType::U32 | DType::I32 => 4,
             DType::F16 | DType::BF16 => 2,
-            DType::FP8E4M3 => 1,
+            DType::FP8E4M3 | DType::U8 | DType::I8 => 1,
             DType::Q4Group64 => 36, // 32B nibbles + 2B bf16 scale + 2B bf16 zero_bias
             DType::Q4KvGroup32 => 20, // 16B nibbles + 2B f16 scale + 2B f16 min
         }

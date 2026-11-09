@@ -40,6 +40,10 @@ impl DType {
             "BF16" => Ok(DType::BF16),
             "F8_E4M3" => Ok(DType::FP8E4M3),
             "Q4_G64" => Ok(DType::Q4Group64),
+            "U32" => Ok(DType::U32),
+            "U8" => Ok(DType::U8),
+            "I32" => Ok(DType::I32),
+            "I8" => Ok(DType::I8),
             other => Err(TensorError::InvalidMetadata(format!(
                 "Unsupported safetensors dtype: '{other}'"
             ))),
@@ -210,13 +214,30 @@ impl ShardedCheckpointLoader {
 
     /// Packs MLX-LM 4-bit affine triplets (`<prefix>.weight`, `<prefix>.scales`, `<prefix>.biases`)
     /// into contiguous 36-byte `BlockQ4Group64` blocks ready for `KriyaRT` Metal kernels.
+    /// Handles both IEEE 754 float16 (F16) and bfloat16 (BF16) scale/bias tensor formats.
     pub fn pack_mlx_affine_q4_group64(
         &self,
         prefix: &str,
     ) -> Result<Vec<BlockQ4Group64>, TensorError> {
+        let s_name = format!("{prefix}.scales");
+        let s_shard = self
+            .tensor_to_shard
+            .get(&s_name)
+            .ok_or_else(|| TensorError::TensorNotFound(s_name.clone()))?;
+        let s_view = self.shards.get(s_shard).unwrap().get_tensor(&s_name)?;
+        let s_is_f16 = s_view.descriptor.dtype == DType::F16;
+        let s_bytes = s_view.data;
+
+        let b_name = format!("{prefix}.biases");
+        let b_shard = self
+            .tensor_to_shard
+            .get(&b_name)
+            .ok_or_else(|| TensorError::TensorNotFound(b_name.clone()))?;
+        let b_view = self.shards.get(b_shard).unwrap().get_tensor(&b_name)?;
+        let b_is_f16 = b_view.descriptor.dtype == DType::F16;
+        let b_bytes = b_view.data;
+
         let w_bytes = self.get_tensor_bytes(&format!("{prefix}.weight"))?;
-        let s_bytes = self.get_tensor_bytes(&format!("{prefix}.scales"))?;
-        let b_bytes = self.get_tensor_bytes(&format!("{prefix}.biases"))?;
 
         if w_bytes.len() % 32 != 0 {
             return Err(TensorError::InvalidMetadata(format!(
@@ -233,16 +254,25 @@ impl ShardedCheckpointLoader {
             });
         }
 
-        let scales_u16: &[u16] = bytemuck::cast_slice(s_bytes);
-        let biases_u16: &[u16] = bytemuck::cast_slice(b_bytes);
-
         let mut packed_blocks = Vec::with_capacity(num_blocks);
         for blk_idx in 0..num_blocks {
             let mut qs = [0u8; 32];
             qs.copy_from_slice(&w_bytes[blk_idx * 32..(blk_idx + 1) * 32]);
+            let s_raw = u16::from_le_bytes([s_bytes[blk_idx * 2], s_bytes[blk_idx * 2 + 1]]);
+            let scale_bf16 = if s_is_f16 {
+                crate::quantizer::f32_to_bf16_bits(crate::quantizer::f16_bits_to_f32(s_raw))
+            } else {
+                s_raw
+            };
+            let b_raw = u16::from_le_bytes([b_bytes[blk_idx * 2], b_bytes[blk_idx * 2 + 1]]);
+            let bias_bf16 = if b_is_f16 {
+                crate::quantizer::f32_to_bf16_bits(crate::quantizer::f16_bits_to_f32(b_raw))
+            } else {
+                b_raw
+            };
             packed_blocks.push(BlockQ4Group64 {
-                scale_bf16: scales_u16[blk_idx],
-                bias_bf16: biases_u16[blk_idx],
+                scale_bf16,
+                bias_bf16,
                 qs,
             });
         }

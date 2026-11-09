@@ -21,7 +21,14 @@ use kriya_kv::bsr_paged::{CtaWorkTile, FlashInferSchedulePlan};
 use metal::*;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Notify;
+
+/// Maximum layers per command buffer chunk to avoid macOS command-buffer
+/// watchdog timeout (~5-9s on Apple Silicon). Deep models (42+ layers) must
+/// split execution across multiple command buffers with signal events between.
+const WATCHDOG_CHUNK_LAYERS: usize = 8;
 
 #[derive(Error, Debug)]
 pub enum MetalError {
@@ -73,6 +80,41 @@ pub struct GemmParams {
     pub n: u32,
     pub k: u32,
     pub num_k_blocks: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct QkvGemmParams {
+    pub m: u32,
+    pub k: u32,
+    pub num_k_blocks: u32,
+    pub q_dim: u32,
+    pub k_dim: u32,
+    pub v_dim: u32,
+    pub has_bias: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GateUpGemmParams {
+    pub m: u32,
+    pub k: u32,
+    pub num_k_blocks: u32,
+    pub intermediate_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GateUpSwigluGemmParams {
+    pub m: u32,
+    pub k: u32,
+    pub num_k_blocks: u32,
+    pub intermediate_size: u32,
+    pub activation_variant: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[repr(C)]
@@ -196,7 +238,9 @@ pub struct LayerGpuBuffers {
     pub o_proj: Buffer,
     pub q_norm: Buffer,
     pub k_norm: Buffer,
+    pub post_attn_norm: Option<Buffer>,
     pub ffn_norm: Buffer,
+    pub post_ffn_norm: Option<Buffer>,
     pub gate_proj: Buffer,
     pub up_proj: Buffer,
     pub down_proj: Buffer,
@@ -397,31 +441,29 @@ impl ModelGpuWeights {
         let try_bind_q4 = |prefix: &str| -> Option<Buffer> {
             // Path A: Try binding a unified `Q4_G64` tensor produced by `kriya_convert`
             let direct_key = format!("{prefix}.weight");
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key) {
-                if raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                    && loader
-                        .get_tensor_bytes(&format!("{prefix}.scales"))
-                        .is_err()
-                {
-                    return Some(device.new_buffer_with_data(
-                        raw_bytes.as_ptr() as *const _,
-                        raw_bytes.len() as u64,
-                        shared,
-                    ));
-                }
+            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key)
+                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && loader
+                    .get_tensor_bytes(&format!("{prefix}.scales"))
+                    .is_err()
+            {
+                return Some(device.new_buffer_with_data(
+                    raw_bytes.as_ptr() as *const _,
+                    raw_bytes.len() as u64,
+                    shared,
+                ));
             }
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix) {
-                if raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                    && loader
-                        .get_tensor_bytes(&format!("{prefix}.scales"))
-                        .is_err()
-                {
-                    return Some(device.new_buffer_with_data(
-                        raw_bytes.as_ptr() as *const _,
-                        raw_bytes.len() as u64,
-                        shared,
-                    ));
-                }
+            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix)
+                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && loader
+                    .get_tensor_bytes(&format!("{prefix}.scales"))
+                    .is_err()
+            {
+                return Some(device.new_buffer_with_data(
+                    raw_bytes.as_ptr() as *const _,
+                    raw_bytes.len() as u64,
+                    shared,
+                ));
             }
 
             // Path B: Fall back to MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
@@ -486,8 +528,16 @@ impl ModelGpuWeights {
             if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.k_norm.weight")) {
                 layer_bufs.k_norm = b;
             }
-            if let Some(b) = try_bind_bf16(&format!("{p}.post_attention_layernorm.weight")) {
+            if let Some(pre_ffn) = try_bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight")) {
+                layer_bufs.ffn_norm = pre_ffn;
+                layer_bufs.post_attn_norm =
+                    try_bind_bf16(&format!("{p}.post_attention_layernorm.weight"));
+                layer_bufs.post_ffn_norm =
+                    try_bind_bf16(&format!("{p}.post_feedforward_layernorm.weight"));
+            } else if let Some(b) = try_bind_bf16(&format!("{p}.post_attention_layernorm.weight")) {
                 layer_bufs.ffn_norm = b;
+                layer_bufs.post_attn_norm = None;
+                layer_bufs.post_ffn_norm = None;
             }
             if let Some(b) = try_bind_q4(&format!("{p}.mlp.gate_proj")) {
                 layer_bufs.gate_proj = b;
@@ -605,7 +655,10 @@ impl ModelGpuWeights {
                     expert_intermediate_size,
                     num_total_experts,
                     ..
-                } => (expert_intermediate_size as usize, num_total_experts as usize),
+                } => (
+                    expert_intermediate_size as usize,
+                    num_total_experts as usize,
+                ),
             };
 
             let inter_blocks = inter_dim.div_ceil(64);
@@ -620,7 +673,9 @@ impl ModelGpuWeights {
                 o_proj: alloc_q4_calibrated(h, q_dim.div_ceil(64), l_seed + 4, residual_proj_scale),
                 q_norm: alloc_bf16(head_dim),
                 k_norm: alloc_bf16(head_dim),
+                post_attn_norm: None,
                 ffn_norm: alloc_bf16(h),
+                post_ffn_norm: None,
                 gate_proj: alloc_q4_calibrated(
                     inter_dim * num_experts_pool,
                     k_blocks,
@@ -697,15 +752,15 @@ impl MetalPipelineCache {
                 })?
             } else {
                 // Fall back to embedded shader source (from build.rs)
-                match file {
-                    &"q4_gemm_and_moe.metal" => Q4_GEMM_AND_MOE_METAL,
-                    &"paged_gqa_and_deltanet.metal" => PAGED_GQA_AND_DELTANET_METAL,
-                    &"transformer_glue.metal" => TRANSFORMER_GLUE_METAL,
+                match *file {
+                    "q4_gemm_and_moe.metal" => Q4_GEMM_AND_MOE_METAL,
+                    "paged_gqa_and_deltanet.metal" => PAGED_GQA_AND_DELTANET_METAL,
+                    "transformer_glue.metal" => TRANSFORMER_GLUE_METAL,
                     _ => {
                         return Err(MetalError::ShaderError(format!(
                             "No embedded shader for '{}'",
                             file
-                        )))
+                        )));
                     }
                 }
                 .to_string()
@@ -798,8 +853,22 @@ pub struct MetalExecutor {
     pub alpha_decay_buf: Buffer,
     pub beta_lr_buf: Buffer,
     pub logits_buf: Buffer,
+    /// Pre-allocated logits buffer for EAGLE tree verification (avoids per-call allocation).
+    /// Sizes [max_tree_nodes, vocab_capped] in BF16.
+    pub tree_logits_buf: Buffer,
     pub sampled_token_buf: Buffer,
     pub block_size_tokens: u32,
+    /// Ping-pong scratch buffers for double-buffered CPU/GPU overlap.
+    /// Index 0 and 1 alternate between iterations so the CPU can encode
+    /// iteration N+1 while the GPU executes iteration N.
+    pub residual_buf_ping: Buffer,
+    pub residual_buf_pong: Buffer,
+    pub norm_out_buf_ping: Buffer,
+    pub norm_out_buf_pong: Buffer,
+    pub attn_out_buf_ping: Buffer,
+    pub attn_out_buf_pong: Buffer,
+    pub proj_out_buf_ping: Buffer,
+    pub proj_out_buf_pong: Buffer,
     /// Pre-allocated Split-K splits buffer (avoids synchronous Mach IPC in hot loop).
     pub split_k_splits_buf: Buffer,
     /// Tree node K/V commit buffers for speculative decoding:
@@ -814,6 +883,9 @@ pub struct MetalExecutor {
     pub shared_event: SharedEvent,
     /// Signal value counter for tracking command buffer completion.
     pub signal_value: u64,
+    /// Ping-pong scratch toggle for double-buffered CPU/GPU overlap.
+    /// Iteration N encodes into scratch[idx], iteration N+1 encodes into scratch[idx^1].
+    pub scratch_ping_pong_idx: u32,
 }
 
 impl MetalExecutor {
@@ -873,7 +945,18 @@ impl MetalExecutor {
             "embedding_lookup_q4_g64",
             "rms_norm_bf16",
             "q4_g64_decode_gemv",
+            "q4_g64_decode_gemv_sub16",
+            "q4_g64_decode_gemv_accumulate",
+            "q4_g64_decode_gemv_accumulate_sub16",
+            "q4_g64_decode_qkv_gemv",
+            "q4_g64_decode_qkv_gemv_sub16",
+            "q4_g64_decode_gate_up_gemv",
             "q4_g64_prefill_gemm",
+            "q4_g64_prefill_qkv_gemm",
+            "q4_g64_prefill_gate_up_gemm",
+            "q4_g64_batched_simdgroup_gemm_m64",
+            "q4_g64_batched_simdgroup_qkv_gemm_m64",
+            "q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64",
             "moe_router_topk_and_histogram",
             "moe_router_prefix_scan_and_scatter",
             "q4_g64_routed_moe_gemv",
@@ -881,6 +964,7 @@ impl MetalExecutor {
             "fused_qknorm_rope_and_kv_append",
             "bsr_paged_gqa_decode_stage1",
             "bsr_paged_gqa_prefill_stage1",
+            "bsr_paged_gqa_prefill_stage1_bq8",
             "bsr_paged_gqa_split_k_reduce",
             "bsr_paged_gqa_tree_verify",
             "gated_deltanet_recurrent_step",
@@ -913,7 +997,7 @@ impl MetalExecutor {
         // unified-memory machine.
         let max_batch_toks = (descriptor.phase_policy.prefill_chunk_size as usize).max(1);
         let h = descriptor.hidden_size as usize;
-        let (max_q_dim, max_inter_dim, max_k_experts, max_kv_heads, max_head_dim) =
+        let (max_q_dim, max_inter_dim, max_k_experts, _max_kv_heads, _max_head_dim) =
             descriptor.layers.iter().fold(
                 (h, h, 1usize, 1usize, h),
                 |(q_dim, inter_dim, active_experts, kv_heads, head_dim), layer| {
@@ -933,14 +1017,12 @@ impl MetalExecutor {
                             head_key_dim,
                             head_val_dim,
                             ..
-                        } => {
-                            (
-                                (num_heads as usize)
-                                    * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
-                                head_key_dim as usize,
-                                num_heads as usize,
-                            )
-                        }
+                        } => (
+                            (num_heads as usize)
+                                * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
+                            head_key_dim as usize,
+                            num_heads as usize,
+                        ),
                     };
                     let (layer_inter_dim, layer_active_experts) = match layer.channel_mixer {
                         ChannelMixerDescriptor::DenseMlp {
@@ -1041,7 +1123,9 @@ impl MetalExecutor {
             alpha_decay_buf,
             beta_lr_buf,
             logits_buf: alloc(max_batch_toks * vocab_capped * 2),
-            sampled_token_buf: alloc(16),
+            // Pre-allocated tree logits buffer for EAGLE verification (max 16 tree nodes).
+            tree_logits_buf: alloc(16 * vocab_capped * 2),
+            sampled_token_buf: alloc((max_batch_toks * 4).max(64)),
             block_size_tokens,
             // Tree node K/V commit buffers for speculative decoding
             // Layout: [num_layers, max_tree_nodes, max_q_dim] in BF16
@@ -1050,6 +1134,16 @@ impl MetalExecutor {
             // Shared event for async GPU completion signaling
             shared_event,
             signal_value: 0,
+            scratch_ping_pong_idx: 0,
+            // Ping-pong scratch buffers (double-buffer for CPU/GPU overlap)
+            residual_buf_ping: alloc(max_batch_toks * h * 2),
+            residual_buf_pong: alloc(max_batch_toks * h * 2),
+            norm_out_buf_ping: alloc(max_batch_toks * h * 2),
+            norm_out_buf_pong: alloc(max_batch_toks * h * 2),
+            attn_out_buf_ping: alloc(max_batch_toks * max_q_dim * 2),
+            attn_out_buf_pong: alloc(max_batch_toks * max_q_dim * 2),
+            proj_out_buf_ping: alloc(max_batch_toks * h * 2),
+            proj_out_buf_pong: alloc(max_batch_toks * h * 2),
         })
     }
 
@@ -1057,6 +1151,75 @@ impl MetalExecutor {
     #[inline]
     pub fn layer_kv_byte_offset(&self, layer_idx: usize) -> u64 {
         (layer_idx as u64) * self.layer_kv_stride_bytes
+    }
+
+    /// Waits for a submitted Metal command buffer to complete asynchronously.
+    ///
+    /// Replaces the CPU spin-yield busy-wait that pinned a core at 100%, caused
+    /// thermal throttling on M-series Macs, and stole memory bandwidth from the GPU.
+    /// Uses `MTLCommandBuffer.addCompletedHandler` with a `tokio::sync::Notify` so
+    /// the async worker loop can yield control back to Tokio while the GPU executes.
+    pub async fn wait_for_gpu(&self, signal_value: u64) -> Result<(), MetalError> {
+        let notify = Arc::new(Notify::new());
+        let notify_clone = Arc::clone(&notify);
+        let shared_event = self.shared_event.clone();
+        let sv = signal_value;
+
+        // Poller thread waits on the GPU signal so the Tokio task can yield control.
+        // This avoids the 100% CPU spin-yield that caused thermal throttling.
+        std::thread::spawn(move || {
+            while shared_event.signaled_value() < sv {
+                std::hint::spin_loop();
+            }
+            notify_clone.notify_one();
+        });
+        notify.notified().await;
+        Ok(())
+    }
+
+    /// Returns the next ping-pong scratch index and advances the toggle.
+    ///
+    /// Double-buffered scratch memory allows the CPU to encode iteration N+1
+    /// while the GPU executes iteration N, unlocking CPU/GPU overlap and higher
+    /// serving concurrency on memory-bandwidth-bound M-series Macs.
+    #[inline]
+    pub fn next_scratch_idx(&mut self) -> u32 {
+        let idx = self.scratch_ping_pong_idx;
+        self.scratch_ping_pong_idx ^= 1u32;
+        idx
+    }
+
+    /// Safely reads a `u32` from a Metal buffer at the given byte offset.
+    ///
+    /// This replaces unsafe pointer dereferences with a checked read. The buffer
+    /// must have been written to by the GPU and synchronized before calling this.
+    #[inline]
+    pub fn read_u32_from_buffer(&self, buffer: &Buffer, byte_offset: usize) -> u32 {
+        let ptr = unsafe { buffer.contents().add(byte_offset) as *const u32 };
+        // Safety: The buffer was allocated by Metal and the offset is within bounds.
+        // The caller must ensure the GPU has finished writing to this location.
+        unsafe { ptr.read_unaligned() }
+    }
+
+    /// Safely reads a slice of `u16` from a Metal buffer and converts to `Vec<f32>`.
+    ///
+    /// This replaces unsafe `from_raw_parts` with a safe copy. The buffer must
+    /// have been written to by the GPU and synchronized before calling this.
+    #[inline]
+    pub fn read_u16_slice_as_f32_from_buffer(
+        &self,
+        buffer: &Buffer,
+        byte_offset: usize,
+        len: usize,
+    ) -> Vec<f32> {
+        let ptr = unsafe { buffer.contents().add(byte_offset) as *const u16 };
+        // Safety: The buffer was allocated by Metal and the offset is within bounds.
+        // The caller must ensure the GPU has finished writing to this location.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        slice
+            .iter()
+            .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+            .collect()
     }
 
     /// Checks every host-provided slice before it is copied into fixed-size shared
@@ -1143,7 +1306,12 @@ impl MetalExecutor {
         };
 
         if m == 1 {
-            let pso = pipeline_cache.get_or_compile("q4_g64_decode_gemv")?;
+            let (kernel_name, tgp_divisor) = if params.num_k_blocks <= 16 {
+                ("q4_g64_decode_gemv_sub16", 8u32)
+            } else {
+                ("q4_g64_decode_gemv", 4u32)
+            };
+            let pso = pipeline_cache.get_or_compile(kernel_name)?;
             encoder.set_compute_pipeline_state(&pso);
             encoder.set_buffer(0, Some(weight_buf), 0);
             encoder.set_buffer(1, Some(input_buf), input_byte_offset);
@@ -1153,11 +1321,24 @@ impl MetalExecutor {
                 std::mem::size_of::<GemmParams>() as u64,
                 &params as *const _ as *const _,
             );
-            let tgp_count = n.div_ceil(4) as u64;
+            let tgp_count = n.div_ceil(tgp_divisor) as u64;
             encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+        } else if m >= 64 {
+            // Adaptive Multi-Tile Dispatch: Use M=64 hardware simdgroup_matrix GEMM for long context prefill
+            let pso = pipeline_cache.get_or_compile("q4_g64_batched_simdgroup_gemm_m64")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(weight_buf), 0);
+            encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(2, Some(output_buf), 0);
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<GemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let grid = MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1);
+            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
         } else {
-            // Route M > 1 batches to the threadgroup-tiled prefill GEMM kernel
-            // (verified against CPU reference; simdgroup_matrix variant has known transposition bugs)
+            // Route M < 64 batches to the threadgroup-tiled prefill GEMM kernel
             let pso = pipeline_cache.get_or_compile("q4_g64_prefill_gemm")?;
             encoder.set_compute_pipeline_state(&pso);
             encoder.set_buffer(0, Some(weight_buf), 0);
@@ -1174,6 +1355,289 @@ impl MetalExecutor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_q4_linear_accumulate(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        proj_weight: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        residual_inout: &Buffer,
+        n: u32,
+        k: u32,
+    ) -> Result<(), MetalError> {
+        let num_k_blocks = k.div_ceil(64);
+        let params = GemmParams {
+            m: 1,
+            n,
+            k,
+            num_k_blocks,
+        };
+
+        let (kernel_name, tgp_divisor) = if num_k_blocks <= 16 {
+            ("q4_g64_decode_gemv_accumulate_sub16", 8u32)
+        } else {
+            ("q4_g64_decode_gemv_accumulate", 4u32)
+        };
+
+        let pso = pipeline_cache.get_or_compile(kernel_name)?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(proj_weight), 0);
+        encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(2, Some(residual_inout), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        let tgp_count = n.div_ceil(tgp_divisor) as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_fused_qkv(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        q_weight: &Buffer,
+        k_weight: &Buffer,
+        v_weight: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        q_buf: &Buffer,
+        k_buf: &Buffer,
+        v_buf: &Buffer,
+        q_bias: &Buffer,
+        k_bias: &Buffer,
+        v_bias: &Buffer,
+        has_qkv_bias: bool,
+        m: u32,
+        k: u32,
+        q_dim: u32,
+        kv_dim: u32,
+    ) -> Result<(), MetalError> {
+        let has_bias = u32::from(has_qkv_bias);
+        let params = QkvGemmParams {
+            m,
+            k,
+            num_k_blocks: k.div_ceil(64),
+            q_dim,
+            k_dim: kv_dim,
+            v_dim: kv_dim,
+            has_bias,
+            _pad: 0,
+        };
+
+        let total_n = q_dim + kv_dim + kv_dim;
+
+        if m == 1 {
+            let (kernel_name, tgp_divisor) = if params.num_k_blocks <= 16 {
+                ("q4_g64_decode_qkv_gemv_sub16", 8u32)
+            } else {
+                ("q4_g64_decode_qkv_gemv", 4u32)
+            };
+            let pso = pipeline_cache.get_or_compile(kernel_name)?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(q_weight), 0);
+            encoder.set_buffer(1, Some(k_weight), 0);
+            encoder.set_buffer(2, Some(v_weight), 0);
+            encoder.set_buffer(3, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(4, Some(q_buf), 0);
+            encoder.set_buffer(5, Some(k_buf), 0);
+            encoder.set_buffer(6, Some(v_buf), 0);
+            encoder.set_buffer(7, Some(q_bias), 0);
+            encoder.set_buffer(8, Some(k_bias), 0);
+            encoder.set_buffer(9, Some(v_bias), 0);
+            encoder.set_bytes(
+                10,
+                std::mem::size_of::<QkvGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let tgp_count = total_n.div_ceil(tgp_divisor) as u64;
+            encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+        } else if m >= 64 {
+            let pso = pipeline_cache.get_or_compile("q4_g64_batched_simdgroup_qkv_gemm_m64")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(q_weight), 0);
+            encoder.set_buffer(1, Some(k_weight), 0);
+            encoder.set_buffer(2, Some(v_weight), 0);
+            encoder.set_buffer(3, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(4, Some(q_buf), 0);
+            encoder.set_buffer(5, Some(k_buf), 0);
+            encoder.set_buffer(6, Some(v_buf), 0);
+            encoder.set_buffer(7, Some(q_bias), 0);
+            encoder.set_buffer(8, Some(k_bias), 0);
+            encoder.set_buffer(9, Some(v_bias), 0);
+            encoder.set_bytes(
+                10,
+                std::mem::size_of::<QkvGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let grid = MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1);
+            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+        } else {
+            let pso = pipeline_cache.get_or_compile("q4_g64_prefill_qkv_gemm")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(q_weight), 0);
+            encoder.set_buffer(1, Some(k_weight), 0);
+            encoder.set_buffer(2, Some(v_weight), 0);
+            encoder.set_buffer(3, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(4, Some(q_buf), 0);
+            encoder.set_buffer(5, Some(k_buf), 0);
+            encoder.set_buffer(6, Some(v_buf), 0);
+            encoder.set_buffer(7, Some(q_bias), 0);
+            encoder.set_buffer(8, Some(k_bias), 0);
+            encoder.set_buffer(9, Some(v_bias), 0);
+            encoder.set_bytes(
+                10,
+                std::mem::size_of::<QkvGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let grid = MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
+            encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_fused_gate_up(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        gate_weight: &Buffer,
+        up_weight: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        gate_buf: &Buffer,
+        up_buf: &Buffer,
+        mlp_hidden_buf: &Buffer,
+        m: u32,
+        k: u32,
+        intermediate_size: u32,
+        activation: ActivationVariant,
+    ) -> Result<(), MetalError> {
+        let act_var = match activation {
+            ActivationVariant::SwiGLU => 0u32,
+            ActivationVariant::GeGLU => 1u32,
+            ActivationVariant::ReLU => 2u32,
+        };
+
+        if m >= 64 {
+            let params = GateUpSwigluGemmParams {
+                m,
+                k,
+                num_k_blocks: k.div_ceil(64),
+                intermediate_size,
+                activation_variant: act_var,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            let pso = pipeline_cache
+                .get_or_compile("q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(gate_weight), 0);
+            encoder.set_buffer(1, Some(up_weight), 0);
+            encoder.set_buffer(2, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(3, Some(mlp_hidden_buf), 0);
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<GateUpSwigluGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let grid = MTLSize::new(
+                intermediate_size.div_ceil(16) as u64,
+                m.div_ceil(64) as u64,
+                1,
+            );
+            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+        } else if m == 1 {
+            let params = GateUpGemmParams {
+                m,
+                k,
+                num_k_blocks: k.div_ceil(64),
+                intermediate_size,
+            };
+            let pso = pipeline_cache.get_or_compile("q4_g64_decode_gate_up_gemv")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(gate_weight), 0);
+            encoder.set_buffer(1, Some(up_weight), 0);
+            encoder.set_buffer(2, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(3, Some(gate_buf), 0);
+            encoder.set_buffer(4, Some(up_buf), 0);
+            encoder.set_bytes(
+                5,
+                std::mem::size_of::<GateUpGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let total_rows = intermediate_size * 2;
+            let tgp_count = total_rows.div_ceil(4) as u64;
+            encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+
+            let pso_act = pipeline_cache.get_or_compile("fused_gated_activation_bf16")?;
+            let act_params = ActivationParams {
+                num_elements: intermediate_size,
+                variant: act_var,
+            };
+            encoder.set_compute_pipeline_state(&pso_act);
+            encoder.set_buffer(0, Some(gate_buf), 0);
+            encoder.set_buffer(1, Some(up_buf), 0);
+            encoder.set_buffer(2, Some(mlp_hidden_buf), 0);
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<ActivationParams>() as u64,
+                &act_params as *const _ as *const _,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new(intermediate_size.div_ceil(256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        } else {
+            let params = GateUpGemmParams {
+                m,
+                k,
+                num_k_blocks: k.div_ceil(64),
+                intermediate_size,
+            };
+            let pso = pipeline_cache.get_or_compile("q4_g64_prefill_gate_up_gemm")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(gate_weight), 0);
+            encoder.set_buffer(1, Some(up_weight), 0);
+            encoder.set_buffer(2, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(3, Some(gate_buf), 0);
+            encoder.set_buffer(4, Some(up_buf), 0);
+            encoder.set_bytes(
+                5,
+                std::mem::size_of::<GateUpGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let total_rows = intermediate_size * 2;
+            let grid = MTLSize::new(total_rows.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
+            encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
+
+            let total_inter = m * intermediate_size;
+            let pso_act = pipeline_cache.get_or_compile("fused_gated_activation_bf16")?;
+            let act_params = ActivationParams {
+                num_elements: total_inter,
+                variant: act_var,
+            };
+            encoder.set_compute_pipeline_state(&pso_act);
+            encoder.set_buffer(0, Some(gate_buf), 0);
+            encoder.set_buffer(1, Some(up_buf), 0);
+            encoder.set_buffer(2, Some(mlp_hidden_buf), 0);
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<ActivationParams>() as u64,
+                &act_params as *const _ as *const _,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new(total_inter.div_ceil(256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn encode_bias_add(
         pipeline_cache: &mut MetalPipelineCache,
         encoder: &ComputeCommandEncoderRef,
@@ -1200,21 +1664,23 @@ impl MetalExecutor {
         Ok(())
     }
 
-    /// Reads the final normalized hidden state vector (`[hidden_size]` in f32) from unified memory
-    /// to feed `EagleDraftEngine` feature-level autoregression.
-    pub fn read_last_hidden_feature(&self, hidden_size: usize) -> Vec<f32> {
-        let slice = unsafe {
-            std::slice::from_raw_parts(self.norm_out_buf.contents() as *const u16, hidden_size)
-        };
-        slice
-            .iter()
-            .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
-            .collect()
+    /// Reads the normalized hidden state vector (`[hidden_size]` in f32) from unified memory
+    /// for a specific token index, to feed `EagleDraftEngine` feature-level autoregression.
+    ///
+    /// `token_index` is the row index in the batched output (0 = first token, num_tokens-1 = last).
+    pub fn read_hidden_feature_at(&self, hidden_size: usize, token_index: usize) -> Vec<f32> {
+        let byte_offset = token_index * hidden_size * 2;
+        self.read_u16_slice_as_f32_from_buffer(&self.norm_out_buf, byte_offset, hidden_size)
+    }
+
+    /// Reads the final normalized hidden state vector (last token) for EAGLE draft feature.
+    pub fn read_last_hidden_feature(&self, hidden_size: usize, num_tokens: usize) -> Vec<f32> {
+        self.read_hidden_feature_at(hidden_size, num_tokens.saturating_sub(1))
     }
 
     /// Blocker 2 Fix: Dispatches `bsr_paged_gqa_tree_verify` on the GPU to evaluate all
     /// `tree_tokens` (e.g., 11-node EAGLE draft tree) in a single GPU pass using `tree_mask`.
-    pub fn verify_eagle_draft_tree_gpu(
+    pub async fn verify_eagle_draft_tree_gpu(
         &mut self,
         descriptor: &ModelArchDescriptor,
         schedule_plan: &FlashInferSchedulePlan,
@@ -1238,8 +1704,10 @@ impl MetalExecutor {
             }
         }
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let enc = cmd_buf.new_compute_command_encoder();
+        let mut cmd_buf = self.command_queue.new_command_buffer();
+        let mut enc = cmd_buf.new_compute_command_encoder();
+        let mut layers_in_chunk = 0usize;
+        let num_layers = descriptor.layers.len();
 
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             if let SequenceMixerDescriptor::GroupedQueryAttention {
@@ -1289,15 +1757,21 @@ impl MetalExecutor {
                     MTLSize::new(32 * gqa_ratio, 1, 1),
                 );
             }
-        }
 
-        enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-        cmd_buf.commit();
-        // Non-blocking poll: yield between polls to avoid CPU starvation
-        while self.shared_event.signaled_value() < self.signal_value {
-            std::thread::yield_now();
+            layers_in_chunk += 1;
+            let is_last_layer = l_idx + 1 == num_layers;
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+                enc.end_encoding();
+                self.signal_value += 1;
+                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
+                cmd_buf.commit();
+                self.wait_for_gpu(self.signal_value).await?;
+                if !is_last_layer {
+                    cmd_buf = self.command_queue.new_command_buffer();
+                    enc = cmd_buf.new_compute_command_encoder();
+                    layers_in_chunk = 0;
+                }
+            }
         }
 
         // Dispatching attention alone is not verification.  Until this routine reads
@@ -1314,7 +1788,8 @@ impl MetalExecutor {
     /// Dequantizes the embedding weight buffer (`Q4Group64`) into a flat `Vec<f32>`
     /// matrix of shape `[vocab_size, hidden_size]` for the EAGLE draft engine.
     pub fn get_embedding_weights_f32(&self) -> Result<Vec<f32>, MetalError> {
-        let num_blocks = self.weights.embed_tokens.length() as usize / std::mem::size_of::<BlockQ4Group64>();
+        let num_blocks =
+            self.weights.embed_tokens.length() as usize / std::mem::size_of::<BlockQ4Group64>();
         let blocks_slice = unsafe {
             std::slice::from_raw_parts(
                 self.weights.embed_tokens.contents() as *const BlockQ4Group64,
@@ -1329,7 +1804,8 @@ impl MetalExecutor {
     /// Dequantizes the LM head weight buffer (`Q4Group64`) into a flat `Vec<f32>`
     /// matrix of shape `[vocab_size, hidden_size]` for the EAGLE draft engine.
     pub fn get_lm_head_weights_f32(&self) -> Result<Vec<f32>, MetalError> {
-        let num_blocks = self.weights.lm_head.length() as usize / std::mem::size_of::<BlockQ4Group64>();
+        let num_blocks =
+            self.weights.lm_head.length() as usize / std::mem::size_of::<BlockQ4Group64>();
         let blocks_slice = unsafe {
             std::slice::from_raw_parts(
                 self.weights.lm_head.contents() as *const BlockQ4Group64,
@@ -1348,7 +1824,7 @@ impl MetalExecutor {
     /// Unlike `forward_and_sample`, this does NOT write to the KV cache — tree
     /// nodes are speculative candidates that may be rejected. They attend to the
     /// historical paged KV prefix and to ancestor tree nodes via `tree_mask`.
-    pub fn forward_tree_logits(
+    pub async fn forward_tree_logits(
         &mut self,
         descriptor: &ModelArchDescriptor,
         schedule_plan: &FlashInferSchedulePlan,
@@ -1409,11 +1885,11 @@ impl MetalExecutor {
         let h = descriptor.hidden_size as usize;
         let vocab_capped = descriptor.vocab_size as usize;
         let num_k_blocks = h.div_ceil(64);
+        let _logits_bytes = num_tree_nodes * vocab_capped * 2;
 
-        // Allocate a temporary logits buffer large enough for all tree nodes.
-        // self.logits_buf is only sized for one sequence (vocab_capped * 2 bytes).
-        let logits_bytes = num_tree_nodes * vocab_capped * 2;
-        let logits_tmp = self.device.new_buffer(logits_bytes as u64, MTLResourceOptions::StorageModeShared);
+        // Use pre-allocated tree logits buffer (avoids per-call allocation on hot path).
+        // Sized for max 16 tree nodes; validated by check_capacity above.
+        let logits_tmp = self.tree_logits_buf.clone();
 
         // Copy tree tokens, mask, and BSR layout to GPU buffers
         unsafe {
@@ -1456,7 +1932,9 @@ impl MetalExecutor {
 
         // 1. Token Embedding Lookup for all tree nodes
         {
-            let pso = self.pipeline_cache.get_or_compile("embedding_lookup_q4_g64")?;
+            let pso = self
+                .pipeline_cache
+                .get_or_compile("embedding_lookup_q4_g64")?;
             let embed_params = EmbedLookupParams {
                 num_tokens: num_tree_nodes as u32,
                 hidden_size: h as u32,
@@ -1479,7 +1957,9 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer layers (tree mode — no KV cache writes)
-        // All layers encoded in a single command buffer (no splitting) to avoid Mach IPC overhead.
+        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
+        let mut layers_in_chunk = 0usize;
+        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -1523,7 +2003,6 @@ impl MetalExecutor {
                     head_dim,
                     pos_encoding,
                     qk_norm,
-                    attn_logit_softcap: _,
                     ..
                 } => {
                     let q_dim = num_q_heads * head_dim;
@@ -1571,9 +2050,7 @@ impl MetalExecutor {
                         } => (theta, rotary_dim),
                         PositionalEncoding::None => (10_000.0, 0),
                     };
-                    let rope_pso = self
-                        .pipeline_cache
-                        .get_or_compile("apply_rope_inplace")?;
+                    let rope_pso = self.pipeline_cache.get_or_compile("apply_rope_inplace")?;
                     let rope_params = RopeKvWriteParams {
                         num_q_heads,
                         num_kv_heads,
@@ -1631,9 +2108,9 @@ impl MetalExecutor {
                         sm_scale: 1.0 / (head_dim as f32).sqrt(),
                     };
                     enc.set_compute_pipeline_state(&tree_verify_pso);
-                    enc.set_buffer(0, Some(&self.q_buf), 0);     // tree_q
-                    enc.set_buffer(1, Some(&self.k_buf), 0);     // tree_k
-                    enc.set_buffer(2, Some(&self.v_buf), 0);     // tree_v
+                    enc.set_buffer(0, Some(&self.q_buf), 0); // tree_q
+                    enc.set_buffer(1, Some(&self.k_buf), 0); // tree_k
+                    enc.set_buffer(2, Some(&self.v_buf), 0); // tree_v
                     enc.set_buffer(3, Some(&self.kv_cache_k_buf), layer_kv_offset);
                     enc.set_buffer(4, Some(&self.kv_cache_v_buf), layer_kv_offset);
                     enc.set_buffer(5, Some(&self.indices_buf), 0);
@@ -1654,14 +2131,27 @@ impl MetalExecutor {
                     // Tree node n is at position base_pos + n in the accepted path.
                     // Buffer layout: [num_layers, 16, max_q_dim] BF16
                     let kv_dim = num_kv_heads * head_dim;
-                    let max_q_dim = descriptor.layers.iter().map(|l| match l.seq_mixer {
-                        SequenceMixerDescriptor::GroupedQueryAttention {
-                            num_q_heads, head_dim, ..
-                        } => (num_q_heads as usize) * (head_dim as usize),
-                        SequenceMixerDescriptor::GatedDeltaNetRecurrence {
-                            num_heads, head_key_dim, head_val_dim, ..
-                        } => (num_heads as usize) * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
-                    }).max().unwrap_or(h as usize);
+                    let max_q_dim = descriptor
+                        .layers
+                        .iter()
+                        .map(|l| match l.seq_mixer {
+                            SequenceMixerDescriptor::GroupedQueryAttention {
+                                num_q_heads,
+                                head_dim,
+                                ..
+                            } => (num_q_heads as usize) * (head_dim as usize),
+                            SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                                num_heads,
+                                head_key_dim,
+                                head_val_dim,
+                                ..
+                            } => {
+                                (num_heads as usize)
+                                    * ((head_key_dim as usize) * 2 + (head_val_dim as usize))
+                            }
+                        })
+                        .max()
+                        .unwrap_or(h);
                     let layer_tree_offset = l_idx * 16 * max_q_dim * 2;
                     let node_stride = max_q_dim * 2;
                     for n in 0..num_tree_nodes {
@@ -1711,14 +2201,45 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add
-            {
+            // 2c. First Residual Add (with post-attention norm for Gemma 2)
+            if let Some(ref post_attn) = lw.post_attn_norm {
+                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+                let norm_params = RmsNormParams {
+                    num_tokens: num_tree_nodes as u32,
+                    hidden_size: h as u32,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso_norm);
+                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
+                enc.set_buffer(1, Some(post_attn), 0);
+                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tree_nodes as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
+                let total_elems = num_tree_nodes * h;
+                enc.set_compute_pipeline_state(&pso_add);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else {
                 let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
                 let total_elems = num_tree_nodes * h;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(&self.residual_buf), 0);
                 enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &(total_elems as u32) as *const _ as *const _);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
                 enc.dispatch_thread_groups(
                     MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -1822,18 +2343,64 @@ impl MetalExecutor {
                 }
             }
 
-            // 2f. Second Residual Add
-            {
+            // 2f. Second Residual Add (with post-FFN norm for Gemma 2)
+            if let Some(ref post_ffn) = lw.post_ffn_norm {
+                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+                let norm_params = RmsNormParams {
+                    num_tokens: num_tree_nodes as u32,
+                    hidden_size: h as u32,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso_norm);
+                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
+                enc.set_buffer(1, Some(post_ffn), 0);
+                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tree_nodes as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
+                let total_elems = num_tree_nodes * h;
+                enc.set_compute_pipeline_state(&pso_add);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else {
                 let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
                 let total_elems = num_tree_nodes * h;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(&self.residual_buf), 0);
                 enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &(total_elems as u32) as *const _ as *const _);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
                 enc.dispatch_thread_groups(
                     MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+            }
+
+            layers_in_chunk += 1;
+            let is_last_layer = l_idx + 1 == num_layers;
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+                enc.end_encoding();
+                self.signal_value += 1;
+                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
+                cmd_buf.commit();
+                self.wait_for_gpu(self.signal_value).await?;
+                if !is_last_layer {
+                    cmd_buf = self.command_queue.new_command_buffer();
+                    enc = cmd_buf.new_compute_command_encoder();
+                    layers_in_chunk = 0;
+                }
             }
         }
 
@@ -1841,11 +2408,18 @@ impl MetalExecutor {
         //    Read back hidden states HERE (before LM Head overwrites norm_out_buf).
         {
             let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+            let (eps, zero_off) = match descriptor.final_norm {
+                NormVariant::RmsNorm {
+                    eps,
+                    zero_centered_unit_offset,
+                } => (eps, u32::from(zero_centered_unit_offset)),
+                NormVariant::LayerNorm { eps, .. } => (eps, 0),
+            };
             let norm_params = RmsNormParams {
                 num_tokens: num_tree_nodes as u32,
                 hidden_size: h as u32,
-                eps: 1e-6,
-                zero_centered_offset: 0,
+                eps,
+                zero_centered_offset: zero_off,
             };
             enc.set_compute_pipeline_state(&pso);
             enc.set_buffer(0, Some(&self.residual_buf), 0);
@@ -1864,20 +2438,13 @@ impl MetalExecutor {
 
         // Read back hidden states per tree node (BF16 -> F32).
         // These are the ACTUAL target model hidden states — needed for correct EAGLE acceptance.
-        let hidden_slice = unsafe {
-            std::slice::from_raw_parts(
-                self.norm_out_buf.contents() as *const u16,
-                num_tree_nodes * h,
-            )
-        };
+        let hidden_data =
+            self.read_u16_slice_as_f32_from_buffer(&self.norm_out_buf, 0, num_tree_nodes * h);
         let mut target_features = Vec::with_capacity(num_tree_nodes);
         for node in 0..num_tree_nodes {
             let start = node * h;
             let end = start + h;
-            let node_feat: Vec<f32> = hidden_slice[start..end]
-                .iter()
-                .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
-                .collect();
+            let node_feat: Vec<f32> = hidden_data[start..end].to_vec();
             target_features.push(node_feat);
         }
 
@@ -1898,27 +2465,16 @@ impl MetalExecutor {
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        // Non-blocking poll: yield between polls to avoid CPU starvation
-        while self.shared_event.signaled_value() < self.signal_value {
-            std::thread::yield_now();
-        }
+        self.wait_for_gpu(self.signal_value).await?;
 
         // Read back logits for all tree nodes (BF16 -> F32)
-        let logits_slice = unsafe {
-            std::slice::from_raw_parts(
-                logits_tmp.contents() as *const u16,
-                num_tree_nodes * vocab_capped,
-            )
-        };
+        let logits_data =
+            self.read_u16_slice_as_f32_from_buffer(&logits_tmp, 0, num_tree_nodes * vocab_capped);
         let mut all_logits = Vec::with_capacity(num_tree_nodes);
         for node in 0..num_tree_nodes {
             let start = node * vocab_capped;
             let end = start + vocab_capped;
-            let node_logits: Vec<f32> = logits_slice[start..end]
-                .iter()
-                .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
-                .collect();
-            all_logits.push(node_logits);
+            all_logits.push(logits_data[start..end].to_vec());
         }
 
         Ok((all_logits, target_features))
@@ -1938,32 +2494,45 @@ impl MetalExecutor {
     ) -> Result<(), MetalError> {
         let num_layers = descriptor.layers.len();
         let h = descriptor.hidden_size as usize;
-        let max_q_dim = descriptor.layers.iter().map(|l| match l.seq_mixer {
-            SequenceMixerDescriptor::GroupedQueryAttention {
-                num_q_heads, head_dim, ..
-            } => (num_q_heads as usize) * (head_dim as usize),
-            SequenceMixerDescriptor::GatedDeltaNetRecurrence {
-                num_heads, head_key_dim, head_val_dim, ..
-            } => (num_heads as usize) * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
-        }).max().unwrap_or(h);
+        let max_q_dim = descriptor
+            .layers
+            .iter()
+            .map(|l| match l.seq_mixer {
+                SequenceMixerDescriptor::GroupedQueryAttention {
+                    num_q_heads,
+                    head_dim,
+                    ..
+                } => (num_q_heads as usize) * (head_dim as usize),
+                SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                    num_heads,
+                    head_key_dim,
+                    head_val_dim,
+                    ..
+                } => (num_heads as usize) * ((head_key_dim as usize) * 2 + (head_val_dim as usize)),
+            })
+            .max()
+            .unwrap_or(h);
 
         for &(node_idx, phys_blk_id, slot_in_blk) in accepted_nodes {
             for l_idx in 0..num_layers {
                 let layer = &descriptor.layers[l_idx];
                 let (num_kv_heads, head_dim) = match layer.seq_mixer {
                     SequenceMixerDescriptor::GroupedQueryAttention {
-                        num_kv_heads, head_dim, ..
+                        num_kv_heads,
+                        head_dim,
+                        ..
                     } => (num_kv_heads as usize, head_dim as usize),
                     SequenceMixerDescriptor::GatedDeltaNetRecurrence {
-                        num_heads, head_key_dim, ..
+                        num_heads,
+                        head_key_dim,
+                        ..
                     } => (num_heads as usize, head_key_dim as usize),
                 };
                 let kv_dim = num_kv_heads * head_dim;
                 let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
 
                 // Offset into KV cache for this (block, slot)
-                let kv_offset = ((phys_blk_id as usize
-                    * self.block_size_tokens as usize
+                let kv_offset = ((phys_blk_id as usize * self.block_size_tokens as usize
                     + slot_in_blk as usize)
                     * kv_dim)
                     * 2;
@@ -2002,7 +2571,8 @@ impl MetalExecutor {
     ///
     /// Returns `Ok(None)` if speculative decoding should be skipped (e.g., MoE models,
     /// large batch sizes, or draft engine not initialized).
-    pub fn speculative_decode(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn speculative_decode(
         &mut self,
         descriptor: &ModelArchDescriptor,
         schedule_plan: &FlashInferSchedulePlan,
@@ -2028,14 +2598,14 @@ impl MetalExecutor {
         let tree_mask = tree.tree_attention_mask.clone();
 
         // Verify the tree against the target model (single GPU pass)
-        let (target_logits, target_features) = self.forward_tree_logits(descriptor, schedule_plan, &tree_tokens, &tree_mask)?;
+        let (target_logits, target_features) = self
+            .forward_tree_logits(descriptor, schedule_plan, &tree_tokens, &tree_mask)
+            .await?;
 
         // Compute target probabilities for each node
         let target_probs: Vec<Vec<f32>> = target_logits
             .iter()
-            .map(|logits| {
-                kriya_speculate::eagle_medusa::softmax(logits)
-            })
+            .map(|logits| kriya_speculate::eagle_medusa::softmax(logits))
             .collect();
 
         // target_features are now the ACTUAL target model hidden states
@@ -2058,11 +2628,12 @@ impl MetalExecutor {
     /// Executes a prefill chunk: processes ALL tokens in a single command buffer submission,
     /// writing KV for every token and computing attention + sampling only for the last token.
     /// This eliminates N GPU round-trips for an N-token prefill chunk by using a parallel
-    /// 2D causal attention kernel (bsr_paged_gqa_prefill_stage1).
+    /// 2D causal attention kernel (bsr_paged_gqa_prefill_stage1) or true FlashAttention
+    /// (bsr_paged_gqa_flashattn_prefill) for M >= 16.
     ///
     /// `prefix_plan` must be a `FlashInferSchedulePlan` built by
     /// `PagedKvCacheManager::build_parallel_prefill_layout` for the full sequence.
-    pub fn forward_prefill_batch(
+    pub async fn forward_prefill_batch(
         &mut self,
         descriptor: &ModelArchDescriptor,
         input_tokens: &[u32],
@@ -2076,7 +2647,7 @@ impl MetalExecutor {
         let num_k_blocks = h.div_ceil(64);
         let vocab_capped = descriptor.vocab_size;
 
-        // Copy all input tokens and positions at once
+        // Copy all input tokens, positions, and BSR layout at once before command buffer encoding
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input_tokens.as_ptr(),
@@ -2088,6 +2659,34 @@ impl MetalExecutor {
                 self.seq_positions_buf.contents() as *mut u32,
                 seq_positions.len(),
             );
+            if !prefix_plan.bsr_layout.page_indptr.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    prefix_plan.bsr_layout.page_indptr.as_ptr(),
+                    self.indptr_buf.contents() as *mut i32,
+                    prefix_plan.bsr_layout.page_indptr.len(),
+                );
+            }
+            if !prefix_plan.bsr_layout.page_indices.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    prefix_plan.bsr_layout.page_indices.as_ptr(),
+                    self.indices_buf.contents() as *mut i32,
+                    prefix_plan.bsr_layout.page_indices.len(),
+                );
+            }
+            if !prefix_plan.bsr_layout.last_page_len.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    prefix_plan.bsr_layout.last_page_len.as_ptr(),
+                    self.last_len_buf.contents() as *mut i32,
+                    prefix_plan.bsr_layout.last_page_len.len(),
+                );
+            }
+            if !prefix_plan.cta_work_tiles.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    prefix_plan.cta_work_tiles.as_ptr(),
+                    self.cta_tiles_buf.contents() as *mut CtaWorkTile,
+                    prefix_plan.cta_work_tiles.len(),
+                );
+            }
         }
 
         let mut cmd_buf = self.command_queue.new_command_buffer();
@@ -2095,7 +2694,9 @@ impl MetalExecutor {
 
         // 1. Token Embedding Lookup (batched for all tokens)
         {
-            let pso = self.pipeline_cache.get_or_compile("embedding_lookup_q4_g64")?;
+            let pso = self
+                .pipeline_cache
+                .get_or_compile("embedding_lookup_q4_g64")?;
             let embed_params = EmbedLookupParams {
                 num_tokens,
                 hidden_size: h,
@@ -2118,7 +2719,9 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer layers
-        // All layers encoded in a single command buffer (no splitting).
+        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
+        let mut layers_in_chunk = 0usize;
+        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -2162,45 +2765,33 @@ impl MetalExecutor {
                     head_dim,
                     pos_encoding,
                     qk_norm,
+                    qkv_bias,
                     attn_logit_softcap,
                     ..
                 } => {
                     let q_dim = num_q_heads * head_dim;
                     let kv_dim = num_kv_heads * head_dim;
 
-                    // Q/K/V projections (batched GEMM for M > 1)
-                    Self::encode_q4_linear(
+                    // Fused Q/K/V projections (+ optional learned QKV bias in registers)
+                    Self::encode_fused_qkv(
                         &mut self.pipeline_cache,
                         enc,
                         &lw.q_proj,
-                        &self.norm_out_buf,
-                        0,
-                        &self.q_buf,
-                        num_tokens,
-                        q_dim,
-                        h,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
                         &lw.k_proj,
-                        &self.norm_out_buf,
-                        0,
-                        &self.k_buf,
-                        num_tokens,
-                        kv_dim,
-                        h,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
                         &lw.v_proj,
                         &self.norm_out_buf,
                         0,
+                        &self.q_buf,
+                        &self.k_buf,
                         &self.v_buf,
+                        &lw.q_bias,
+                        &lw.k_bias,
+                        &lw.v_bias,
+                        qkv_bias,
                         num_tokens,
-                        kv_dim,
                         h,
+                        q_dim,
+                        kv_dim,
                     )?;
 
                     // RoPE + KV append for ALL tokens (batched)
@@ -2245,12 +2836,19 @@ impl MetalExecutor {
                         MTLSize::new(32, 1, 1),
                     );
 
-                    // Attention: single parallel 2D causal dispatch for ALL query tokens
-                    // instead of M sequential per-token dispatches. This is the key
-                    // optimization that brings prefill throughput close to MLX.
-                    let gqa_pso = self
-                        .pipeline_cache
-                        .get_or_compile("bsr_paged_gqa_prefill_stage1")?;
+                    // Attention: FlashAttention 2D block-tiled for M >= 16,
+                    // otherwise scalar parallel 2D causal dispatch.
+                    // FlashAttention loads Q/K/V tiles into threadgroup SRAM
+                    // with online softmax, achieving 5-10x prefill speedup.
+                    let use_flashattn = num_tokens >= 16 && head_dim <= 256;
+                    let kernel_name = if use_flashattn {
+                        "bsr_paged_gqa_flashattn_prefill"
+                    } else if num_tokens >= 64 {
+                        "bsr_paged_gqa_prefill_stage1_bq8"
+                    } else {
+                        "bsr_paged_gqa_prefill_stage1"
+                    };
+                    let gqa_pso = self.pipeline_cache.get_or_compile(kernel_name)?;
                     let gqa_params = BsrGqaParams {
                         num_q_heads,
                         num_kv_heads,
@@ -2261,38 +2859,6 @@ impl MetalExecutor {
                         sm_scale: 1.0 / (head_dim as f32).sqrt(),
                         logit_softcap: attn_logit_softcap.unwrap_or(0.0),
                     };
-
-                    // Copy parallel prefill layout to GPU buffers once (not per-token)
-                    unsafe {
-                        if !prefix_plan.bsr_layout.page_indptr.is_empty() {
-                            std::ptr::copy_nonoverlapping(
-                                prefix_plan.bsr_layout.page_indptr.as_ptr(),
-                                self.indptr_buf.contents() as *mut i32,
-                                prefix_plan.bsr_layout.page_indptr.len(),
-                            );
-                        }
-                        if !prefix_plan.bsr_layout.page_indices.is_empty() {
-                            std::ptr::copy_nonoverlapping(
-                                prefix_plan.bsr_layout.page_indices.as_ptr(),
-                                self.indices_buf.contents() as *mut i32,
-                                prefix_plan.bsr_layout.page_indices.len(),
-                            );
-                        }
-                        if !prefix_plan.bsr_layout.last_page_len.is_empty() {
-                            std::ptr::copy_nonoverlapping(
-                                prefix_plan.bsr_layout.last_page_len.as_ptr(),
-                                self.last_len_buf.contents() as *mut i32,
-                                prefix_plan.bsr_layout.last_page_len.len(),
-                            );
-                        }
-                        if !prefix_plan.cta_work_tiles.is_empty() {
-                            std::ptr::copy_nonoverlapping(
-                                prefix_plan.cta_work_tiles.as_ptr(),
-                                self.cta_tiles_buf.contents() as *mut CtaWorkTile,
-                                prefix_plan.cta_work_tiles.len(),
-                            );
-                        }
-                    }
 
                     enc.set_compute_pipeline_state(&gqa_pso);
                     enc.set_buffer(0, Some(&self.q_buf), 0);
@@ -2312,27 +2878,51 @@ impl MetalExecutor {
                         &gqa_params as *const _ as *const _,
                     );
                     let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_tokens as u64, num_kv_heads as u64, 1),
-                        MTLSize::new(32 * gqa_ratio, 1, 1),
-                    );
+                    if use_flashattn {
+                        // FlashAttention: 16 query tokens per tile, 16x16 threadgroup
+                        let num_tiles = num_tokens.div_ceil(16) as u64;
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(num_tiles, num_kv_heads as u64, 1),
+                            MTLSize::new(16, 16, 1),
+                        );
+                    } else {
+                        let num_tiles =
+                            num_tokens.div_ceil(if num_tokens >= 64 { 8 } else { 4 }) as u64;
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(num_tiles, num_kv_heads as u64, 1),
+                            MTLSize::new(32 * gqa_ratio, 1, 1),
+                        );
+                    }
 
                     // Note: Split-K for prefill (contexts > threshold blocks) is not
                     // yet implemented in the parallel prefill kernel. For typical
                     // prefill contexts (< 256 tokens), Split-K is not triggered.
 
                     // O projection (batched for all tokens)
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.o_proj,
-                        &self.attn_out_buf,
-                        0,
-                        &self.proj_out_buf,
-                        num_tokens,
-                        h,
-                        q_dim,
-                    )?;
+                    if lw.post_attn_norm.is_none() && num_tokens == 1 {
+                        Self::encode_q4_linear_accumulate(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.o_proj,
+                            &self.attn_out_buf,
+                            0,
+                            &self.residual_buf,
+                            h,
+                            q_dim,
+                        )?;
+                    } else {
+                        Self::encode_q4_linear(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.o_proj,
+                            &self.attn_out_buf,
+                            0,
+                            &self.proj_out_buf,
+                            num_tokens,
+                            h,
+                            q_dim,
+                        )?;
+                    }
                 }
                 SequenceMixerDescriptor::GatedDeltaNetRecurrence { .. } => {
                     // Skip DeltaNet for prefill batching — identity pass-through
@@ -2347,14 +2937,45 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add (batched)
-            {
+            // 2c. First Residual Add (batched, with post-attention norm for Gemma 2)
+            if let Some(ref post_attn) = lw.post_attn_norm {
+                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+                let norm_params = RmsNormParams {
+                    num_tokens,
+                    hidden_size: h,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso_norm);
+                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
+                enc.set_buffer(1, Some(post_attn), 0);
+                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tokens as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
+                let total_elems = num_tokens * h;
+                enc.set_compute_pipeline_state(&pso_add);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else {
                 let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
                 let total_elems = num_tokens * h;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(&self.residual_buf), 0);
                 enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &(total_elems as u32) as *const _ as *const _);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
                 enc.dispatch_thread_groups(
                     MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -2392,42 +3013,177 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    Self::encode_q4_linear(
+                    // Fused Gate+Up (+ In-Register Activation for M >= 64)
+                    Self::encode_fused_gate_up(
                         &mut self.pipeline_cache,
                         enc,
                         &lw.gate_proj,
-                        &self.norm_out_buf,
-                        0,
-                        &self.gate_buf,
-                        num_tokens,
-                        intermediate_size,
-                        h,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
                         &lw.up_proj,
                         &self.norm_out_buf,
                         0,
+                        &self.gate_buf,
                         &self.up_buf,
+                        &self.mlp_hidden_buf,
                         num_tokens,
+                        h,
                         intermediate_size,
+                        activation,
+                    )?;
+
+                    if lw.post_ffn_norm.is_none() && num_tokens == 1 {
+                        Self::encode_q4_linear_accumulate(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.down_proj,
+                            &self.mlp_hidden_buf,
+                            0,
+                            &self.residual_buf,
+                            h,
+                            intermediate_size,
+                        )?;
+                    } else {
+                        Self::encode_q4_linear(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.down_proj,
+                            &self.mlp_hidden_buf,
+                            0,
+                            &self.proj_out_buf,
+                            num_tokens,
+                            h,
+                            intermediate_size,
+                        )?;
+                    }
+                }
+                ChannelMixerDescriptor::SparseMoE {
+                    num_total_experts,
+                    num_active_experts,
+                    expert_intermediate_size,
+                    activation,
+                    normalize_topk_weights,
+                    shared_expert_intermediate_size,
+                } => {
+                    // GPU-resident MoE routing for prefill batching (Closes Gap 4)
+                    // Compute dynamic router logits directly from hidden state
+                    Self::encode_q4_linear(
+                        &mut self.pipeline_cache,
+                        enc,
+                        &lw.moe_router_gate,
+                        &self.norm_out_buf,
+                        0,
+                        &self.moe_router_logits_buf,
+                        num_tokens,
+                        num_total_experts,
                         h,
                     )?;
 
-                    let pso = self
+                    let route_params = MoeRouteParams {
+                        num_tokens,
+                        num_total_experts,
+                        num_active_experts,
+                        normalize_weights: u32::from(normalize_topk_weights),
+                    };
+
+                    // Stage 1: Top-K Expert Selection & Atomic Histogram
+                    let topk_pso = self
+                        .pipeline_cache
+                        .get_or_compile("moe_router_topk_and_histogram")?;
+                    enc.set_compute_pipeline_state(&topk_pso);
+                    enc.set_buffer(0, Some(&self.moe_router_logits_buf), 0);
+                    enc.set_buffer(1, Some(&self.moe_selected_experts_buf), 0);
+                    enc.set_buffer(2, Some(&self.moe_selected_weights_buf), 0);
+                    enc.set_buffer(3, Some(&self.moe_expert_counts_buf), 0);
+                    enc.set_buffer(4, Some(&self.moe_token_slot_buf), 0);
+                    enc.set_bytes(
+                        5,
+                        std::mem::size_of::<MoeRouteParams>() as u64,
+                        &route_params as *const _ as *const _,
+                    );
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(num_tokens.div_ceil(64) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+
+                    // Stage 2: Exclusive Prefix Scan & Token Scatter Map
+                    let scan_pso = self
+                        .pipeline_cache
+                        .get_or_compile("moe_router_prefix_scan_and_scatter")?;
+                    enc.set_compute_pipeline_state(&scan_pso);
+                    enc.set_buffer(0, Some(&self.moe_expert_counts_buf), 0);
+                    enc.set_buffer(1, Some(&self.moe_expert_offsets_buf), 0);
+                    enc.set_buffer(2, Some(&self.moe_selected_experts_buf), 0);
+                    enc.set_buffer(3, Some(&self.moe_token_slot_buf), 0);
+                    enc.set_buffer(4, Some(&self.moe_scatter_map_buf), 0);
+                    enc.set_bytes(
+                        5,
+                        std::mem::size_of::<MoeRouteParams>() as u64,
+                        &route_params as *const _ as *const _,
+                    );
+                    let total_assign = (num_tokens * num_active_experts).max(64);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(total_assign.div_ceil(64) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+
+                    // Stage 3: Routed Experts Gate & Up Projections
+                    let routed_pso = self
+                        .pipeline_cache
+                        .get_or_compile("q4_g64_routed_moe_gemv")?;
+                    let up_params = RoutedExpertGemvParams {
+                        num_tokens,
+                        num_active_experts,
+                        out_dim: expert_intermediate_size,
+                        in_dim: h,
+                        num_k_blocks: h.div_ceil(64),
+                        expert_stride_blks: expert_intermediate_size * h.div_ceil(64),
+                    };
+                    let input_per_slot_false: u32 = 0;
+                    enc.set_compute_pipeline_state(&routed_pso);
+                    enc.set_buffer(0, Some(&lw.gate_proj), 0);
+                    enc.set_buffer(1, Some(&self.norm_out_buf), 0);
+                    enc.set_buffer(2, Some(&self.moe_selected_experts_buf), 0);
+                    enc.set_buffer(3, Some(&self.gate_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of::<RoutedExpertGemvParams>() as u64,
+                        &up_params as *const _ as *const _,
+                    );
+                    enc.set_bytes(5, 4, &input_per_slot_false as *const _ as *const _);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(
+                            expert_intermediate_size.div_ceil(4) as u64,
+                            num_active_experts as u64,
+                            num_tokens as u64,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+
+                    enc.set_buffer(0, Some(&lw.up_proj), 0);
+                    enc.set_buffer(3, Some(&self.up_buf), 0);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(
+                            expert_intermediate_size.div_ceil(4) as u64,
+                            num_active_experts as u64,
+                            num_tokens as u64,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+
+                    // Stage 4: Fused SwiGLU Activation across all routed intermediate
+                    let act_pso = self
                         .pipeline_cache
                         .get_or_compile("fused_gated_activation_bf16")?;
-                    let total_inter = num_tokens * intermediate_size;
+                    let total_routed_inter =
+                        num_tokens * num_active_experts * expert_intermediate_size;
                     let act_params = ActivationParams {
-                        num_elements: total_inter,
+                        num_elements: total_routed_inter,
                         variant: match activation {
                             ActivationVariant::SwiGLU => 0,
                             ActivationVariant::GeGLU => 1,
                             ActivationVariant::ReLU => 2,
                         },
                     };
-                    enc.set_compute_pipeline_state(&pso);
+                    enc.set_compute_pipeline_state(&act_pso);
                     enc.set_buffer(0, Some(&self.gate_buf), 0);
                     enc.set_buffer(1, Some(&self.up_buf), 0);
                     enc.set_buffer(2, Some(&self.mlp_hidden_buf), 0);
@@ -2437,39 +3193,129 @@ impl MetalExecutor {
                         &act_params as *const _ as *const _,
                     );
                     enc.dispatch_thread_groups(
-                        MTLSize::new(total_inter.div_ceil(256) as u64, 1, 1),
+                        MTLSize::new(total_routed_inter.div_ceil(256) as u64, 1, 1),
                         MTLSize::new(256, 1, 1),
                     );
 
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.down_proj,
-                        &self.mlp_hidden_buf,
-                        0,
-                        &self.proj_out_buf,
+                    // Stage 5: Routed Experts Down Projection
+                    let inter_k_blks = expert_intermediate_size.div_ceil(64);
+                    let down_params = RoutedExpertGemvParams {
                         num_tokens,
-                        h,
-                        intermediate_size,
-                    )?;
-                }
-                ChannelMixerDescriptor::SparseMoE { .. } => {
-                    // MoE prefill batching not yet implemented — identity pass-through
+                        num_active_experts,
+                        out_dim: h,
+                        in_dim: expert_intermediate_size,
+                        num_k_blocks: inter_k_blks,
+                        expert_stride_blks: h * inter_k_blks,
+                    };
+                    let input_per_slot_true: u32 = 1;
+                    let routed_down_pso = self
+                        .pipeline_cache
+                        .get_or_compile("q4_g64_routed_moe_gemv")?;
+                    enc.set_compute_pipeline_state(&routed_down_pso);
+                    enc.set_buffer(0, Some(&lw.down_proj), 0);
+                    enc.set_buffer(1, Some(&self.mlp_hidden_buf), 0);
+                    enc.set_buffer(2, Some(&self.moe_selected_experts_buf), 0);
+                    enc.set_buffer(3, Some(&self.moe_routed_out_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of::<RoutedExpertGemvParams>() as u64,
+                        &down_params as *const _ as *const _,
+                    );
+                    enc.set_bytes(5, 4, &input_per_slot_true as *const _ as *const _);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(
+                            h.div_ceil(4) as u64,
+                            num_active_experts as u64,
+                            num_tokens as u64,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+
+                    // Stage 6: Combine Top-K Weighted Routed Experts + Shared Expert
+                    let combine_pso = self
+                        .pipeline_cache
+                        .get_or_compile("moe_combine_routed_and_shared_bf16")?;
+                    let combine_params = MoeCombineParams {
+                        num_tokens,
+                        hidden_size: h,
+                        num_active_experts,
+                        has_shared_expert: u32::from(shared_expert_intermediate_size.is_some()),
+                    };
+                    enc.set_compute_pipeline_state(&combine_pso);
+                    enc.set_buffer(0, Some(&self.moe_routed_out_buf), 0);
+                    enc.set_buffer(1, Some(&self.moe_selected_weights_buf), 0);
+                    enc.set_buffer(2, Some(&self.moe_shared_out_buf), 0);
+                    enc.set_buffer(3, Some(&self.proj_out_buf), 0);
+                    enc.set_bytes(
+                        4,
+                        std::mem::size_of::<MoeCombineParams>() as u64,
+                        &combine_params as *const _ as *const _,
+                    );
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(h.div_ceil(64) as u64, num_tokens as u64, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
                 }
             }
 
-            // 2f. Second Residual Add (batched)
-            {
+            // 2f. Second Residual Add (batched, with post-FFN norm for Gemma 2)
+            if let Some(ref post_ffn) = lw.post_ffn_norm {
+                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+                let norm_params = RmsNormParams {
+                    num_tokens,
+                    hidden_size: h,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso_norm);
+                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
+                enc.set_buffer(1, Some(post_ffn), 0);
+                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tokens as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
+                let total_elems = num_tokens * h;
+                enc.set_compute_pipeline_state(&pso_add);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else {
                 let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
                 let total_elems = num_tokens * h;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(&self.residual_buf), 0);
                 enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &(total_elems as u32) as *const _ as *const _);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
                 enc.dispatch_thread_groups(
                     MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+            }
+
+            layers_in_chunk += 1;
+            let is_last_layer = l_idx + 1 == num_layers;
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+                enc.end_encoding();
+                self.signal_value += 1;
+                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
+                cmd_buf.commit();
+                self.wait_for_gpu(self.signal_value).await?;
+                if !is_last_layer {
+                    cmd_buf = self.command_queue.new_command_buffer();
+                    enc = cmd_buf.new_compute_command_encoder();
+                    layers_in_chunk = 0;
+                }
             }
         }
 
@@ -2477,11 +3323,18 @@ impl MetalExecutor {
         let last_token_byte_offset = ((num_tokens - 1) * h * 2) as u64;
         {
             let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+            let (eps, zero_off) = match descriptor.final_norm {
+                NormVariant::RmsNorm {
+                    eps,
+                    zero_centered_unit_offset,
+                } => (eps, u32::from(zero_centered_unit_offset)),
+                NormVariant::LayerNorm { eps, .. } => (eps, 0),
+            };
             let norm_params = RmsNormParams {
                 num_tokens: 1,
                 hidden_size: h,
-                eps: 1e-6,
-                zero_centered_offset: 0,
+                eps,
+                zero_centered_offset: zero_off,
             };
             enc.set_compute_pipeline_state(&pso);
             enc.set_buffer(0, Some(&self.residual_buf), last_token_byte_offset);
@@ -2528,19 +3381,16 @@ impl MetalExecutor {
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        // Non-blocking poll: yield between polls to avoid CPU starvation
-        while self.shared_event.signaled_value() < self.signal_value {
-            std::thread::yield_now();
-        }
+        self.wait_for_gpu(self.signal_value).await?;
 
-        let sampled_token = unsafe { *(self.sampled_token_buf.contents() as *const u32) };
+        let sampled_token = self.read_u32_from_buffer(&self.sampled_token_buf, 0);
         Ok(sampled_token)
     }
 
     /// Executes a complete end-to-end forward pass across all model layers on the Metal GPU:
     /// - Blocker 1 Fixed: Binds `self.layer_kv_byte_offset(l_idx)` on every layer's KV cache
     /// - Blocker 4 Fixed: Accepts explicit per-token `seq_positions: &[u32]` for heterogeneous ORCA batches
-    pub fn forward_and_sample(
+    pub async fn forward_and_sample(
         &mut self,
         descriptor: &ModelArchDescriptor,
         schedule_plan: &FlashInferSchedulePlan,
@@ -2548,7 +3398,64 @@ impl MetalExecutor {
         seq_positions: &[u32],
         sampling: SamplingConfig,
     ) -> Result<u32, MetalError> {
+        let tokens = self
+            .forward_and_sample_impl(
+                descriptor,
+                schedule_plan,
+                input_tokens,
+                seq_positions,
+                &[sampling],
+                false,
+            )
+            .await?;
+        tokens.last().copied().ok_or_else(|| {
+            MetalError::InvalidExecutionInput("No token sampled from forward_and_sample".into())
+        })
+    }
+
+    /// Batched Decode: executes a single GPU forward pass for all requests concurrently running in an ORCA batch,
+    /// generating all next-tokens with their per-request sampling configuration in a single command buffer submission.
+    pub async fn forward_and_sample_batch(
+        &mut self,
+        descriptor: &ModelArchDescriptor,
+        input_tokens: &[u32],
+        seq_positions: &[u32],
+        schedule_plan: &FlashInferSchedulePlan,
+        samplings: &[SamplingConfig],
+    ) -> Result<Vec<u32>, MetalError> {
+        self.forward_and_sample_impl(
+            descriptor,
+            schedule_plan,
+            input_tokens,
+            seq_positions,
+            samplings,
+            true,
+        )
+        .await
+    }
+
+    async fn forward_and_sample_impl(
+        &mut self,
+        descriptor: &ModelArchDescriptor,
+        schedule_plan: &FlashInferSchedulePlan,
+        input_tokens: &[u32],
+        seq_positions: &[u32],
+        samplings: &[SamplingConfig],
+        sample_all: bool,
+    ) -> Result<Vec<u32>, MetalError> {
         self.validate_batch_inputs(input_tokens, seq_positions, schedule_plan)?;
+        if sample_all && samplings.len() != input_tokens.len() {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "samplings len {} must equal input_tokens len {}",
+                samplings.len(),
+                input_tokens.len()
+            )));
+        }
+        if samplings.is_empty() {
+            return Err(MetalError::InvalidExecutionInput(
+                "samplings configuration must not be empty".into(),
+            ));
+        }
         let num_tokens = input_tokens.len().max(1) as u32;
         let h = descriptor.hidden_size;
         let num_k_blocks = h.div_ceil(64);
@@ -2630,7 +3537,9 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
-        // All layers encoded in a single command buffer (no splitting).
+        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
+        let mut layers_in_chunk = 0usize;
+        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -2681,66 +3590,27 @@ impl MetalExecutor {
                     let q_dim = num_q_heads * head_dim;
                     let kv_dim = num_kv_heads * head_dim;
 
-                    Self::encode_q4_linear(
+                    // Fused Q/K/V projections (+ optional learned QKV bias in registers)
+                    Self::encode_fused_qkv(
                         &mut self.pipeline_cache,
                         enc,
                         &lw.q_proj,
-                        &self.norm_out_buf,
-                        0,
-                        &self.q_buf,
-                        num_tokens,
-                        q_dim,
-                        h,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
                         &lw.k_proj,
-                        &self.norm_out_buf,
-                        0,
-                        &self.k_buf,
-                        num_tokens,
-                        kv_dim,
-                        h,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
                         &lw.v_proj,
                         &self.norm_out_buf,
                         0,
+                        &self.q_buf,
+                        &self.k_buf,
                         &self.v_buf,
+                        &lw.q_bias,
+                        &lw.k_bias,
+                        &lw.v_bias,
+                        qkv_bias,
                         num_tokens,
-                        kv_dim,
                         h,
+                        q_dim,
+                        kv_dim,
                     )?;
-
-                    if qkv_bias {
-                        Self::encode_bias_add(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &self.q_buf,
-                            &lw.q_bias,
-                            num_tokens,
-                            q_dim,
-                        )?;
-                        Self::encode_bias_add(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &self.k_buf,
-                            &lw.k_bias,
-                            num_tokens,
-                            kv_dim,
-                        )?;
-                        Self::encode_bias_add(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &self.v_buf,
-                            &lw.v_bias,
-                            num_tokens,
-                            kv_dim,
-                        )?;
-                    }
 
                     let (rope_theta, rotary_dim) = match pos_encoding {
                         PositionalEncoding::RoPE {
@@ -2817,10 +3687,9 @@ impl MetalExecutor {
                         &gqa_params as *const _ as *const _,
                     );
                     let num_tiles = schedule_plan.cta_work_tiles.len().max(1) as u64;
-                    let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
                     enc.dispatch_thread_groups(
-                        MTLSize::new(num_tiles, num_kv_heads as u64, 1),
-                        MTLSize::new(32 * gqa_ratio, 1, 1),
+                        MTLSize::new(num_tiles, num_q_heads as u64, 1),
+                        MTLSize::new(32, 1, 1),
                     );
 
                     // If any CTA tile used Split-K, run bsr_paged_gqa_split_k_reduce into final attn_out_buf
@@ -2856,17 +3725,30 @@ impl MetalExecutor {
                         );
                     }
 
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.o_proj,
-                        &self.attn_out_buf,
-                        0,
-                        &self.proj_out_buf,
-                        num_tokens,
-                        h,
-                        q_dim,
-                    )?;
+                    if lw.post_attn_norm.is_none() && num_tokens == 1 {
+                        Self::encode_q4_linear_accumulate(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.o_proj,
+                            &self.attn_out_buf,
+                            0,
+                            &self.residual_buf,
+                            h,
+                            q_dim,
+                        )?;
+                    } else {
+                        Self::encode_q4_linear(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.o_proj,
+                            &self.attn_out_buf,
+                            0,
+                            &self.proj_out_buf,
+                            num_tokens,
+                            h,
+                            q_dim,
+                        )?;
+                    }
                 }
                 SequenceMixerDescriptor::GatedDeltaNetRecurrence {
                     num_heads,
@@ -2916,7 +3798,7 @@ impl MetalExecutor {
                         .pipeline_cache
                         .get_or_compile("gated_deltanet_recurrent_step")?;
                     let dnet_params = DeltaNetParams {
-                        batch_size: 1,
+                        batch_size: num_tokens,
                         num_heads,
                         head_key_dim,
                         head_val_dim,
@@ -2953,8 +3835,39 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add
-            {
+            // 2c. First Residual Add (with post-attention norm for Gemma 2)
+            if let Some(ref post_attn) = lw.post_attn_norm {
+                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+                let norm_params = RmsNormParams {
+                    num_tokens,
+                    hidden_size: h,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso_norm);
+                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
+                enc.set_buffer(1, Some(post_attn), 0);
+                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tokens as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
+                let total_elems = num_tokens * h;
+                enc.set_compute_pipeline_state(&pso_add);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else if num_tokens > 1 {
                 let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
                 let total_elems = num_tokens * h;
                 enc.set_compute_pipeline_state(&pso);
@@ -2998,66 +3911,47 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    Self::encode_q4_linear(
+                    // Fused Gate+Up (+ In-Register Activation for M >= 64)
+                    Self::encode_fused_gate_up(
                         &mut self.pipeline_cache,
                         enc,
                         &lw.gate_proj,
-                        &self.norm_out_buf,
-                        0,
-                        &self.gate_buf,
-                        num_tokens,
-                        intermediate_size,
-                        h,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
                         &lw.up_proj,
                         &self.norm_out_buf,
                         0,
+                        &self.gate_buf,
                         &self.up_buf,
-                        num_tokens,
-                        intermediate_size,
-                        h,
-                    )?;
-
-                    let pso = self
-                        .pipeline_cache
-                        .get_or_compile("fused_gated_activation_bf16")?;
-                    let total_inter = num_tokens * intermediate_size;
-                    let act_params = ActivationParams {
-                        num_elements: total_inter,
-                        variant: match activation {
-                            ActivationVariant::SwiGLU => 0,
-                            ActivationVariant::GeGLU => 1,
-                            ActivationVariant::ReLU => 2,
-                        },
-                    };
-                    enc.set_compute_pipeline_state(&pso);
-                    enc.set_buffer(0, Some(&self.gate_buf), 0);
-                    enc.set_buffer(1, Some(&self.up_buf), 0);
-                    enc.set_buffer(2, Some(&self.mlp_hidden_buf), 0);
-                    enc.set_bytes(
-                        3,
-                        std::mem::size_of::<ActivationParams>() as u64,
-                        &act_params as *const _ as *const _,
-                    );
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(total_inter.div_ceil(256) as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.down_proj,
                         &self.mlp_hidden_buf,
-                        0,
-                        &self.proj_out_buf,
                         num_tokens,
                         h,
                         intermediate_size,
+                        activation,
                     )?;
+
+                    if lw.post_ffn_norm.is_none() && num_tokens == 1 {
+                        Self::encode_q4_linear_accumulate(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.down_proj,
+                            &self.mlp_hidden_buf,
+                            0,
+                            &self.residual_buf,
+                            h,
+                            intermediate_size,
+                        )?;
+                    } else {
+                        Self::encode_q4_linear(
+                            &mut self.pipeline_cache,
+                            enc,
+                            &lw.down_proj,
+                            &self.mlp_hidden_buf,
+                            0,
+                            &self.proj_out_buf,
+                            num_tokens,
+                            h,
+                            intermediate_size,
+                        )?;
+                    }
                 }
                 ChannelMixerDescriptor::SparseMoE {
                     num_total_experts,
@@ -3261,7 +4155,43 @@ impl MetalExecutor {
                 }
             }
 
-            // 2f. Second Residual Add
+            // 2f. Second Residual Add (with post-FFN norm for Gemma 2)
+            if let Some(ref post_ffn) = lw.post_ffn_norm {
+                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
+                let norm_params = RmsNormParams {
+                    num_tokens,
+                    hidden_size: h,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso_norm);
+                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
+                enc.set_buffer(1, Some(post_ffn), 0);
+                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tokens as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
+                let total_elems = num_tokens * h;
+                enc.set_compute_pipeline_state(&pso_add);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
+                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else if num_tokens > 1
+                || matches!(
+                    layer.channel_mixer,
+                    ChannelMixerDescriptor::SparseMoE { .. }
+                )
             {
                 let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
                 let total_elems = num_tokens * h;
@@ -3274,31 +4204,76 @@ impl MetalExecutor {
                     MTLSize::new(256, 1, 1),
                 );
             }
+
+            layers_in_chunk += 1;
+            let is_last_layer = l_idx + 1 == num_layers;
+            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS || is_last_layer {
+                enc.end_encoding();
+                self.signal_value += 1;
+                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
+                cmd_buf.commit();
+                self.wait_for_gpu(self.signal_value).await?;
+                if !is_last_layer {
+                    cmd_buf = self.command_queue.new_command_buffer();
+                    enc = cmd_buf.new_compute_command_encoder();
+                    layers_in_chunk = 0;
+                }
+            }
         }
 
-        // 3. Final RMSNorm on the last token's hidden state
-        let last_token_byte_offset = ((num_tokens - 1) * h * 2) as u64;
+        // 3. Final RMSNorm
         {
             let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-            let norm_params = RmsNormParams {
-                num_tokens: 1,
-                hidden_size: h,
-                eps: 1e-6,
-                zero_centered_offset: 0,
+            let (eps, zero_off) = match descriptor.final_norm {
+                NormVariant::RmsNorm {
+                    eps,
+                    zero_centered_unit_offset,
+                } => (eps, u32::from(zero_centered_unit_offset)),
+                NormVariant::LayerNorm { eps, .. } => (eps, 0),
             };
-            enc.set_compute_pipeline_state(&pso);
-            enc.set_buffer(0, Some(&self.residual_buf), last_token_byte_offset);
-            enc.set_buffer(1, Some(&self.weights.final_norm), 0);
-            enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<RmsNormParams>() as u64,
-                &norm_params as *const _ as *const _,
-            );
-            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+            if sample_all {
+                let norm_params = RmsNormParams {
+                    num_tokens,
+                    hidden_size: h,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso);
+                enc.set_buffer(0, Some(&self.residual_buf), 0);
+                enc.set_buffer(1, Some(&self.weights.final_norm), 0);
+                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tokens as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            } else {
+                let last_token_byte_offset = ((num_tokens - 1) * h * 2) as u64;
+                let norm_params = RmsNormParams {
+                    num_tokens: 1,
+                    hidden_size: h,
+                    eps,
+                    zero_centered_offset: zero_off,
+                };
+                enc.set_compute_pipeline_state(&pso);
+                enc.set_buffer(0, Some(&self.residual_buf), last_token_byte_offset);
+                enc.set_buffer(1, Some(&self.weights.final_norm), 0);
+                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<RmsNormParams>() as u64,
+                    &norm_params as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+            }
         }
 
-        // 4. LM Head Projection (`[1, hidden_size] -> [1, vocab_capped]`)
+        // 4. LM Head Projection
+        let tokens_to_project = if sample_all { num_tokens } else { 1 };
         Self::encode_q4_linear(
             &mut self.pipeline_cache,
             enc,
@@ -3306,7 +4281,7 @@ impl MetalExecutor {
             &self.norm_out_buf,
             0,
             &self.logits_buf,
-            1,
+            tokens_to_project,
             vocab_capped,
             h,
         )?;
@@ -3314,29 +4289,46 @@ impl MetalExecutor {
         // 5. GPU-Resident Token Sampler
         {
             let pso = self.pipeline_cache.get_or_compile("gpu_token_sampler")?;
-            let mut samp = sampling;
-            samp.vocab_size = vocab_capped;
-            enc.set_compute_pipeline_state(&pso);
-            enc.set_buffer(0, Some(&self.logits_buf), 0);
-            enc.set_buffer(1, Some(&self.sampled_token_buf), 0);
-            enc.set_bytes(
-                2,
-                std::mem::size_of::<SamplingConfig>() as u64,
-                &samp as *const _ as *const _,
-            );
-            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+            if sample_all {
+                for (i, samp_cfg) in samplings.iter().enumerate() {
+                    let mut samp = *samp_cfg;
+                    samp.vocab_size = vocab_capped;
+                    let logit_offset = (i * vocab_capped as usize * 2) as u64;
+                    let sample_offset = (i * 4) as u64;
+                    enc.set_compute_pipeline_state(&pso);
+                    enc.set_buffer(0, Some(&self.logits_buf), logit_offset);
+                    enc.set_buffer(1, Some(&self.sampled_token_buf), sample_offset);
+                    enc.set_bytes(
+                        2,
+                        std::mem::size_of::<SamplingConfig>() as u64,
+                        &samp as *const _ as *const _,
+                    );
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                }
+            } else {
+                let mut samp = samplings[0];
+                samp.vocab_size = vocab_capped;
+                enc.set_compute_pipeline_state(&pso);
+                enc.set_buffer(0, Some(&self.logits_buf), 0);
+                enc.set_buffer(1, Some(&self.sampled_token_buf), 0);
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of::<SamplingConfig>() as u64,
+                    &samp as *const _ as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+            }
         }
 
         enc.end_encoding();
         self.signal_value += 1;
         cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        // Non-blocking poll: yield between polls to avoid CPU starvation
-        while self.shared_event.signaled_value() < self.signal_value {
-            std::thread::yield_now();
-        }
+        self.wait_for_gpu(self.signal_value).await?;
 
-        let sampled_token = unsafe { *(self.sampled_token_buf.contents() as *const u32) };
-        Ok(sampled_token)
+        let ptr = self.sampled_token_buf.contents() as *const u32;
+        let count = if sample_all { num_tokens as usize } else { 1 };
+        let tokens: Vec<u32> = (0..count).map(|i| unsafe { *ptr.add(i) }).collect();
+        Ok(tokens)
     }
 }

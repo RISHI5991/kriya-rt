@@ -241,6 +241,17 @@ impl OrcaMachineScheduler {
         self.pending_queue.push_back(req_id);
     }
 
+    /// Whether the sampled token for the request's *currently scheduled*
+    /// iteration is a client-visible completion token. Intermediate prefill
+    /// chunks update KV state but their logits must never be streamed.
+    pub fn will_emit_current_iteration_token(&self, req_id: u64) -> Result<bool, SchedulerError> {
+        let req = self
+            .requests
+            .get(&req_id)
+            .ok_or(SchedulerError::RequestNotFound(req_id))?;
+        Ok(req.phase != RequestPhase::Prefill || req.is_final_prefill_chunk())
+    }
+
     /// Removes a request that cannot continue because its execution backend
     /// failed. This is deliberately separate from normal completion: callers
     /// must not leave its page-table entries or KV blocks resident after an
@@ -248,10 +259,8 @@ impl OrcaMachineScheduler {
     pub fn abort_request(&mut self, req_id: u64) -> Result<(), SchedulerError> {
         self.pending_queue.retain(|&id| id != req_id);
         self.running_requests.retain(|&id| id != req_id);
-        if self.requests.remove(&req_id).is_some() {
-            if self.kv_manager.contains_sequence(req_id) {
-                self.kv_manager.free_sequence(req_id)?;
-            }
+        if self.requests.remove(&req_id).is_some() && self.kv_manager.contains_sequence(req_id) {
+            self.kv_manager.free_sequence(req_id)?;
         }
         Ok(())
     }
@@ -742,6 +751,7 @@ mod tests {
         // Step A: Request 1 decodes (1 tok) + Request 2 runs Chunk 1 (512 toks) = 513 tokens
         let step_a = sched.schedule_next_iteration().unwrap().unwrap();
         assert_eq!(step_a.selective_batch.total_flattened_tokens, 513);
+        assert!(!sched.will_emit_current_iteration_token(2).unwrap());
         sched
             .commit_iteration_outputs(&[(1, 102), (2, 0)], 200)
             .unwrap();
@@ -749,6 +759,7 @@ mod tests {
         // Step B: Request 1 decodes (1 tok) + Request 2 runs Chunk 2 (512 toks) = 513 tokens
         let step_b = sched.schedule_next_iteration().unwrap().unwrap();
         assert_eq!(step_b.selective_batch.total_flattened_tokens, 513);
+        assert!(!sched.will_emit_current_iteration_token(2).unwrap());
         sched
             .commit_iteration_outputs(&[(1, 103), (2, 0)], 250)
             .unwrap();
@@ -756,6 +767,7 @@ mod tests {
         // Step C: Request 1 decodes (1 tok) + Request 2 finishes final Chunk 3 (176 toks) = 177 tokens
         let step_c = sched.schedule_next_iteration().unwrap().unwrap();
         assert_eq!(step_c.selective_batch.total_flattened_tokens, 177);
+        assert!(sched.will_emit_current_iteration_token(2).unwrap());
         sched
             .commit_iteration_outputs(&[(1, 104), (2, 201)], 300)
             .unwrap();

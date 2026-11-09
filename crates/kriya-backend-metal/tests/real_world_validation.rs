@@ -4,13 +4,11 @@
 //! (Llama-3.2-3B, Mistral-7B, Gemma-2-9B head_dim=256, etc.).
 //! These tests verify numerical correctness on hardware-representative shapes.
 
-use kriya_backend_metal::encoder::{
-    MetalExecutor, SamplingConfig,
-};
+use futures::executor::block_on;
+use kriya_backend_metal::encoder::{MetalExecutor, SamplingConfig};
 use kriya_core::descriptor::ModelArchDescriptor;
 use kriya_core::quantizer::{
-    bf16_bits_to_f32, dequantize_q4_group64_to_f32, f32_to_bf16_bits,
-    quantize_f32_to_q4_group64,
+    bf16_bits_to_f32, dequantize_q4_group64_to_f32, f32_to_bf16_bits, quantize_f32_to_q4_group64,
 };
 use kriya_kv::bsr_paged::{CtaWorkTile, PagedKvCacheManager};
 use metal::{Device, MTLResourceOptions, MTLSize};
@@ -29,7 +27,6 @@ fn workspace_kernels_dir() -> std::path::PathBuf {
 /// ========================================================================
 // TEST 1: Q4_G64 Decode GEMV at Real Model Dimensions
 /// ========================================================================
-
 /// Tests Q4_G64 decode GEMV with Llama-3.2-3B dimensions: hidden=3072, q_dim=3072.
 /// Verifies against a naive CPU reference.
 #[test]
@@ -52,9 +49,7 @@ fn test_q4_gemmv_real_dimensions_llama_3b() {
     assert_eq!(weight_blocks.len(), q_dim * num_k_blocks);
 
     // Input vector [h] with small values
-    let input_f32: Vec<f32> = (0..h)
-        .map(|i| ((i as f32) * 0.0002 - 0.3) * 0.01)
-        .collect();
+    let input_f32: Vec<f32> = (0..h).map(|i| ((i as f32) * 0.0002 - 0.3) * 0.01).collect();
     let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
 
     // CPU reference: dequantize and compute
@@ -85,7 +80,7 @@ fn test_q4_gemmv_real_dimensions_llama_3b() {
     let queue = device.new_command_queue();
     let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
         device.clone(),
-        &workspace_kernels_dir(),
+        workspace_kernels_dir(),
     )
     .unwrap();
 
@@ -107,7 +102,10 @@ fn test_q4_gemmv_real_dimensions_llama_3b() {
         &params as *const _ as *const _,
     );
     let tgp_count = q_dim.div_ceil(4);
-    encoder.dispatch_thread_groups(MTLSize::new(tgp_count as u64, 1, 1), MTLSize::new(128, 1, 1));
+    encoder.dispatch_thread_groups(
+        MTLSize::new(tgp_count as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
     encoder.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
@@ -121,7 +119,11 @@ fn test_q4_gemmv_real_dimensions_llama_3b() {
         if diff > max_diff {
             max_diff = diff;
         }
-        let rel = if cpu.abs() > 1e-6 { diff / cpu.abs() } else { diff };
+        let rel = if cpu.abs() > 1e-6 {
+            diff / cpu.abs()
+        } else {
+            diff
+        };
         if rel > max_rel_diff {
             max_rel_diff = rel;
         }
@@ -138,7 +140,6 @@ fn test_q4_gemmv_real_dimensions_llama_3b() {
 /// ========================================================================
 // TEST 2: Prefill GEMM (simdgroup_matrix) at Real Dimensions, M > 1
 /// ========================================================================
-
 /// Tests the hardware matrix-core prefill GEMM with M=16 tokens, K=3072, N=3072.
 /// This is the kernel that was unverified — critical for prefill performance.
 #[test]
@@ -197,7 +198,7 @@ fn test_q4_prefill_gemm_real_dimensions() {
     let queue = device.new_command_queue();
     let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
         device.clone(),
-        &workspace_kernels_dir(),
+        workspace_kernels_dir(),
     )
     .unwrap();
 
@@ -219,11 +220,7 @@ fn test_q4_prefill_gemm_real_dimensions() {
         &params as *const _ as *const _,
     );
     // Grid: (N/16, M/16) threadgroups of 16x16 threads
-    let grid = MTLSize::new(
-        n.div_ceil(16) as u64,
-        m.div_ceil(16) as u64,
-        1,
-    );
+    let grid = MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
     encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
     encoder.end_encoding();
     cmd.commit();
@@ -239,7 +236,11 @@ fn test_q4_prefill_gemm_real_dimensions() {
         if diff > max_diff {
             max_diff = diff;
         }
-        let rel = if cpu.abs() > 1e-6 { diff / cpu.abs() } else { diff };
+        let rel = if cpu.abs() > 1e-6 {
+            diff / cpu.abs()
+        } else {
+            diff
+        };
         if rel > max_rel_diff {
             max_rel_diff = rel;
         }
@@ -248,7 +249,12 @@ fn test_q4_prefill_gemm_real_dimensions() {
             if mismatch_count <= 5 {
                 eprintln!(
                     "Mismatch at [{},{}]: GPU={:.6}, CPU={:.6}, diff={:.6}, rel={:.6}",
-                    i / n, i % n, gpu, cpu, diff, rel
+                    i / n,
+                    i % n,
+                    gpu,
+                    cpu,
+                    diff,
+                    rel
                 );
             }
         }
@@ -256,7 +262,11 @@ fn test_q4_prefill_gemm_real_dimensions() {
     let mismatch_rate = mismatch_count as f32 / (m * n) as f32 * 100.0;
     println!(
         "Q4_PREFILL_GEMM (M=16, K=3072, N=3072): max_diff={:.6}, max_rel_diff={:.6}, mismatches={}/{} ({:.2}%)",
-        max_diff, max_rel_diff, mismatch_count, m * n, mismatch_rate
+        max_diff,
+        max_rel_diff,
+        mismatch_count,
+        m * n,
+        mismatch_rate
     );
     assert!(
         mismatch_rate < 1.0,
@@ -268,7 +278,6 @@ fn test_q4_prefill_gemm_real_dimensions() {
 /// ========================================================================
 // TEST 3: Paged BSR GQA Attention at Real Dimensions (head_dim=128)
 /// ========================================================================
-
 /// Tests BSR paged GQA attention with Llama-3.2-3B dimensions:
 /// 24 Q heads, 8 KV heads, head_dim=128, block_size=16.
 #[test]
@@ -315,11 +324,11 @@ fn test_bsr_paged_gqa_real_dimensions() {
 
             for blk in 0..NUM_BLOCKS as usize {
                 for tok in 0..BLOCK_SZ as usize {
-                    let kv_off = ((blk * BLOCK_SZ as usize + tok) * NUM_KV_HEADS as usize + kvh) * D;
+                    let kv_off =
+                        ((blk * BLOCK_SZ as usize + tok) * NUM_KV_HEADS as usize + kvh) * D;
                     let mut score = 0.0f32;
                     for d in 0..D {
-                        score += q_f32[(b * NUM_Q_HEADS as usize + qh) * D + d]
-                            * k_f32[kv_off + d];
+                        score += q_f32[(b * NUM_Q_HEADS as usize + qh) * D + d] * k_f32[kv_off + d];
                     }
                     score *= sm_scale;
 
@@ -341,7 +350,11 @@ fn test_bsr_paged_gqa_real_dimensions() {
     }
 
     let shared = MTLResourceOptions::StorageModeShared;
-    let q_buf = device.new_buffer_with_data(q_bf16.as_ptr() as *const _, (q_bf16.len() * 2) as u64, shared);
+    let q_buf = device.new_buffer_with_data(
+        q_bf16.as_ptr() as *const _,
+        (q_bf16.len() * 2) as u64,
+        shared,
+    );
     let kv_bytes = (NUM_BLOCKS as usize * BLOCK_SZ as usize * NUM_KV_HEADS as usize * D * 2) as u64;
     let kv_k = device.new_buffer(kv_bytes, shared);
     let kv_v = device.new_buffer(kv_bytes, shared);
@@ -354,9 +367,21 @@ fn test_bsr_paged_gqa_real_dimensions() {
     let indptr: Vec<i32> = vec![0, NUM_BLOCKS as i32];
     let indices: Vec<i32> = (0..NUM_BLOCKS).map(|i| i as i32).collect();
     let last_len: Vec<i32> = vec![BLOCK_SZ as i32];
-    let indptr_buf = device.new_buffer_with_data(indptr.as_ptr() as *const _, (indptr.len() * 4) as u64, shared);
-    let indices_buf = device.new_buffer_with_data(indices.as_ptr() as *const _, (indices.len() * 4) as u64, shared);
-    let last_len_buf = device.new_buffer_with_data(last_len.as_ptr() as *const _, (last_len.len() * 4) as u64, shared);
+    let indptr_buf = device.new_buffer_with_data(
+        indptr.as_ptr() as *const _,
+        (indptr.len() * 4) as u64,
+        shared,
+    );
+    let indices_buf = device.new_buffer_with_data(
+        indices.as_ptr() as *const _,
+        (indices.len() * 4) as u64,
+        shared,
+    );
+    let last_len_buf = device.new_buffer_with_data(
+        last_len.as_ptr() as *const _,
+        (last_len.len() * 4) as u64,
+        shared,
+    );
 
     let tile = CtaWorkTile {
         request_idx: 0,
@@ -377,7 +402,7 @@ fn test_bsr_paged_gqa_real_dimensions() {
     let queue = device.new_command_queue();
     let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
         device.clone(),
-        &workspace_kernels_dir(),
+        workspace_kernels_dir(),
     )
     .unwrap();
 
@@ -385,7 +410,11 @@ fn test_bsr_paged_gqa_real_dimensions() {
     {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.get_or_compile("fused_qknorm_rope_and_kv_append").unwrap());
+        enc.set_compute_pipeline_state(
+            &pipelines
+                .get_or_compile("fused_qknorm_rope_and_kv_append")
+                .unwrap(),
+        );
         let rope_params = kriya_backend_metal::encoder::RopeKvWriteParams {
             num_q_heads: NUM_Q_HEADS,
             num_kv_heads: NUM_KV_HEADS,
@@ -409,8 +438,15 @@ fn test_bsr_paged_gqa_real_dimensions() {
         enc.set_buffer(9, Some(&last_len_buf), 0);
         let seq_pos = device.new_buffer_with_data([0u32].as_ptr() as *const _, 4, shared);
         enc.set_buffer(10, Some(&seq_pos), 0); // seq_positions dummy
-        enc.set_bytes(11, std::mem::size_of_val(&rope_params) as u64, &rope_params as *const _ as *const _);
-        enc.dispatch_thread_groups(MTLSize::new((NUM_Q_HEADS + NUM_KV_HEADS) as u64, 1, 1), MTLSize::new(32, 1, 1));
+        enc.set_bytes(
+            11,
+            std::mem::size_of_val(&rope_params) as u64,
+            &rope_params as *const _ as *const _,
+        );
+        enc.dispatch_thread_groups(
+            MTLSize::new((NUM_Q_HEADS + NUM_KV_HEADS) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -420,7 +456,11 @@ fn test_bsr_paged_gqa_real_dimensions() {
     {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.get_or_compile("bsr_paged_gqa_decode_stage1").unwrap());
+        enc.set_compute_pipeline_state(
+            &pipelines
+                .get_or_compile("bsr_paged_gqa_decode_stage1")
+                .unwrap(),
+        );
         let gqa_params = kriya_backend_metal::encoder::BsrGqaParams {
             num_q_heads: NUM_Q_HEADS,
             num_kv_heads: NUM_KV_HEADS,
@@ -442,14 +482,26 @@ fn test_bsr_paged_gqa_real_dimensions() {
         enc.set_buffer(8, Some(&output), 0);
         enc.set_buffer(9, Some(&partial_out), 0);
         enc.set_buffer(10, Some(&partial_lse), 0);
-        enc.set_bytes(11, std::mem::size_of_val(&gqa_params) as u64, &gqa_params as *const _ as *const _);
-        enc.dispatch_thread_groups(MTLSize::new(1, NUM_KV_HEADS as u64, 1), MTLSize::new(32 * gqa_ratio as u64, 1, 1));
+        enc.set_bytes(
+            11,
+            std::mem::size_of_val(&gqa_params) as u64,
+            &gqa_params as *const _ as *const _,
+        );
+        enc.dispatch_thread_groups(
+            MTLSize::new(1, NUM_KV_HEADS as u64, 1),
+            MTLSize::new(32 * gqa_ratio as u64, 1, 1),
+        );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
     }
 
-    let gpu_output = unsafe { std::slice::from_raw_parts(output.contents() as *const u16, B * NUM_Q_HEADS as usize * D) };
+    let gpu_output = unsafe {
+        std::slice::from_raw_parts(
+            output.contents() as *const u16,
+            B * NUM_Q_HEADS as usize * D,
+        )
+    };
     let mut max_diff = 0.0f32;
     for (i, (&gpu_bits, &cpu)) in gpu_output.iter().zip(expected.iter()).enumerate() {
         let gpu = bf16_bits_to_f32(gpu_bits);
@@ -470,11 +522,10 @@ fn test_bsr_paged_gqa_real_dimensions() {
 /// ========================================================================
 // TEST 4: EAGLE Tree Verification End-to-End
 /// ========================================================================
-
 /// Tests that forward_tree_logits produces valid logits for a small tree.
 #[test]
 fn test_eagle_tree_verification_end_to_end() {
-    let Some(device) = Device::system_default() else {
+    let Some(_device) = Device::system_default() else {
         eprintln!("Skipping: no Metal GPU");
         return;
     };
@@ -493,12 +544,18 @@ fn test_eagle_tree_verification_end_to_end() {
             max_position_embeddings: 128,
             weight_dtype: kriya_core::tensor::DType::Q4Group64,
             tie_word_embeddings: false,
-            final_norm: NormVariant::RmsNorm { eps: 1e-5, zero_centered_unit_offset: false },
+            final_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
             final_logit_softcap: None,
             phase_policy: PhaseRoutingPolicy::default(),
             layers: vec![LayerDescriptor {
                 layer_idx: 0,
-                attn_norm: NormVariant::RmsNorm { eps: 1e-5, zero_centered_unit_offset: false },
+                attn_norm: NormVariant::RmsNorm {
+                    eps: 1e-5,
+                    zero_centered_unit_offset: false,
+                },
                 seq_mixer: SequenceMixerDescriptor::GroupedQueryAttention {
                     num_q_heads: 1,
                     num_kv_heads: 1,
@@ -516,7 +573,10 @@ fn test_eagle_tree_verification_end_to_end() {
                     split_k_decode_threshold: 128,
                 },
                 post_attn_norm: None,
-                ffn_norm: NormVariant::RmsNorm { eps: 1e-5, zero_centered_unit_offset: false },
+                ffn_norm: NormVariant::RmsNorm {
+                    eps: 1e-5,
+                    zero_centered_unit_offset: false,
+                },
                 channel_mixer: ChannelMixerDescriptor::DenseMlp {
                     intermediate_size: 64,
                     activation: ActivationVariant::SwiGLU,
@@ -532,20 +592,15 @@ fn test_eagle_tree_verification_end_to_end() {
     // Write a complete miniature checkpoint
     write_complete_miniature_checkpoint(tmp_dir.path());
 
-    let mut executor = MetalExecutor::new(
-        &desc,
-        &shader_dir,
-        Some(tmp_dir.path()),
-        16,
-        16,
-    ).unwrap();
+    let mut executor =
+        MetalExecutor::new(&desc, &shader_dir, Some(tmp_dir.path()), 16, 16).unwrap();
 
     // Create a 3-node draft tree
     let tree_tokens = vec![1u32, 2, 3];
     let tree_mask = vec![
         true, false, false, // node 0 attends to itself
-        true, true, false,  // node 1 attends to 0, 1
-        true, true, true,   // node 2 attends to 0, 1, 2
+        true, true, false, // node 1 attends to 0, 1
+        true, true, true, // node 2 attends to 0, 1, 2
     ];
 
     let mut kv_mgr = PagedKvCacheManager::new(64, 32, 16);
@@ -553,16 +608,24 @@ fn test_eagle_tree_verification_end_to_end() {
     let plan = kv_mgr.build_schedule_plan(&[1], 16).unwrap();
 
     let start = Instant::now();
-    let (logits, features) = executor
-        .forward_tree_logits(&desc, &plan, &tree_tokens, &tree_mask)
-        .expect("Tree verification should succeed");
+    let (logits, features) =
+        block_on(executor.forward_tree_logits(&desc, &plan, &tree_tokens, &tree_mask))
+            .expect("Tree verification should succeed");
     let elapsed = start.elapsed();
 
     // Verify shapes
     assert_eq!(logits.len(), 3, "Should have logits for 3 tree nodes");
     assert_eq!(logits[0].len(), 64, "Each node should have 64 vocab logits");
-    assert_eq!(features.len(), 3, "Should have hidden states for 3 tree nodes");
-    assert_eq!(features[0].len(), 64, "Each node should have 64 hidden dims");
+    assert_eq!(
+        features.len(),
+        3,
+        "Should have hidden states for 3 tree nodes"
+    );
+    assert_eq!(
+        features[0].len(),
+        64,
+        "Each node should have 64 hidden dims"
+    );
 
     // Verify logits are finite and reasonable
     for (node_idx, node_logits) in logits.iter().enumerate() {
@@ -570,7 +633,9 @@ fn test_eagle_tree_verification_end_to_end() {
             assert!(
                 logit.is_finite(),
                 "Logit at node {}, vocab {} is not finite: {}",
-                node_idx, v_idx, logit
+                node_idx,
+                v_idx,
+                logit
             );
         }
     }
@@ -584,7 +649,6 @@ fn test_eagle_tree_verification_end_to_end() {
 /// ========================================================================
 // TEST 5: Memory Budget Enforcement
 /// ========================================================================
-
 /// Tests that the hardware profiler correctly computes memory budgets
 /// and triggers hybrid mode for large models on small Macs.
 #[test]
@@ -602,8 +666,14 @@ fn test_memory_budget_enforcement() {
     assert_eq!(profile.max_working_set_bytes, 6_871_947_673); // 8GB * 0.80
 
     let policy = profile.tune_for_model(14 * 1024 * 1024 * 1024); // 14GB model
-    assert!(policy.gpu_hot_expert_ratio < 1.0, "Should trigger hybrid mode for large model");
-    assert!(policy.compress_kv_cache_q4, "Should compress KV cache under memory pressure");
+    assert!(
+        policy.gpu_hot_expert_ratio < 1.0,
+        "Should trigger hybrid mode for large model"
+    );
+    assert!(
+        policy.compress_kv_cache_q4,
+        "Should compress KV cache under memory pressure"
+    );
 
     // 128GB M4 Max: model fits entirely in GPU
     let profile = HardwareProfile::detect(
@@ -614,7 +684,10 @@ fn test_memory_budget_enforcement() {
     );
     assert_eq!(profile.form_factor, MacFormFactor::Max);
     let policy = profile.tune_for_model(20 * 1024 * 1024 * 1024); // 20GB model
-    assert_eq!(policy.gpu_hot_expert_ratio, 1.0, "Model fits in GPU, all experts hot");
+    assert_eq!(
+        policy.gpu_hot_expert_ratio, 1.0,
+        "Model fits in GPU, all experts hot"
+    );
     assert!(!policy.compress_kv_cache_q4);
 
     println!("Memory budget enforcement: PASS");
@@ -623,12 +696,11 @@ fn test_memory_budget_enforcement() {
 /// ========================================================================
 // TEST 6: Prefill Batching End-to-End
 /// ========================================================================
-
 /// Tests that forward_prefill_batch produces the same output as
 /// calling forward_and_sample token-by-token for each prefill token.
 #[test]
 fn test_prefill_batch_matches_token_by_token() {
-    let Some(device) = Device::system_default() else {
+    let Some(_device) = Device::system_default() else {
         eprintln!("Skipping: no Metal GPU");
         return;
     };
@@ -645,12 +717,18 @@ fn test_prefill_batch_matches_token_by_token() {
         max_position_embeddings: 128,
         weight_dtype: kriya_core::tensor::DType::Q4Group64,
         tie_word_embeddings: false,
-        final_norm: NormVariant::RmsNorm { eps: 1e-5, zero_centered_unit_offset: false },
+        final_norm: NormVariant::RmsNorm {
+            eps: 1e-5,
+            zero_centered_unit_offset: false,
+        },
         final_logit_softcap: None,
         phase_policy: PhaseRoutingPolicy::default(),
         layers: vec![LayerDescriptor {
             layer_idx: 0,
-            attn_norm: NormVariant::RmsNorm { eps: 1e-5, zero_centered_unit_offset: false },
+            attn_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
             seq_mixer: SequenceMixerDescriptor::GroupedQueryAttention {
                 num_q_heads: 1,
                 num_kv_heads: 1,
@@ -668,7 +746,10 @@ fn test_prefill_batch_matches_token_by_token() {
                 split_k_decode_threshold: 128,
             },
             post_attn_norm: None,
-            ffn_norm: NormVariant::RmsNorm { eps: 1e-5, zero_centered_unit_offset: false },
+            ffn_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
             channel_mixer: ChannelMixerDescriptor::DenseMlp {
                 intermediate_size: 64,
                 activation: ActivationVariant::SwiGLU,
@@ -682,13 +763,8 @@ fn test_prefill_batch_matches_token_by_token() {
     let tmp_dir = tempfile::tempdir().unwrap();
     write_complete_miniature_checkpoint(tmp_dir.path());
 
-    let mut executor = MetalExecutor::new(
-        &desc,
-        &shader_dir,
-        Some(tmp_dir.path()),
-        16,
-        16,
-    ).unwrap();
+    let mut executor =
+        MetalExecutor::new(&desc, &shader_dir, Some(tmp_dir.path()), 16, 16).unwrap();
 
     let mut kv_mgr = PagedKvCacheManager::new(64, 32, 16);
     kv_mgr.allocate_sequence(1, &[1, 2, 3]).unwrap();
@@ -708,47 +784,44 @@ fn test_prefill_batch_matches_token_by_token() {
 
     // Process token 1
     let plan1 = kv_mgr_ttt.build_prefix_schedule_plan(1, 1, 16).unwrap();
-    let tok1 = executor
-        .forward_and_sample(&desc, &plan1, &[1], &[0], samp_cfg)
-        .unwrap();
+    let tok1 = block_on(executor.forward_and_sample(&desc, &plan1, &[1], &[0], samp_cfg)).unwrap();
 
     // Process token 2 (position 1)
     let plan2 = kv_mgr_ttt.build_prefix_schedule_plan(1, 2, 16).unwrap();
-    let tok2 = executor
-        .forward_and_sample(&desc, &plan2, &[2], &[1], samp_cfg)
-        .unwrap();
+    let tok2 = block_on(executor.forward_and_sample(&desc, &plan2, &[2], &[1], samp_cfg)).unwrap();
 
     // Process token 3 (position 2)
     let plan3 = kv_mgr_ttt.build_prefix_schedule_plan(1, 3, 16).unwrap();
-    let tok3 = executor
-        .forward_and_sample(&desc, &plan3, &[3], &[2], samp_cfg)
-        .unwrap();
+    let tok3 = block_on(executor.forward_and_sample(&desc, &plan3, &[3], &[2], samp_cfg)).unwrap();
 
     // Batched prefill: process [1, 2, 3] in one command buffer
-    let mut executor2 = MetalExecutor::new(
-        &desc,
-        &shader_dir,
-        Some(tmp_dir.path()),
-        16,
-        16,
-    ).unwrap();
+    let mut executor2 =
+        MetalExecutor::new(&desc, &shader_dir, Some(tmp_dir.path()), 16, 16).unwrap();
     let mut kv_mgr_batch = PagedKvCacheManager::new(64, 32, 16);
     kv_mgr_batch.allocate_sequence(1, &[1, 2, 3]).unwrap();
 
     // Build a single parallel prefill layout for the entire chunk
     let prefix_plan = kv_mgr_batch
-        .build_parallel_prefill_layout(1, 3, 16)
+        .build_parallel_prefill_layout(1, 3, 16, 16)
         .unwrap();
 
     let positions = vec![0u32, 1, 2];
     let tokens = vec![1u32, 2, 3];
 
-    let tok_batch = executor2
-        .forward_prefill_batch(&desc, &tokens, &positions, &prefix_plan, samp_cfg)
-        .unwrap();
+    let tok_batch = block_on(executor2.forward_prefill_batch(
+        &desc,
+        &tokens,
+        &positions,
+        &prefix_plan,
+        samp_cfg,
+    ))
+    .unwrap();
 
     // Batched result should match the last token-by-token result
-    assert_eq!(tok_batch, tok3, "Batched prefill should produce same token as last sequential token");
+    assert_eq!(
+        tok_batch, tok3,
+        "Batched prefill should produce same token as last sequential token"
+    );
 
     println!(
         "Prefill batching vs token-by-token: tok1={}, tok2={}, tok3={}, batched={}, PASS",

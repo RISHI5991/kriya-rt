@@ -183,18 +183,16 @@ impl RadixPrefixCache {
             let chunk = &prompt_tokens[offset..offset + blk_sz];
             let first_tok = chunk[0];
 
-            if let Some(child) = current.children.get(&first_tok) {
-                if child.block_tokens == chunk {
-                    if let Some(phys_id) = child.physical_block_id {
-                        if gpu_allocator.ref_count(phys_id).unwrap_or(0) > 0 {
-                            gpu_allocator.inc_ref(phys_id)?;
-                            matched_blocks.push(phys_id);
-                            current = child;
-                            offset += blk_sz;
-                            continue;
-                        }
-                    }
-                }
+            if let Some(child) = current.children.get(&first_tok)
+                && child.block_tokens == chunk
+                && let Some(phys_id) = child.physical_block_id
+                && gpu_allocator.ref_count(phys_id).unwrap_or(0) > 0
+            {
+                gpu_allocator.inc_ref(phys_id)?;
+                matched_blocks.push(phys_id);
+                current = child;
+                offset += blk_sz;
+                continue;
             }
             break;
         }
@@ -248,11 +246,7 @@ impl SequenceBlockTable {
             0
         } else {
             let rem = self.total_tokens % block_size_tokens;
-            if rem == 0 {
-                block_size_tokens
-            } else {
-                rem
-            }
+            if rem == 0 { block_size_tokens } else { rem }
         }
     }
 }
@@ -593,6 +587,7 @@ impl PagedKvCacheManager {
     pub fn build_parallel_prefill_layout(
         &self,
         seq_id: u64,
+        prefix_tokens: u32,
         num_tokens: u32,
         max_blocks_per_cta: u32,
     ) -> Result<FlashInferSchedulePlan, KvCacheError> {
@@ -602,38 +597,39 @@ impl PagedKvCacheManager {
             .get(&seq_id)
             .ok_or(KvCacheError::InvalidSequenceId(seq_id))?;
 
-        if num_tokens == 0 || num_tokens > seq.total_tokens {
+        if num_tokens == 0 || prefix_tokens.saturating_add(num_tokens) > seq.total_tokens {
             return Err(KvCacheError::InvalidSequenceId(seq_id));
         }
 
-        // page_indptr: cumulative blocks per position
-        // page_indptr[0] = 0
-        // page_indptr[i+1] = ceil((i+1) / blk_sz) blocks needed for positions 0..i
+        // The attention kernel treats each query as an independent BSR row.
+        // Therefore page_indptr must point into a *concatenated* page_indices
+        // array, not directly to logical-block counts. For a 16-token page,
+        // query rows 0..2 are [block0], [block0], [block0], yielding [0,1,2,3].
         let mut page_indptr = Vec::with_capacity(num_tokens as usize + 1);
+        let mut page_indices = Vec::new();
         page_indptr.push(0);
         for i in 0..num_tokens {
-            let blocks_needed = ((i + 1) as u32).div_ceil(blk_sz);
-            page_indptr.push(blocks_needed as i32);
+            let visible_tokens = prefix_tokens + i + 1;
+            let blocks_needed = visible_tokens.div_ceil(blk_sz) as usize;
+            page_indices.extend(
+                seq.logical_blocks[..blocks_needed]
+                    .iter()
+                    .map(|&id| id as i32),
+            );
+            page_indptr.push(page_indices.len() as i32);
         }
-
-        // page_indices: all block IDs for the full sequence
-        let page_indices: Vec<i32> = seq
-            .logical_blocks
-            .iter()
-            .map(|&id| id as i32)
-            .collect();
 
         // last_page_len: valid tokens in last page per position (causal clamp)
         let mut last_page_len = Vec::with_capacity(num_tokens as usize);
         for i in 0..num_tokens {
-            let valid = ((i as u32) % blk_sz) + 1;
+            let valid = ((prefix_tokens + i) % blk_sz) + 1;
             last_page_len.push(valid as i32);
         }
 
         // CTA work tiles: one per query token
         let mut cta_work_tiles = Vec::new();
         for i in 0..num_tokens {
-            let blocks_for_pos = ((i + 1) as u32).div_ceil(blk_sz);
+            let blocks_for_pos = (prefix_tokens + i + 1).div_ceil(blk_sz);
             let is_split_k = u32::from(blocks_for_pos > max_blocks_per_cta);
             cta_work_tiles.push(CtaWorkTile {
                 request_idx: 0,
@@ -700,6 +696,20 @@ mod tests {
         mgr.fork_sequence(101, 103).unwrap();
         let (_blk, cow) = mgr.append_token_slot(103).unwrap();
         assert!(cow.is_some());
+    }
+
+    #[test]
+    fn test_parallel_prefill_layout_has_one_causal_bsr_row_per_query() {
+        let mut mgr = PagedKvCacheManager::new(16, 8, 4);
+        mgr.allocate_sequence(7, &[10, 11, 12, 13, 14, 15]).unwrap();
+
+        // Queries at absolute positions 2, 3, 4 see 3, 4, and 5 tokens.
+        // With four-token pages their BSR rows are [block0], [block0],
+        // [block0, block1], represented by concatenated page indices.
+        let plan = mgr.build_parallel_prefill_layout(7, 2, 3, 8).unwrap();
+        assert_eq!(plan.bsr_layout.page_indptr, vec![0, 1, 2, 4]);
+        assert_eq!(plan.bsr_layout.page_indices, vec![0, 0, 0, 1]);
+        assert_eq!(plan.bsr_layout.last_page_len, vec![3, 4, 1]);
     }
 
     #[test]
