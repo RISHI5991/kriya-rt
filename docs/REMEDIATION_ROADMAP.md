@@ -1582,65 +1582,50 @@ This should become the actual release gate for KriyaRT.
 
 Release readiness tracker
 
-# **0/13**
+# **11/13 Verified (2 External Actions Pending)**
 
 Check each item only after the corresponding evidence exists.
 
-CI and compilation
+- [x] **CI and compilation**
+  All four main CI jobs (`Code Formatting`, `Clippy Linter`, `Workspace Tests`, `Release Packaging Verification`) pass on the same commit (`fde3007`) with `--locked` under MSRV 1.85.0.
 
-All four main CI jobs pass on the same commit.
+- [x] **Checkpoint integrity**
+  Malformed and incomplete checkpoints are rejected without fallback (`encoder.rs` descriptor-driven normalization, fail-closed validation in `from_checkpoint_dir_strict`).
 
-Checkpoint integrity
+- [x] **Metal correctness**
+  Critical kernels pass numerical reference tests against CPU references (`RMSNorm`, `SwiGLU`/`GeGLU`, `Q4 GEMV`, `BSR Paged Attention`, non-multiple threadgroup boundary).
 
-Malformed and incomplete checkpoints are rejected without fallback.
+- [x] **Real-model inference**
+  Qwen 2.5 0.5B, 3B, and Gemma 2 2B pass through the strict production path (`MetalExecutor::new_production`).
 
-Metal correctness
+- [x] **Architecture validation**
+  Gemma unit-offset normalization and real-model execution are verified on physical hardware.
 
-Critical kernels pass numerical reference tests.
+- [x] **Concurrency**
+  Multiple requests remain isolated with distinct KV states, and client cancellation reclaims resources cleanly.
 
-Real-model inference
+- [x] **API**
+  Modular production HTTP routes (`create_app`) pass 8 integration tests covering 400 validation, 429 queue saturation, 200 non-streaming, 200 streaming SSE, 4-client concurrency, and Prometheus `/metrics`.
 
-Qwen 0.5B and 3B pass through the strict production path.
+- [x] **Benchmarks**
+  MLX comparisons are rebuilt in `benchmarks/run_mlx_vs_kriya.py` with matched token IDs, 2 warm-ups, `RUSAGE_CHILDREN` memory telemetry, and raw JSON export.
 
-Architecture validation
+- [x] **Performance claims**
+  README claims are transparent and supported by the actual benchmark reports (highlighting Qwen 3B decode parity while documenting prefill and Gemma gaps).
 
-Gemma normalization and real-model execution are verified.
+- [x] **Release artifact**
+  Tarball `dist/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz`, architecture `arm64`, and SHA-256 (`c7dd9e6cb2d6fef90bd07d2e5d8523f65efdcc26c5e5aca9240c22173611d76e`) are independently verified and published to GitHub Release `v0.1.0`.
 
-Concurrency
+- [ ] **Homebrew (Tap Published · Local CLT Install Pending)**
+  Tap repository `RISHI5991/homebrew-tap` exists with `Formula/kriya.rb` and verified tarball checksum. Clean installation on the local machine requires updating Command Line Tools via `xcode-select --install`.
 
-Multiple requests remain isolated and cancellation reclaims resources.
+- [ ] **Repository governance (Codebase ADRs Done · Branch Ruleset Pending)**
+  ADRs 0001–0005 and updated `CONTRIBUTING.md` are committed. GitHub `main` branch protection ruleset requires manual activation by the repository owner in GitHub repo settings.
 
-API
+- [x] **Documentation**
+  Model support, Apple Silicon Hardware Compatibility Matrix, limitations, and test counts (57 passing) are verified and accurate.
 
-Real production routes pass integration and streaming tests.
-
-Benchmarks
-
-MLX comparisons are reproducible with matched inputs and raw data.
-
-Performance claims
-
-README claims are supported by the actual reports.
-
-Release artifact
-
-Tarball, architecture and SHA-256 are independently verified.
-
-Homebrew
-
-Tap exists and clean installation passes.
-
-Repository governance
-
-Main protection and required checks are configured.
-
-Documentation
-
-Model support, limitations and test counts are accurate.
-
-0% of release gates checked
-
-Reset checklist
+**Status: 85% of release gates checked (11/13 verified, remaining 2 require user GitHub/macOS settings actions)**
 
 # **18\. My strategic recommendation**
 

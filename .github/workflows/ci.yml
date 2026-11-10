@@ -17,7 +17,7 @@ env:
 jobs:
   fmt:
     name: Code Formatting
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
 
   clippy:
     name: Clippy Linter
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -47,7 +47,7 @@ jobs:
 
   test-workspace:
     name: Workspace Tests (Apple Silicon)
-    runs-on: macos-14
+    runs-on: macos-latest
     env:
       KRIYA_REQUIRE_METAL: "1"
     steps:
@@ -62,7 +62,7 @@ jobs:
 
   package-check:
     name: Release Packaging Verification
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

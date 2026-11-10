@@ -1184,10 +1184,7 @@ kernel void bsr_paged_gqa_flashattn_prefill(
     const uint gqa_ratio = params.num_q_heads / params.num_kv_heads;
     const uint D         = params.head_dim;
     const uint TGP_M     = 16u;     // Query tokens per tile
-    const uint TILE_K    = 16u;     // K/V elements per tile (16 head_dim elements)
     const uint tid       = simd_id * 32u + lane_id;
-    const uint threads_in_tgp = gqa_ratio * 32u;
-
     if (simd_id >= gqa_ratio) return;
 
     const uint q_head = kv_head * gqa_ratio + simd_id;
@@ -1670,4 +1667,3 @@ kernel void apply_rope_inplace(
         }
     }
 }
-
