@@ -9,8 +9,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B%20(Edition%202024)-orange.svg)](https://www.rust-lang.org/)
 [![Homebrew](https://img.shields.io/badge/Homebrew-RISHI5991%2Ftap%2Fkriya-yellow.svg)](packaging/homebrew/kriya.rb)
 
-**The fastest, lightest, zero-dependency Large Language Model (LLM) inference runtime for Apple Silicon.**  
-*100% pure Rust + handcrafted Metal Shading Language (MSL 3.1). Zero Python overhead. Boots in 30ms. Single ~20MB binary.*
+**Native Rust and Metal inference runtime for Apple Silicon.**  
+*Engineered for zero-dependency local model execution, memory-aware serving, and low-latency decode without Python or PyTorch overhead. Boots in 30ms. Single ~20MB static binary.*
 
 [Key Innovations](#-key-architectural-innovations) • [Empirical Benchmarks](#-empirical-hardware-benchmarks-apple-silicon-m1-8gb) • [Quick Start](#-quick-start-in-60-seconds) • [OpenAI API Usage](#-openai-compatible-local-serving) • [Roadmap](ROADMAP.md) • [Contributing](CONTRIBUTING.md)
 
@@ -31,15 +31,15 @@ Apple's **MLX** is an extraordinary general research and array computing framewo
 Model: Qwen 2.5 3B Instruct (4-bit Group-64) on Apple M1 (8 GB Unified Memory)
 
 Apple MLX-LM   [==============================] 27.5 tok/s (36.4 ms / tok)
-KriyaRT        [================================] 28.9 tok/s (34.6 ms / tok)  (+5.1% FASTER!)
+KriyaRT        [================================] 28.9 tok/s (34.6 ms / tok)  (+5.1% decode throughput)
 =============================================================================================
 ```
 
-* **⚡ Faster Where It Counts:** Beats Apple MLX by **+5.1%** on autoregressive decode on Qwen 2.5 3B via register-level fused SwiGLU.
+* **⚡ Competitive Decode Throughput:** Delivers competitive autoregressive decode throughput on selected Qwen configurations (+5.1% on Qwen 2.5 3B decode) via register-level fused SwiGLU. Active optimization is ongoing for prefill throughput and cross-model kernel pipelines.
 * **📦 Single Standalone Binary:** ~20MB static executable. 0 Python. 0 CUDA. 0 external C++ libraries.
-* **🔄 Zero-Conversion Direct Hub Ingestion:** Directly memory-maps standard MLX / Hugging Face Community safetensors checkpoints without offline conversion.
+* **🔄 Direct Checkpoint Ingestion:** Eliminates separate offline conversion steps; MLX affine triplets (`.weight` + `.scales` + `.biases`) are repacked into unified GPU buffers at load time, while native `Q4_G64` format binds directly.
 * **🧠 Minimal Memory Footprint:** Operates under **2.3 GB RAM** on 3B models, ensuring smooth execution on 8GB base Macs without memory paging or swap thrashing.
-* **🌐 True Production Serving:** Built-in ORCA iteration-level selective batching, Paged Radix KV caches with copy-on-write prefix sharing, and an OpenAI-compatible `/v1/chat/completions` HTTP server with real-time SSE streaming.
+* **🌐 Production-Ready Serving:** Built-in ORCA iteration-level selective batching, Paged Radix KV caches with copy-on-write prefix sharing, and an OpenAI-compatible `/v1/chat/completions` HTTP server with real-time SSE streaming.
 
 ---
 
@@ -125,18 +125,20 @@ Standard inference frameworks materialize intermediate Gate and Up tensors in DR
 * Multi-turn conversations and shared system prompts automatically reuse KV cache branches via Copy-on-Write (CoW) radix tree prefix sharing.
 * Vectorized `bq8` prefill attention processes 8 query tokens per SIMD threadgroup with online softmax kept strictly within threadgroup SRAM.
 
-### 3. Zero-Conversion Direct Hub Ingestion
-No separate quantization or conversion step required:
+### 3. Direct Hub Checkpoint Ingestion
+No separate offline conversion utility is required:
 ```bash
 ./kriya-server --model ~/.cache/huggingface/hub/models--mlx-community--Qwen2.5-3B-Instruct-4bit/snapshots/...
 ```
-KriyaRT automatically detects `.weight` + `.scales` + `.biases` triplets, maps them into contiguous unified memory, and performs alignment-safe on-the-fly conversion of normalizations to native BF16.
+KriyaRT automatically detects MLX `.weight` + `.scales` + `.biases` triplets and repacks them into contiguous GPU buffers at load time, while pre-packed unified `Q4_G64` checkpoints bind directly. Layer normalizations are dynamically cast to native BF16 with zero CPU conversion latency.
 
 ---
 
 ## 📦 Quick Start in 60 Seconds
 
-### Option A: Install via Homebrew (Recommended)
+### Option A: Install via Homebrew
+
+*(Note: Homebrew formula is tracked at `packaging/homebrew/kriya.rb`. Public tap configuration `RISHI5991/tap` is being provisioned alongside v0.1.0 release artifacts).*
 
 ```bash
 # Add tap and install precompiled release binary

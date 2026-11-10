@@ -210,14 +210,42 @@ impl EngineRuntime {
             }
         };
 
-        // Release integrity check: If kriya-artifact-manifest.json exists, verify checksum
+        // Release integrity check: If kriya-artifact-manifest.json exists, verify checksum strictly
         let manifest_path = checkpoint_dir.join("kriya-artifact-manifest.json");
-        if manifest_path.is_file()
-            && let Ok(manifest_bytes) = std::fs::read(&manifest_path)
-            && let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(&manifest_bytes)
-            && let Some(spec_file) = manifest_json.get("speculative_draft_file")
-            && let Some(expected_hash) = spec_file.get("sha256").and_then(|h| h.as_str())
-        {
+        if manifest_path.is_file() {
+            let manifest_bytes = match std::fs::read(&manifest_path) {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!(
+                        "KriyaRT integrity failure: failed to read manifest at {}: {err}",
+                        manifest_path.display()
+                    );
+                    return None;
+                }
+            };
+            let manifest_json: serde_json::Value = match serde_json::from_slice(&manifest_bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!(
+                        "KriyaRT integrity failure: malformed manifest JSON at {}: {err}",
+                        manifest_path.display()
+                    );
+                    return None;
+                }
+            };
+            let Some(spec_file) = manifest_json.get("speculative_draft_file") else {
+                eprintln!(
+                    "KriyaRT integrity failure: manifest missing 'speculative_draft_file' entry"
+                );
+                return None;
+            };
+            let Some(expected_hash) = spec_file.get("sha256").and_then(|h| h.as_str()) else {
+                eprintln!(
+                    "KriyaRT integrity failure: manifest missing 'sha256' string for draft file"
+                );
+                return None;
+            };
+
             let mut context = ring::digest::Context::new(&ring::digest::SHA256);
             context.update(&draft_weights);
             let computed_hash: String = context

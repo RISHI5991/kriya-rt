@@ -43,6 +43,8 @@ jobs:
   test-workspace:
     name: Workspace Tests (Apple Silicon)
     runs-on: macos-14
+    env:
+      KRIYA_REQUIRE_METAL: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

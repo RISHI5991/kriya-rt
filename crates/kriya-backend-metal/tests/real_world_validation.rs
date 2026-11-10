@@ -24,6 +24,21 @@ fn workspace_kernels_dir() -> std::path::PathBuf {
         .join("metal")
 }
 
+fn require_metal_device() -> Option<Device> {
+    match Device::system_default() {
+        Some(dev) => Some(dev),
+        None => {
+            if std::env::var("KRIYA_REQUIRE_METAL").is_ok() {
+                panic!(
+                    "Fatal: KRIYA_REQUIRE_METAL is set, but no Apple Silicon GPU is visible to this process!"
+                );
+            }
+            eprintln!("Skipping Metal execution: no Apple Silicon GPU is visible to this process");
+            None
+        }
+    }
+}
+
 /// ========================================================================
 // TEST 1: Q4_G64 Decode GEMV at Real Model Dimensions
 /// ========================================================================
@@ -31,8 +46,7 @@ fn workspace_kernels_dir() -> std::path::PathBuf {
 /// Verifies against a naive CPU reference.
 #[test]
 fn test_q4_gemmv_real_dimensions_llama_3b() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping: no Metal GPU");
+    let Some(device) = require_metal_device() else {
         return;
     };
 
@@ -144,8 +158,7 @@ fn test_q4_gemmv_real_dimensions_llama_3b() {
 /// This is the kernel that was unverified — critical for prefill performance.
 #[test]
 fn test_q4_prefill_gemm_real_dimensions() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping: no Metal GPU");
+    let Some(device) = require_metal_device() else {
         return;
     };
 
@@ -282,8 +295,7 @@ fn test_q4_prefill_gemm_real_dimensions() {
 /// 24 Q heads, 8 KV heads, head_dim=128, block_size=16.
 #[test]
 fn test_bsr_paged_gqa_real_dimensions() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping: no Metal GPU");
+    let Some(device) = require_metal_device() else {
         return;
     };
 
@@ -525,8 +537,7 @@ fn test_bsr_paged_gqa_real_dimensions() {
 /// Tests that forward_tree_logits produces valid logits for a small tree.
 #[test]
 fn test_eagle_tree_verification_end_to_end() {
-    let Some(_device) = Device::system_default() else {
-        eprintln!("Skipping: no Metal GPU");
+    let Some(_device) = require_metal_device() else {
         return;
     };
 
@@ -700,8 +711,7 @@ fn test_memory_budget_enforcement() {
 /// calling forward_and_sample token-by-token for each prefill token.
 #[test]
 fn test_prefill_batch_matches_token_by_token() {
-    let Some(_device) = Device::system_default() else {
-        eprintln!("Skipping: no Metal GPU");
+    let Some(_device) = require_metal_device() else {
         return;
     };
 
@@ -837,8 +847,7 @@ fn test_prefill_batch_matches_token_by_token() {
 /// ensuring EAGLE speculative decoding operates on isolated per-request hidden features.
 #[test]
 fn test_batched_speculative_per_request_hidden_features() {
-    let Some(_device) = Device::system_default() else {
-        eprintln!("Skipping: no Metal GPU");
+    let Some(_device) = require_metal_device() else {
         return;
     };
 
@@ -944,6 +953,213 @@ fn test_batched_speculative_per_request_hidden_features() {
     );
 
     println!("Batched speculative root feature isolation verified successfully");
+}
+
+#[test]
+fn test_concurrent_multi_request_batching_isolation_and_cancellation() {
+    let Some(_device) = require_metal_device() else {
+        return;
+    };
+
+    use kriya_core::descriptor::{
+        ActivationVariant, AttentionMaskVariant, ChannelMixerDescriptor, LayerDescriptor,
+        NormVariant, PhaseRoutingPolicy, PositionalEncoding, SequenceMixerDescriptor,
+    };
+    let desc = ModelArchDescriptor {
+        family: "test".into(),
+        model_name: "mini-multi-request".into(),
+        vocab_size: 64,
+        hidden_size: 64,
+        max_position_embeddings: 128,
+        weight_dtype: kriya_core::tensor::DType::Q4Group64,
+        tie_word_embeddings: false,
+        final_norm: NormVariant::RmsNorm {
+            eps: 1e-5,
+            zero_centered_unit_offset: false,
+        },
+        final_logit_softcap: None,
+        phase_policy: PhaseRoutingPolicy::default(),
+        layers: vec![LayerDescriptor {
+            layer_idx: 0,
+            attn_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
+            seq_mixer: SequenceMixerDescriptor::GroupedQueryAttention {
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 64,
+                pos_encoding: PositionalEncoding::RoPE {
+                    theta: 10_000.0,
+                    rotary_dim: 64,
+                    interleaved: false,
+                    scaling_factor: 1.0,
+                },
+                mask_variant: AttentionMaskVariant::Causal,
+                qk_norm: None,
+                qkv_bias: false,
+                attn_logit_softcap: None,
+                split_k_decode_threshold: 128,
+            },
+            post_attn_norm: None,
+            ffn_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
+            channel_mixer: ChannelMixerDescriptor::DenseMlp {
+                intermediate_size: 64,
+                activation: ActivationVariant::SwiGLU,
+                use_bias: false,
+            },
+            post_ffn_norm: None,
+        }],
+    };
+
+    let shader_dir = workspace_kernels_dir();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    write_miniature_checkpoint_with_distinct_embeddings(tmp_dir.path());
+
+    let mut executor =
+        MetalExecutor::new(&desc, &shader_dir, Some(tmp_dir.path()), 16, 16).unwrap();
+
+    let mut kv_mgr = PagedKvCacheManager::new(64, 32, 16);
+
+    // 1. Scenario: 4 concurrent decode requests
+    let req_ids = [201u64, 202, 203, 204];
+    let initial_tokens = [5u32, 12, 23, 37];
+
+    for (&req, &tok) in req_ids.iter().zip(&initial_tokens) {
+        kv_mgr.allocate_sequence(req, &[tok]).unwrap();
+    }
+
+    let plan_4 = kv_mgr.build_schedule_plan(&req_ids, 16).unwrap();
+    let samp_cfg = SamplingConfig {
+        vocab_size: 64,
+        greedy: 1,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 64,
+        rng_seed: 42,
+    };
+    let samplings_4 = [samp_cfg, samp_cfg, samp_cfg, samp_cfg];
+    let positions_4 = [0u32, 0, 0, 0];
+
+    let sampled_4 = block_on(executor.forward_and_sample_batch(
+        &desc,
+        &initial_tokens,
+        &positions_4,
+        &plan_4,
+        &samplings_4,
+    ))
+    .unwrap();
+
+    assert_eq!(sampled_4.len(), 4);
+
+    let mut features = Vec::new();
+    for i in 0..4 {
+        let feat = executor.read_hidden_feature_at(64, i);
+        assert_eq!(feat.len(), 64);
+        assert!(feat.iter().all(|x| x.is_finite()));
+        features.push(feat);
+    }
+
+    // Verify all 4 hidden features are pairwise distinct (no cross-request collision)
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            assert_ne!(
+                features[i], features[j],
+                "Request {i} and Request {j} produced identical hidden features"
+            );
+        }
+    }
+
+    // 2. Scenario: Mixed prefill + decode iteration
+    // Req 205 arrives as a new prefill request (prompt chunk of 3 tokens: &[2, 4, 8])
+    let req_prefill = 205u64;
+    let prefill_tokens = [2u32, 4, 8];
+    kv_mgr
+        .allocate_sequence(req_prefill, &prefill_tokens)
+        .unwrap();
+
+    let prefill_plan = kv_mgr
+        .build_parallel_prefill_layout(req_prefill, 0, 3, 16)
+        .unwrap();
+    let prefill_positions = [0u32, 1, 2];
+
+    let prefill_next_tok = block_on(executor.forward_prefill_batch(
+        &desc,
+        &prefill_tokens,
+        &prefill_positions,
+        &prefill_plan,
+        samp_cfg,
+    ))
+    .unwrap();
+    assert!(prefill_next_tok < 64);
+
+    // Decode continues for Req 201 and 203 with distinct input tokens
+    let decode_reqs = [201u64, 203u64];
+    let decode_tokens = [14u32, 42u32];
+    let decode_positions = [1u32, 1u32];
+    let decode_plan = kv_mgr.build_schedule_plan(&decode_reqs, 16).unwrap();
+    let decode_samplings = [samp_cfg, samp_cfg];
+
+    let decode_sampled = block_on(executor.forward_and_sample_batch(
+        &desc,
+        &decode_tokens,
+        &decode_positions,
+        &decode_plan,
+        &decode_samplings,
+    ))
+    .unwrap();
+
+    assert_eq!(decode_sampled.len(), 2);
+    let feat_201 = executor.read_hidden_feature_at(64, 0);
+    let feat_203 = executor.read_hidden_feature_at(64, 1);
+    assert_ne!(feat_201, feat_203);
+    assert!(feat_201.iter().all(|x| x.is_finite()));
+    assert!(feat_203.iter().all(|x| x.is_finite()));
+
+    // 3. Scenario: One request cancelled mid-generation; assert KV pages are reclaimed
+    assert!(kv_mgr.contains_sequence(202));
+    kv_mgr.free_sequence(202).unwrap();
+    assert!(
+        !kv_mgr.contains_sequence(202),
+        "Sequence 202 must be completely unregistered"
+    );
+
+    // 4. Scenario: One request reaches completion / EOS
+    kv_mgr.free_sequence(204).unwrap();
+    assert!(!kv_mgr.contains_sequence(204));
+
+    // The remaining active requests (201, 203, 205) continue smoothly
+    let final_reqs = [201u64, 203, 205];
+    let final_tokens = [decode_sampled[0], decode_sampled[1], prefill_next_tok];
+    let final_positions = [2u32, 2, 3];
+    let final_plan = kv_mgr.build_schedule_plan(&final_reqs, 16).unwrap();
+    let final_samplings = [samp_cfg, samp_cfg, samp_cfg];
+
+    let final_sampled = block_on(executor.forward_and_sample_batch(
+        &desc,
+        &final_tokens,
+        &final_positions,
+        &final_plan,
+        &final_samplings,
+    ))
+    .unwrap();
+
+    assert_eq!(final_sampled.len(), 3);
+    for tok in final_sampled {
+        assert!(tok < 64);
+    }
+
+    // Clean up remaining sequences
+    kv_mgr.free_sequence(201).unwrap();
+    kv_mgr.free_sequence(203).unwrap();
+    kv_mgr.free_sequence(205).unwrap();
+
+    println!(
+        "Concurrent multi-request batching, isolation, and cancellation verified successfully"
+    );
 }
 
 // ========================================================================

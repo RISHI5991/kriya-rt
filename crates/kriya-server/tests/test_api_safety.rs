@@ -241,3 +241,143 @@ async fn test_api_admission_queue_saturation_429() {
     let body_str = String::from_utf8_lossy(&body_bytes);
     assert!(body_str.contains("kriya_rejected_requests_total 1"));
 }
+
+#[tokio::test]
+async fn test_server_concurrent_requests_isolation_and_cancellation() {
+    use std::sync::atomic::AtomicBool;
+
+    let (work_tx, mut work_rx) = mpsc::unbounded_channel::<u64>();
+    let metrics = Arc::new(ServerMetrics::default());
+    let handle = ServerHandle {
+        work_tx,
+        model_name: "test-model".to_string(),
+        metrics: metrics.clone(),
+        max_prompt_tokens: 1024,
+        max_completion_tokens: 512,
+        max_concurrent_requests: 16,
+    };
+
+    let app = Router::new()
+        .route(
+            "/v1/chat/stream",
+            post({
+                let handle = handle.clone();
+                move |axum::Json(payload): axum::Json<ChatCompletionRequest>| {
+                    let handle = handle.clone();
+                    async move {
+                        handle
+                            .metrics
+                            .active_requests
+                            .fetch_add(1, Ordering::SeqCst);
+                        let _ = handle.work_tx.send(payload.messages.len() as u64);
+
+                        struct ActiveGuard(Arc<ServerMetrics>);
+                        impl Drop for ActiveGuard {
+                            fn drop(&mut self) {
+                                self.0.active_requests.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+
+                        let guard = Arc::new(ActiveGuard(handle.metrics.clone()));
+                        let stream = futures_util::stream::unfold(
+                            (0usize, guard),
+                            |(i, guard)| async move {
+                                if i < 5 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(15))
+                                        .await;
+                                    Some((
+                                        Ok::<_, std::io::Error>(format!("data: token_{i}\n\n")),
+                                        (i + 1, guard),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .with_state(handle);
+
+    // Drain the work channel in background
+    let drainer = tokio::spawn(async move {
+        let mut count = 0;
+        while work_rx.recv().await.is_some() {
+            count += 1;
+            if count == 4 {
+                break;
+            }
+        }
+    });
+
+    // Spawn 4 concurrent requests
+    let client_cancelled = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    for req_idx in 0..4 {
+        let app_clone = app.clone();
+        let client_cancelled_clone = client_cancelled.clone();
+        let join_h = tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/stream")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"messages":[{{"role":"user","content":"req_{req_idx}"}}],"max_tokens":16}}"#
+                )))
+                .unwrap();
+
+            let res = app_clone.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+
+            let mut body_stream = res.into_body().into_data_stream();
+            use futures_util::StreamExt;
+
+            let mut tokens_received = 0;
+            while let Some(chunk) = body_stream.next().await {
+                let bytes = chunk.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                if text.contains("token_") {
+                    tokens_received += 1;
+                }
+                // Cancel request 3 after receiving 1 token
+                if req_idx == 3 && tokens_received >= 1 {
+                    client_cancelled_clone.store(true, Ordering::SeqCst);
+                    // Dropping the body_stream simulates an aborted client HTTP connection
+                    drop(body_stream);
+                    return tokens_received;
+                }
+            }
+            tokens_received
+        });
+        handles.push(join_h);
+    }
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+
+    // Requests 0, 1, 2 completed fully (5 tokens each)
+    assert_eq!(results[0], 5);
+    assert_eq!(results[1], 5);
+    assert_eq!(results[2], 5);
+    // Request 3 cancelled early
+    assert_eq!(results[3], 1);
+    assert!(client_cancelled.load(Ordering::SeqCst));
+
+    // Verify all active requests have decremented to 0
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        metrics.active_requests.load(Ordering::SeqCst),
+        0,
+        "Active requests gauge must return to zero after completion and cancellation"
+    );
+
+    let _ = drainer.await;
+}

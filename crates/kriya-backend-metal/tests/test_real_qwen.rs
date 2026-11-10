@@ -6,10 +6,25 @@ use kriya_kv::bsr_paged::PagedKvCacheManager;
 use metal::Device;
 use std::path::PathBuf;
 
+fn require_metal_device() -> Option<Device> {
+    match Device::system_default() {
+        Some(dev) => Some(dev),
+        None => {
+            if std::env::var("KRIYA_REQUIRE_METAL").is_ok() {
+                panic!(
+                    "Fatal: KRIYA_REQUIRE_METAL is set, but no Apple Silicon GPU is visible to this process!"
+                );
+            }
+            eprintln!("Skipping Metal test: No Apple Silicon GPU available.");
+            None
+        }
+    }
+}
+
 #[test]
 #[ignore = "Requires physical weights in models/qwen2.5-0.5b-instruct-kriya-q4"]
 fn test_real_qwen_inference() {
-    let Some(_device) = Device::system_default() else {
+    let Some(_device) = require_metal_device() else {
         return;
     };
 

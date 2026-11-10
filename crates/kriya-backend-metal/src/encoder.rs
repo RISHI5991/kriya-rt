@@ -331,15 +331,40 @@ impl ModelGpuWeights {
                 let cols = expected_shape[1];
                 let num_blocks = rows * cols.div_ceil(64);
                 let w_bytes = view.data.len();
-                if w_bytes == num_blocks * 32 {
-                    return Ok(());
-                } else {
+                if w_bytes != num_blocks * 32 {
                     return Err(MetalError::UnsupportedProductionConfiguration(format!(
                         "MLX weight tensor '{weight_name}' byte length {} does not match expected {}",
                         w_bytes,
                         num_blocks * 32
                     )));
                 }
+                let s_view = loader.get_tensor(&s_name)?;
+                if !matches!(
+                    s_view.descriptor.dtype,
+                    DType::BF16 | DType::F16 | DType::F32
+                ) {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX scales tensor '{s_name}' has invalid dtype {:?}; expected float",
+                        s_view.descriptor.dtype
+                    )));
+                }
+                let b_view = loader.get_tensor(&b_name)?;
+                if !matches!(
+                    b_view.descriptor.dtype,
+                    DType::BF16 | DType::F16 | DType::F32
+                ) {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX biases tensor '{b_name}' has invalid dtype {:?}; expected float",
+                        b_view.descriptor.dtype
+                    )));
+                }
+                // Dry-run repacking to verify it actually succeeds
+                loader.pack_mlx_affine_q4_group64(prefix).map_err(|err| {
+                    MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX Q4 triplet repacking failed for '{prefix}': {err}"
+                    ))
+                })?;
+                return Ok(());
             }
         }
 
@@ -356,9 +381,39 @@ impl ModelGpuWeights {
                 let cols = expected_shape[1];
                 let num_blocks = rows * cols.div_ceil(64);
                 let w_bytes = view.data.len();
-                if w_bytes == num_blocks * 32 {
-                    return Ok(());
+                if w_bytes != num_blocks * 32 {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX weight tensor '{prefix}' byte length {} does not match expected {}",
+                        w_bytes,
+                        num_blocks * 32
+                    )));
                 }
+                let s_view = loader.get_tensor(&s_name)?;
+                if !matches!(
+                    s_view.descriptor.dtype,
+                    DType::BF16 | DType::F16 | DType::F32
+                ) {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX scales tensor '{s_name}' has invalid dtype {:?}; expected float",
+                        s_view.descriptor.dtype
+                    )));
+                }
+                let b_view = loader.get_tensor(&b_name)?;
+                if !matches!(
+                    b_view.descriptor.dtype,
+                    DType::BF16 | DType::F16 | DType::F32
+                ) {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX biases tensor '{b_name}' has invalid dtype {:?}; expected float",
+                        b_view.descriptor.dtype
+                    )));
+                }
+                loader.pack_mlx_affine_q4_group64(prefix).map_err(|err| {
+                    MetalError::UnsupportedProductionConfiguration(format!(
+                        "MLX Q4 triplet repacking failed for '{prefix}': {err}"
+                    ))
+                })?;
+                return Ok(());
             }
         }
 
@@ -504,6 +559,238 @@ impl ModelGpuWeights {
             }
         }
         Ok(())
+    }
+
+    /// Strictly loads real `.safetensors` / MLX 4-bit weights from a local checkpoint directory
+    /// for production serving or benchmarking. Fails closed with an error if ANY required
+    /// tensor, scale, or bias fails to load or pack. Zero synthetic fallback is allocated.
+    pub fn from_checkpoint_dir_strict<P: AsRef<Path>>(
+        device: &Device,
+        desc: &ModelArchDescriptor,
+        checkpoint_dir: P,
+    ) -> Result<Self, MetalError> {
+        let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
+        let shared = MTLResourceOptions::StorageModeShared;
+        let h = desc.hidden_size as usize;
+        let vocab = desc.vocab_size as usize;
+
+        let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
+            let direct_key = format!("{prefix}.weight");
+            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key)
+                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && loader
+                    .get_tensor_bytes(&format!("{prefix}.scales"))
+                    .is_err()
+            {
+                return Ok(device.new_buffer_with_data(
+                    raw_bytes.as_ptr() as *const _,
+                    raw_bytes.len() as u64,
+                    shared,
+                ));
+            }
+            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix)
+                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && loader
+                    .get_tensor_bytes(&format!("{prefix}.scales"))
+                    .is_err()
+            {
+                return Ok(device.new_buffer_with_data(
+                    raw_bytes.as_ptr() as *const _,
+                    raw_bytes.len() as u64,
+                    shared,
+                ));
+            }
+
+            // Path B: MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
+            let blocks = loader.pack_mlx_affine_q4_group64(prefix).map_err(|err| {
+                MetalError::UnsupportedProductionConfiguration(format!(
+                    "Production required tensor '{prefix}' failed to load or pack: {err}"
+                ))
+            })?;
+            let expected_blocks = expected_shape[0] * expected_shape[1].div_ceil(64);
+            if blocks.len() != expected_blocks {
+                return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                    "Packed blocks length {} does not match expected {} for tensor '{prefix}'",
+                    blocks.len(),
+                    expected_blocks
+                )));
+            }
+            Ok(device.new_buffer_with_data(
+                blocks.as_ptr() as *const _,
+                (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
+                shared,
+            ))
+        };
+
+        let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
+            let view = loader.get_tensor(name).map_err(|err| {
+                MetalError::UnsupportedProductionConfiguration(format!(
+                    "Production required norm tensor '{name}' missing: {err}"
+                ))
+            })?;
+            if view.descriptor.shape != [expected_len] {
+                return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                    "Tensor '{name}' shape {:?} does not match expected [{expected_len}]",
+                    view.descriptor.shape
+                )));
+            }
+            let bf16_bytes: Vec<u8> = match view.descriptor.dtype {
+                DType::BF16 => view.data.to_vec(),
+                DType::F16 => {
+                    let num_elements = view.data.len() / 2;
+                    let mut converted = Vec::with_capacity(num_elements * 2);
+                    for i in 0..num_elements {
+                        let f16_val = u16::from_le_bytes([view.data[i * 2], view.data[i * 2 + 1]]);
+                        let f32_val = kriya_core::quantizer::f16_bits_to_f32(f16_val);
+                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
+                        converted.extend_from_slice(&bf16_val.to_le_bytes());
+                    }
+                    converted
+                }
+                DType::F32 => {
+                    let num_elements = view.data.len() / 4;
+                    let mut converted = Vec::with_capacity(num_elements * 2);
+                    for i in 0..num_elements {
+                        let bytes = [
+                            view.data[i * 4],
+                            view.data[i * 4 + 1],
+                            view.data[i * 4 + 2],
+                            view.data[i * 4 + 3],
+                        ];
+                        let f32_val = f32::from_le_bytes(bytes);
+                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
+                        converted.extend_from_slice(&bf16_val.to_le_bytes());
+                    }
+                    converted
+                }
+                other => {
+                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "Tensor '{name}' has unsupported dtype {:?}",
+                        other
+                    )));
+                }
+            };
+            Ok(device.new_buffer_with_data(
+                bf16_bytes.as_ptr() as *const _,
+                bf16_bytes.len() as u64,
+                shared,
+            ))
+        };
+
+        let embed_tokens = bind_q4("model.embed_tokens", &[vocab, h])?;
+        let final_norm = bind_bf16("model.norm.weight", h)?;
+        let lm_head = if desc.tie_word_embeddings {
+            embed_tokens.clone()
+        } else {
+            bind_q4("lm_head", &[vocab, h])?
+        };
+
+        let mut layers = Vec::with_capacity(desc.layers.len());
+        for (idx, layer) in desc.layers.iter().enumerate() {
+            let p = format!("model.layers.{idx}");
+            let attn_norm = bind_bf16(&format!("{p}.input_layernorm.weight"), h)?;
+
+            let (q_dim, kv_dim, head_dim, qkv_bias, qk_norm) = match layer.seq_mixer {
+                SequenceMixerDescriptor::GroupedQueryAttention {
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    qkv_bias,
+                    qk_norm,
+                    ..
+                } => (
+                    num_q_heads as usize * head_dim as usize,
+                    num_kv_heads as usize * head_dim as usize,
+                    head_dim as usize,
+                    qkv_bias,
+                    qk_norm.is_some(),
+                ),
+                _ => (h, h, 64, false, false),
+            };
+            let inter = match layer.channel_mixer {
+                ChannelMixerDescriptor::DenseMlp {
+                    intermediate_size, ..
+                } => intermediate_size as usize,
+                _ => h * 4,
+            };
+
+            let q_proj = bind_q4(&format!("{p}.self_attn.q_proj"), &[q_dim, h])?;
+            let k_proj = bind_q4(&format!("{p}.self_attn.k_proj"), &[kv_dim, h])?;
+            let v_proj = bind_q4(&format!("{p}.self_attn.v_proj"), &[kv_dim, h])?;
+            let o_proj = bind_q4(&format!("{p}.self_attn.o_proj"), &[h, q_dim])?;
+
+            let q_bias = if qkv_bias {
+                bind_bf16(&format!("{p}.self_attn.q_proj.bias"), q_dim)?
+            } else {
+                device.new_buffer(4, shared)
+            };
+            let k_bias = if qkv_bias {
+                bind_bf16(&format!("{p}.self_attn.k_proj.bias"), kv_dim)?
+            } else {
+                device.new_buffer(4, shared)
+            };
+            let v_bias = if qkv_bias {
+                bind_bf16(&format!("{p}.self_attn.v_proj.bias"), kv_dim)?
+            } else {
+                device.new_buffer(4, shared)
+            };
+
+            let q_norm = if qk_norm {
+                bind_bf16(&format!("{p}.self_attn.q_norm.weight"), head_dim)?
+            } else {
+                device.new_buffer(4, shared)
+            };
+            let k_norm = if qk_norm {
+                bind_bf16(&format!("{p}.self_attn.k_norm.weight"), head_dim)?
+            } else {
+                device.new_buffer(4, shared)
+            };
+
+            let (ffn_norm, post_attn_norm, post_ffn_norm) = if loader
+                .get_tensor(&format!("{p}.pre_feedforward_layernorm.weight"))
+                .is_ok()
+            {
+                let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
+                let post_att = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h).ok();
+                let post_ff = bind_bf16(&format!("{p}.post_feedforward_layernorm.weight"), h).ok();
+                (pre, post_att, post_ff)
+            } else {
+                let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
+                (norm, None, None)
+            };
+
+            let gate_proj = bind_q4(&format!("{p}.mlp.gate_proj"), &[inter, h])?;
+            let up_proj = bind_q4(&format!("{p}.mlp.up_proj"), &[inter, h])?;
+            let down_proj = bind_q4(&format!("{p}.mlp.down_proj"), &[h, inter])?;
+            let moe_router_gate = device.new_buffer(4, shared);
+
+            layers.push(LayerGpuBuffers {
+                attn_norm,
+                q_proj,
+                k_proj,
+                v_proj,
+                q_bias,
+                k_bias,
+                v_bias,
+                o_proj,
+                q_norm,
+                k_norm,
+                post_attn_norm,
+                ffn_norm,
+                post_ffn_norm,
+                gate_proj,
+                up_proj,
+                down_proj,
+                moe_router_gate,
+            });
+        }
+
+        Ok(ModelGpuWeights {
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+        })
     }
 
     /// Loads real `.safetensors` / MLX 4-bit weights from a local checkpoint directory,
@@ -1090,8 +1377,10 @@ impl MetalExecutor {
         let weights = if let Some(ckpt) = checkpoint_dir {
             if production_mode {
                 ModelGpuWeights::validate_production_checkpoint(descriptor, ckpt)?;
+                ModelGpuWeights::from_checkpoint_dir_strict(&device, descriptor, ckpt)?
+            } else {
+                ModelGpuWeights::from_checkpoint_dir(&device, descriptor, ckpt)?
             }
-            ModelGpuWeights::from_checkpoint_dir(&device, descriptor, ckpt)?
         } else {
             if production_mode {
                 return Err(MetalError::UnsupportedProductionConfiguration(

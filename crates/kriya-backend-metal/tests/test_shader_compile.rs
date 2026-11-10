@@ -15,6 +15,21 @@ fn workspace_kernels_dir() -> PathBuf {
         .join("metal")
 }
 
+fn require_metal_device() -> Option<Device> {
+    match Device::system_default() {
+        Some(dev) => Some(dev),
+        None => {
+            if std::env::var("KRIYA_REQUIRE_METAL").is_ok() {
+                panic!(
+                    "Fatal: KRIYA_REQUIRE_METAL is set, but no Apple Silicon GPU is visible to this process!"
+                );
+            }
+            eprintln!("Skipping Metal execution: no Apple Silicon GPU is visible to this process");
+            None
+        }
+    }
+}
+
 /// A deliberately small, but complete, dense-GQA model contract.  It lets the
 /// production checkpoint validator be tested without treating a partial
 /// checkpoint as evidence that a real model can run.
@@ -185,9 +200,221 @@ fn test_production_checkpoint_validation_accepts_complete_dense_q4_fixture() {
 }
 
 #[test]
+fn test_production_checkpoint_rejects_missing_model_tensor_with_explicit_name() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let descriptor = miniature_dense_gqa_descriptor();
+    use kriya_core::quantizer::SavedTensorPayload;
+    let bf16_ones = || SavedTensorPayload::Bf16(vec![0x3F80_u16; 64]);
+    let q4_matrix = || q4_payload(64 * 64);
+    let tensors = vec![
+        (
+            "model.embed_tokens.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        ("model.norm.weight".into(), vec![64], bf16_ones()),
+        ("lm_head.weight".into(), vec![64, 64], q4_matrix()),
+        (
+            "model.layers.0.input_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        // Deliberately omitted: model.layers.0.mlp.down_proj.weight
+    ];
+    kriya_core::quantizer::write_mixed_safetensors(
+        tmp_dir.path().join("model.safetensors"),
+        &tensors,
+    )
+    .unwrap();
+
+    let err = kriya_backend_metal::encoder::ModelGpuWeights::validate_production_checkpoint(
+        &descriptor,
+        tmp_dir.path(),
+    )
+    .expect_err("should reject missing down_proj");
+
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("model.layers.0.mlp.down_proj"),
+        "Error must name missing tensor: {err_str}"
+    );
+}
+
+#[test]
+fn test_production_checkpoint_rejects_malformed_scale_tensor() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let descriptor = miniature_dense_gqa_descriptor();
+    use kriya_core::quantizer::SavedTensorPayload;
+    let bf16_ones = || SavedTensorPayload::Bf16(vec![0x3F80_u16; 64]);
+    let q4_matrix = || q4_payload(64 * 64);
+    // Write MLX triplet for q_proj where scales has wrong group length (1 instead of 64)
+    let tensors = vec![
+        (
+            "model.embed_tokens.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        ("model.norm.weight".into(), vec![64], bf16_ones()),
+        ("lm_head.weight".into(), vec![64, 64], q4_matrix()),
+        (
+            "model.layers.0.input_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            vec![64, 16],
+            SavedTensorPayload::Bf16(vec![0; 64 * 16]),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.scales".into(),
+            vec![1],
+            SavedTensorPayload::Bf16(vec![0x3F80]),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.biases".into(),
+            vec![64],
+            SavedTensorPayload::Bf16(vec![0; 64]),
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+    ];
+    kriya_core::quantizer::write_mixed_safetensors(
+        tmp_dir.path().join("model.safetensors"),
+        &tensors,
+    )
+    .unwrap();
+
+    let err = kriya_backend_metal::encoder::ModelGpuWeights::validate_production_checkpoint(
+        &descriptor,
+        tmp_dir.path(),
+    )
+    .expect_err("should reject malformed MLX scale count");
+
+    eprintln!("Actual error received: {:?}", err);
+    assert!(
+        err.to_string().contains("q_proj"),
+        "Error must name failing tensor"
+    );
+}
+
+#[test]
+fn test_strict_production_loader_rejects_missing_tensor_without_fallback() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let descriptor = miniature_dense_gqa_descriptor();
+    // Write partial checkpoint: only embed_tokens, missing norm, lm_head, and all layers
+    let partial_tensors = vec![(
+        "model.embed_tokens.weight".into(),
+        vec![64, 64],
+        q4_payload(64 * 64),
+    )];
+    kriya_core::quantizer::write_mixed_safetensors(
+        tmp_dir.path().join("model.safetensors"),
+        &partial_tensors,
+    )
+    .unwrap();
+
+    // 1. Test mode allows fallback on partial checkpoint
+    let permissive_res = kriya_backend_metal::encoder::ModelGpuWeights::from_checkpoint_dir(
+        &device,
+        &descriptor,
+        tmp_dir.path(),
+    );
+    assert!(
+        permissive_res.is_ok(),
+        "Test mode allows synthetic fallback"
+    );
+
+    // 2. Strict production mode strictly rejects missing tensors with zero synthetic allocation
+    let res = kriya_backend_metal::encoder::ModelGpuWeights::from_checkpoint_dir_strict(
+        &device,
+        &descriptor,
+        tmp_dir.path(),
+    );
+    let Err(err) = res else {
+        panic!("strict production loader must fail closed on missing checkpoint");
+    };
+
+    assert!(
+        err.to_string().contains("Production required"),
+        "Error should explain production failure: {err}"
+    );
+}
+
+#[test]
 fn test_production_executor_runs_complete_dense_q4_fixture_on_metal() {
-    let Some(_device) = Device::system_default() else {
-        eprintln!("Skipping Metal execution: no Apple Silicon GPU is visible to this process");
+    let Some(_device) = require_metal_device() else {
         return;
     };
 
@@ -227,8 +454,7 @@ fn test_production_executor_runs_complete_dense_q4_fixture_on_metal() {
 
 #[test]
 fn test_q4_decode_gemv_matches_cpu_reference_on_metal() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping Metal execution: no Apple Silicon GPU is visible to this process");
+    let Some(device) = require_metal_device() else {
         return;
     };
 
@@ -305,8 +531,7 @@ fn test_q4_decode_gemv_matches_cpu_reference_on_metal() {
 
 #[test]
 fn test_paged_attention_matches_cpu_reference_on_metal() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping Metal execution: no Apple Silicon GPU is visible to this process");
+    let Some(device) = require_metal_device() else {
         return;
     };
 
@@ -535,7 +760,7 @@ fn test_xcrun_metal_compiler_verification() {
 
 #[test]
 fn test_kv_layer_stride_and_kriya_convert_q4_binding() {
-    let Some(device) = Device::system_default() else {
+    let Some(device) = require_metal_device() else {
         return;
     };
 
