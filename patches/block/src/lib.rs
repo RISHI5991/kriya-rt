@@ -3,6 +3,7 @@ A patched version of block v0.1.6 with fixes for Rust edition 2024 compatibility
 The original crate has a future incompatibility with static of uninhabited type
 (rust-lang/rust#74840).
 */
+#![allow(warnings)]
 #![allow(clippy::all)]
 #![allow(rustdoc::all)]
 

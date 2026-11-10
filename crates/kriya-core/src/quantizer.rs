@@ -288,7 +288,7 @@ impl HuggingFaceModelConfig {
                 seq_mixer,
                 post_attn_norm: if is_gemma { Some(rms) } else { None },
                 ffn_norm: rms,
-                channel_mixer: channel_mixer.clone(),
+                channel_mixer,
                 post_ffn_norm: if is_gemma { Some(rms) } else { None },
             });
         }

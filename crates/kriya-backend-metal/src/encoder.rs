@@ -345,7 +345,8 @@ impl ModelGpuWeights {
 
         // Check bare prefix (some archives omit the .weight suffix)
         if let Ok(view) = loader.get_tensor(prefix) {
-            if view.descriptor.dtype == DType::Q4Group64 && view.descriptor.shape == expected_shape {
+            if view.descriptor.dtype == DType::Q4Group64 && view.descriptor.shape == expected_shape
+            {
                 return Ok(());
             }
             let s_name = format!("{prefix}.scales");
@@ -412,23 +413,18 @@ impl ModelGpuWeights {
         )?;
         Self::require_norm_tensor(&loader, "model.norm.weight", h)?;
         if !desc.tie_word_embeddings {
-            Self::require_q4_weight(
-                &loader,
-                "lm_head",
-                &[desc.vocab_size as usize, h],
-            )?;
+            Self::require_q4_weight(&loader, "lm_head", &[desc.vocab_size as usize, h])?;
         }
         for layer in &desc.layers {
             let p = format!("model.layers.{}", layer.layer_idx);
-            Self::require_norm_tensor(
-                &loader,
-                &format!("{p}.input_layernorm.weight"),
-                h,
-            )?;
+            Self::require_norm_tensor(&loader, &format!("{p}.input_layernorm.weight"), h)?;
 
             // Support both standard FFN norm and Gemma 2 pre/post norm layouts
             if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
-                if loader.get_tensor(&format!("{p}.pre_feedforward_layernorm.weight")).is_ok() {
+                if loader
+                    .get_tensor(&format!("{p}.pre_feedforward_layernorm.weight"))
+                    .is_ok()
+                {
                     Self::require_norm_tensor(
                         &loader,
                         &format!("{p}.pre_feedforward_layernorm.weight"),
@@ -468,11 +464,7 @@ impl ModelGpuWeights {
                 ("v_proj", vec![kv_dim, h]),
                 ("o_proj", vec![h, q_dim]),
             ] {
-                Self::require_q4_weight(
-                    &loader,
-                    &format!("{p}.self_attn.{suffix}"),
-                    &shape,
-                )?;
+                Self::require_q4_weight(&loader, &format!("{p}.self_attn.{suffix}"), &shape)?;
             }
             if qkv_bias {
                 for (suffix, shape) in [("q_proj", q_dim), ("k_proj", kv_dim), ("v_proj", kv_dim)] {
@@ -508,11 +500,7 @@ impl ModelGpuWeights {
                 ("up_proj", vec![inter, h]),
                 ("down_proj", vec![h, inter]),
             ] {
-                Self::require_q4_weight(
-                    &loader,
-                    &format!("{p}.mlp.{suffix}"),
-                    &shape,
-                )?;
+                Self::require_q4_weight(&loader, &format!("{p}.mlp.{suffix}"), &shape)?;
             }
         }
         Ok(())

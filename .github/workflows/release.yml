@@ -21,31 +21,15 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Extract Tag Name
+      - name: Extract Version from Tag
         id: vars
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Build Release Binaries
         run: |
-          cargo build --release --target aarch64-apple-darwin -p kriya-server
-          cargo build --release --target aarch64-apple-darwin --bin kriya_convert -p kriya-server
+          RAW_TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${RAW_TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Package Artifacts
-        run: |
-          TAG="${{ steps.vars.outputs.tag }}"
-          PKG_NAME="kriya-rt-${TAG}-aarch64-apple-darwin"
-          mkdir -p "dist/${PKG_NAME}/bin"
-
-          cp target/aarch64-apple-darwin/release/kriya-server "dist/${PKG_NAME}/bin/"
-          cp target/aarch64-apple-darwin/release/kriya_convert "dist/${PKG_NAME}/bin/"
-          cp README.md "dist/${PKG_NAME}/"
-          cp LICENSE "dist/${PKG_NAME}/" 2>/dev/null || touch "dist/${PKG_NAME}/LICENSE"
-
-          cd dist
-          tar -czvf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
-          shasum -a 256 "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
-          echo "SHA256 Checksum:"
-          cat "${PKG_NAME}.tar.gz.sha256"
+      - name: Build Release Package
+        run: bash packaging/build_release_package.sh "${{ steps.vars.outputs.version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -164,7 +164,8 @@ impl EngineRuntime {
             kv_mgr,
         );
 
-        let draft_engine = Self::build_draft_engine(&descriptor, &executor, checkpoint_dir, draft_weights_path);
+        let draft_engine =
+            Self::build_draft_engine(&descriptor, &executor, checkpoint_dir, draft_weights_path);
 
         Ok(Self {
             descriptor,
@@ -1404,7 +1405,9 @@ async fn main() {
     if runtime.draft_engine.is_some() {
         println!("KriyaRT: Speculative decoding ACTIVE with EAGLE draft head.");
     } else {
-        println!("KriyaRT: Speculative decoding INACTIVE (standard single-token autoregressive decode). Pass --draft-weights to enable EAGLE.");
+        println!(
+            "KriyaRT: Speculative decoding INACTIVE (standard single-token autoregressive decode). Pass --draft-weights to enable EAGLE."
+        );
     }
 
     let has_prompt = args.iter().any(|arg| arg == "--prompt");
