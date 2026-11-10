@@ -17,7 +17,7 @@ tokio = { version = "1.40", features = ["sync", "rt"] }
 # metal-rs crate provides safe Rust bindings to Apple's Metal API.
 # This crate only compiles on macOS/iOS targets.
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
+metal = "0.33"
 objc = "0.2"
 
 [dev-dependencies]
