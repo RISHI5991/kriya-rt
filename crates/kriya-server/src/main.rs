@@ -296,6 +296,7 @@ impl EngineRuntime {
         let mut decode_positions: Vec<u32> = Vec::new();
         let mut decode_samplings: Vec<SamplingConfig> = Vec::new();
         let mut decode_req_to_output_idx: HashMap<u64, usize> = HashMap::new();
+        let mut req_to_root_feature: HashMap<u64, Vec<f32>> = HashMap::new();
 
         // Prefill results: (req_id, target_token, should_emit_to_client)
         let mut prefill_results: Vec<(u64, u32, bool)> = Vec::new();
@@ -423,10 +424,15 @@ impl EngineRuntime {
                         .await
                     {
                         Ok(decoded_tokens) => {
+                            let h = self.descriptor.hidden_size as usize;
                             for (i, token) in decoded_tokens.iter().enumerate() {
                                 let req_id = decode_req_ids[i];
                                 let out_idx = decode_req_to_output_idx[&req_id];
                                 primary_outputs[out_idx] = (req_id, *token);
+                                if self.draft_engine.is_some() {
+                                    req_to_root_feature
+                                        .insert(req_id, self.executor.read_hidden_feature_at(h, i));
+                                }
                             }
                         }
                         Err(err) => {
@@ -499,11 +505,11 @@ impl EngineRuntime {
                     continue;
                 }
 
-                // Root feature = final hidden state from the last forward pass
-                // TODO: Track per-request row index for multi-request batched decode.
-                // For now, read from offset 0 (correct for single-request EAGLE).
-                let h = self.descriptor.hidden_size as usize;
-                let root_feature = self.executor.read_last_hidden_feature(h, 1);
+                // Root feature = exact final hidden state for this request's batch row.
+                // Extracted immediately after batched decode before tree verification overwrites GPU buffers.
+                let Some(root_feature) = req_to_root_feature.get(&req_id) else {
+                    continue;
+                };
 
                 // Draft tree topology adapts to batch size
                 let topology = if batch_size <= 2 {
@@ -529,7 +535,7 @@ impl EngineRuntime {
                         &plan,
                         self.draft_engine.as_mut().unwrap(),
                         primary_tok,
-                        &root_feature,
+                        root_feature,
                         &topology,
                         &mut self.draft_rng,
                     )
@@ -1316,6 +1322,29 @@ fn current_timestamp_us() -> u64 {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("kriya-server {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("KriyaRT Server {}", env!("CARGO_PKG_VERSION"));
+        println!("High-throughput native Apple Silicon LLM inference engine\n");
+        println!("Usage: kriya-server --model <local_checkpoint_dir_or_hf_repo> [options]\n");
+        println!("Options:");
+        println!("  --model <path_or_repo>   Local model directory or Hugging Face Hub repository");
+        println!("  --host <addr>            Host to bind HTTP/OpenAI server (default: 127.0.0.1)");
+        println!("  --port <port>            Port to bind HTTP/OpenAI server (default: 8080)");
+        println!("  --prompt <text>          Run prompt directly via CLI and exit");
+        println!("  --draft-weights <path>   Enable EAGLE speculative decoding with draft head");
+        println!("  --max-tokens <n>         Maximum tokens to generate (default: 256)");
+        println!("  --temperature <val>      Sampling temperature (default: 0.7)");
+        println!("  --top-p <val>            Nucleus sampling top-p (default: 0.95)");
+        println!("  --version, -V            Print version and exit");
+        println!("  --help, -h               Print this help message and exit");
+        return;
+    }
 
     // 1. Resolve `--model <local_path_or_hf_repo_id>` (downloads all shards via `hub_fetcher` if not local)
     let mut checkpoint_dir = args

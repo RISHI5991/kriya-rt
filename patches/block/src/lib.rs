@@ -3,7 +3,13 @@ A patched version of block v0.1.6 with fixes for Rust edition 2024 compatibility
 The original crate has a future incompatibility with static of uninhabited type
 (rust-lang/rust#74840).
 */
-#![allow(warnings)]
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(dead_code)]
+#![allow(deprecated)]
+#![allow(improper_ctypes)]
+#![allow(missing_abi)]
 #![allow(clippy::all)]
 #![allow(rustdoc::all)]
 

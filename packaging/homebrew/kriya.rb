@@ -1,13 +1,13 @@
 class Kriya < Formula
   desc "Ultra-high-throughput native Metal inference engine for frontier LLMs on Apple Silicon"
-  homepage "https://github.com/rishisharma/kriya-rt"
+  homepage "https://github.com/RISHI5991/kriya-rt"
   version "0.1.0"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/rishisharma/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "e03ae3b490b98131651364c2eae2645878b72f1252a3dc272701820a5781023d"
+      url "https://github.com/RISHI5991/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz"
+      sha256 "2f21cd08ad5085022657a67e50a718da30e957df806581be0912d5f096d3d654"
     end
   end
 
@@ -31,13 +31,6 @@ class Kriya < Formula
         # Serve OpenAI-compatible API locally on port 8080:
         kriya-server --model <model_directory> --port 8080
     EOS
-  end
-
-  service do
-    run [opt_bin/"kriya-server", "--host", "127.0.0.1", "--port", "8080"]
-    keep_alive true
-    log_path var/"log/kriya-server.log"
-    error_log_path var/"log/kriya-server.err.log"
   end
 
   test do

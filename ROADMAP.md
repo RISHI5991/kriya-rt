@@ -15,7 +15,7 @@ This document outlines the architectural milestones and engineering priorities f
 - [x] **Block-Sparse Row (BSR) Paged KV-Cache:** 16-token pages with radix prefix sharing and copy-on-write page recycling.
 - [x] **Vectorized BQ8 Prefill Attention:** 8 query tokens per SIMD threadgroup supporting $D=64, 128, 256$ head dimensions with online softmax in threadgroup SRAM.
 - [x] **OpenAI-Compatible HTTP Server:** Streaming Server-Sent Events (SSE) `/v1/chat/completions` API via Axum.
-- [x] **Turnkey Release Engineering:** Standalone codesigned release tarballs and Homebrew formula (`brew install rishisharma/tap/kriya`).
+- [x] **Turnkey Release Engineering:** Standalone release tarballs with SHA-256 verification and Homebrew formula (`brew install RISHI5991/tap/kriya`).
 
 ---
 
@@ -67,6 +67,6 @@ This document outlines the architectural milestones and engineering priorities f
 ## How to Get Involved
 
 Want to tackle one of these roadmap items?
-1. Check the [Issues](https://github.com/rishisharma/kriya-rt/issues) tab for items tagged `good first issue` or `help wanted`.
-2. Open an RFC in [Discussions](https://github.com/rishisharma/kriya-rt/discussions) to propose your implementation approach.
+1. Check the [Issues](https://github.com/RISHI5991/kriya-rt/issues) tab for items tagged `good first issue` or `help wanted`.
+2. Open an RFC in [Discussions](https://github.com/RISHI5991/kriya-rt/discussions) to propose your implementation approach.
 3. Read our [Contributing Guide](CONTRIBUTING.md) to set up your environment!

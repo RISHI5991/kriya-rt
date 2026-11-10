@@ -77,23 +77,17 @@ struct ModelManifest {
 fn decode_raw_floats(data: &[u8], dtype: DType) -> Option<Vec<f32>> {
     match dtype {
         DType::F32 => Some(
-            data.as_chunks::<4>()
-                .0
-                .iter()
+            data.chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
         DType::BF16 => Some(
-            data.as_chunks::<2>()
-                .0
-                .iter()
+            data.chunks_exact(2)
                 .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
         ),
         DType::F16 => Some(
-            data.as_chunks::<2>()
-                .0
-                .iter()
+            data.chunks_exact(2)
                 .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
         ),
@@ -441,7 +435,7 @@ fn main() {
             } else {
                 let f32_vals_for_quality = f32_vals.clone();
                 let mut padded = f32_vals;
-                if !padded.len().is_multiple_of(64) {
+                if padded.len() % 64 != 0 {
                     padded.resize(padded.len().div_ceil(64) * 64, 0.0);
                 }
                 let blocks = quantize_f32_to_q4_group64(&padded).unwrap();

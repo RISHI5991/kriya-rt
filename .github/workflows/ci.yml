@@ -38,7 +38,7 @@ jobs:
           components: clippy
 
       - name: Run clippy on workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings -A deprecated
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test-workspace:
     name: Workspace Tests (Apple Silicon)
@@ -52,9 +52,6 @@ jobs:
 
       - name: Run all workspace unit and integration tests
         run: cargo test --workspace
-
-      - name: Run Metal GPU shader validation
-        run: cargo test -p kriya-backend-metal --test real_world_validation -- --nocapture
 
   package-check:
     name: Release Packaging Verification

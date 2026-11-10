@@ -2,12 +2,12 @@
 
 <div align="center">
 
-[![CI](https://github.com/rishisharma/kriya-rt/actions/workflows/ci.yml/badge.svg)](https://github.com/rishisharma/kriya-rt/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/Release-v0.1.0-emerald.svg)](https://github.com/rishisharma/kriya-rt/releases)
+[![CI](https://github.com/RISHI5991/kriya-rt/actions/workflows/ci.yml/badge.svg)](https://github.com/RISHI5991/kriya-rt/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/badge/Release-v0.1.0-emerald.svg)](https://github.com/RISHI5991/kriya-rt/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon%20(M1--M4)-black.svg)](#hardware-requirements)
-[![Rust](https://img.shields.io/badge/Rust-1.81%2B%20(Edition%202024)-orange.svg)](https://www.rust-lang.org/)
-[![Homebrew](https://img.shields.io/badge/Homebrew-rishisharma%2Ftap%2Fkriya-yellow.svg)](packaging/homebrew/kriya.rb)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B%20(Edition%202024)-orange.svg)](https://www.rust-lang.org/)
+[![Homebrew](https://img.shields.io/badge/Homebrew-RISHI5991%2Ftap%2Fkriya-yellow.svg)](packaging/homebrew/kriya.rb)
 
 **The fastest, lightest, zero-dependency Large Language Model (LLM) inference runtime for Apple Silicon.**  
 *100% pure Rust + handcrafted Metal Shading Language (MSL 3.1). Zero Python overhead. Boots in 30ms. Single ~20MB binary.*
@@ -140,7 +140,7 @@ KriyaRT automatically detects `.weight` + `.scales` + `.biases` triplets, maps t
 
 ```bash
 # Add tap and install precompiled release binary
-brew install rishisharma/tap/kriya
+brew install RISHI5991/tap/kriya
 
 # Check installation
 kriya-server --version
@@ -148,11 +148,11 @@ kriya-server --version
 
 ### Option B: Download Standalone Release Tarball
 
-Precompiled, codesigned Apple Silicon binaries (`aarch64-apple-darwin`) are available on the [Releases](https://github.com/rishisharma/kriya-rt/releases) page:
+Precompiled Apple Silicon release binaries (`aarch64-apple-darwin` with SHA-256 verification) are available on the [Releases](https://github.com/RISHI5991/kriya-rt/releases) page:
 
 ```bash
 # Download and unpack
-curl -L -O https://github.com/rishisharma/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz
+curl -L -O https://github.com/RISHI5991/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz
 tar -xvf kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz
 cd kriya-rt-v0.1.0-aarch64-apple-darwin/bin
 
@@ -161,10 +161,10 @@ cd kriya-rt-v0.1.0-aarch64-apple-darwin/bin
 
 ### Option C: Build from Source
 
-**Prerequisites:** macOS on Apple Silicon, Xcode Command Line Tools (`xcode-select --install`), and Rust 1.81+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
+**Prerequisites:** macOS on Apple Silicon, Xcode Command Line Tools (`xcode-select --install`), and Rust 1.85+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
 
 ```bash
-git clone https://github.com/rishisharma/kriya-rt.git
+git clone https://github.com/RISHI5991/kriya-rt.git
 cd kriya-rt
 
 # Build optimized release binary
@@ -262,14 +262,17 @@ main();
 
 ## 🎯 Supported Architectures & Scope
 
-| Model Family | Parameter Sizes | Status | Features Tested |
+| Model Family | Parameter Sizes | Implementation Status | Features Verified |
 | :--- | :---: | :---: | :--- |
-| **Qwen 2.5** | 0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B | :white_check_mark: Production | GQA 8:1, SwiGLU, RoPE |
-| **Llama 3 / 3.1 / 3.2** | 1B, 3B, 8B, 70B | :white_check_mark: Production | Standard GQA, RoPE |
-| **Gemma 2** | 2B, 9B, 27B | :white_check_mark: Production | 4 RMSNorms/layer, $\sqrt{d}$ scale, dual logit softcapping |
-| **Mistral / SmolLM2** | 135M, 7B | :white_check_mark: Production | Sliding window, GQA |
-| **Spark X / OptiQ** | 4B | 🚧 In Progress | Fused `q_k_v_proj` & OptiQ mixed 4/8-bit (See [Roadmap](ROADMAP.md)) |
-| **DeepSeek V2 / V3** | 16B, 236B, 671B | 📋 Planned | Multi-Head Latent Attention (MLA) (See [Roadmap](ROADMAP.md)) |
+| **Qwen 2.5** | 0.5B, 1.5B, 3B | :white_check_mark: **Validated on Apple Silicon** | GQA 8:1, SwiGLU, RoPE, Hugging Face Hub direct fetch |
+| **Qwen 2.5** | 7B, 14B, 32B, 72B | ⚙️ **Architecture Ready** | Identical GQA layout; requires 16GB–64GB Unified Memory |
+| **Llama 3 / 3.1 / 3.2** | 1B, 3B | :white_check_mark: **Validated on Apple Silicon** | Standard GQA, RoPE |
+| **Llama 3 / 3.1** | 8B, 70B | ⚙️ **Architecture Ready** | Standard GQA layout; verified on miniature/synthetic tensors |
+| **Gemma 2** | 2B | :white_check_mark: **Validated on Apple Silicon** | 4 RMSNorms/layer, $\sqrt{d}$ scale, dual logit softcapping |
+| **Gemma 2** | 9B, 27B | ⚙️ **Architecture Ready** | Pre/post feedforward layernorms, logit softcapping |
+| **SmolLM2 / Mistral** | 135M, 7B | :white_check_mark: **Validated on Apple Silicon** | Sliding window, GQA |
+| **Spark X / OptiQ** | 4B | 🚧 **In Progress** | Fused `q_k_v_proj` & OptiQ mixed 4/8-bit (See [Roadmap](ROADMAP.md)) |
+| **DeepSeek V2 / V3** | 16B, 236B, 671B | 📋 **Planned** | Multi-Head Latent Attention (MLA) (See [Roadmap](ROADMAP.md)) |
 
 ---
 
@@ -298,7 +301,7 @@ We welcome contributors from around the globe!
 
 * Read our [Contributing Guide](CONTRIBUTING.md) to set up your local development environment.
 * Explore our [Roadmap](ROADMAP.md) to pick up milestone targets (MPSGraph prefill, AMX integration, new model kernels).
-* Join [Discussions](https://github.com/rishisharma/kriya-rt/discussions) to propose RFCs, ask questions, or share benchmarks on your Mac hardware.
+* Join [Discussions](https://github.com/RISHI5991/kriya-rt/discussions) to propose RFCs, ask questions, or share benchmarks on your Mac hardware.
 * Adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---

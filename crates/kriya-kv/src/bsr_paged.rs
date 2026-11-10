@@ -562,7 +562,7 @@ impl PagedKvCacheManager {
                     .iter()
                     .map(|&id| id as i32)
                     .collect(),
-                last_page_len: vec![if prefix_tokens.is_multiple_of(blk_sz) {
+                last_page_len: vec![if prefix_tokens % blk_sz == 0 {
                     blk_sz as i32
                 } else {
                     (prefix_tokens % blk_sz) as i32

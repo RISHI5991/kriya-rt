@@ -191,7 +191,7 @@ impl<'a> TensorView<'a> {
     /// Checks if the underlying memory pointer is 16KB page-aligned for zero-copy Metal binding.
     #[inline]
     pub fn is_page_aligned(&self) -> bool {
-        (self.data.as_ptr() as usize).is_multiple_of(METAL_PAGE_ALIGNMENT)
+        (self.data.as_ptr() as usize) % METAL_PAGE_ALIGNMENT == 0
     }
 
     /// Zero-copy cast into a slice of `BlockQ4Group64` blocks for `Q4Group64` tensors.

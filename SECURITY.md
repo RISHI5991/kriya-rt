@@ -18,7 +18,7 @@ The KriyaRT engineering team takes the security of our runtime and users serious
 If you believe you have discovered a security vulnerability in KriyaRT (including memory safety violations, out-of-bounds GPU buffer accesses, denial-of-service in the HTTP server, or malicious checkpoint ingestion exploits):
 
 1. **Do NOT open a public GitHub issue.**
-2. Send a detailed report via email to **[security@kriya-rt.dev](mailto:security@kriya-rt.dev)** or submit a private security advisory through GitHub's [Advisories](https://github.com/rishisharma/kriya-rt/security/advisories) interface.
+2. Send a detailed report via email to **[security@kriya-rt.dev](mailto:security@kriya-rt.dev)** or submit a private security advisory through GitHub's [Advisories](https://github.com/RISHI5991/kriya-rt/security/advisories) interface.
 3. Include the following details where possible:
    - Steps to reproduce the issue.
    - Operating system and macOS version (`sw_vers`).

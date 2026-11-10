@@ -829,6 +829,123 @@ fn test_prefill_batch_matches_token_by_token() {
     );
 }
 
+/// ========================================================================
+/// TEST 8: Batched Decode Multi-Request Distinct Root Features
+/// ========================================================================
+/// Verifies that forward_and_sample_batch produces distinct, non-zero, finite
+/// hidden state vectors for separate requests in the batch via read_hidden_feature_at,
+/// ensuring EAGLE speculative decoding operates on isolated per-request hidden features.
+#[test]
+fn test_batched_speculative_per_request_hidden_features() {
+    let Some(_device) = Device::system_default() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
+
+    use kriya_core::descriptor::{
+        ActivationVariant, AttentionMaskVariant, ChannelMixerDescriptor, LayerDescriptor,
+        NormVariant, PhaseRoutingPolicy, PositionalEncoding, SequenceMixerDescriptor,
+    };
+    let desc = ModelArchDescriptor {
+        family: "test".into(),
+        model_name: "mini-batch-feature".into(),
+        vocab_size: 64,
+        hidden_size: 64,
+        max_position_embeddings: 128,
+        weight_dtype: kriya_core::tensor::DType::Q4Group64,
+        tie_word_embeddings: false,
+        final_norm: NormVariant::RmsNorm {
+            eps: 1e-5,
+            zero_centered_unit_offset: false,
+        },
+        final_logit_softcap: None,
+        phase_policy: PhaseRoutingPolicy::default(),
+        layers: vec![LayerDescriptor {
+            layer_idx: 0,
+            attn_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
+            seq_mixer: SequenceMixerDescriptor::GroupedQueryAttention {
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 64,
+                pos_encoding: PositionalEncoding::RoPE {
+                    theta: 10_000.0,
+                    rotary_dim: 64,
+                    interleaved: false,
+                    scaling_factor: 1.0,
+                },
+                mask_variant: AttentionMaskVariant::Causal,
+                qk_norm: None,
+                qkv_bias: false,
+                attn_logit_softcap: None,
+                split_k_decode_threshold: 128,
+            },
+            post_attn_norm: None,
+            ffn_norm: NormVariant::RmsNorm {
+                eps: 1e-5,
+                zero_centered_unit_offset: false,
+            },
+            channel_mixer: ChannelMixerDescriptor::DenseMlp {
+                intermediate_size: 64,
+                activation: ActivationVariant::SwiGLU,
+                use_bias: false,
+            },
+            post_ffn_norm: None,
+        }],
+    };
+
+    let shader_dir = workspace_kernels_dir();
+    let tmp_dir = tempfile::tempdir().unwrap();
+    write_miniature_checkpoint_with_distinct_embeddings(tmp_dir.path());
+
+    let mut executor =
+        MetalExecutor::new(&desc, &shader_dir, Some(tmp_dir.path()), 16, 16).unwrap();
+
+    let mut kv_mgr = PagedKvCacheManager::new(64, 32, 16);
+    let req_1 = 101u64;
+    let req_2 = 102u64;
+    kv_mgr.allocate_sequence(req_1, &[5]).unwrap();
+    kv_mgr.allocate_sequence(req_2, &[23]).unwrap();
+
+    let plan = kv_mgr.build_schedule_plan(&[req_1, req_2], 16).unwrap();
+    let samp_cfg = SamplingConfig {
+        vocab_size: 64,
+        greedy: 1,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 64,
+        rng_seed: 42,
+    };
+
+    let tokens = [5u32, 23u32];
+    let positions = [0u32, 0u32];
+    let samplings = [samp_cfg, samp_cfg];
+
+    let sampled =
+        block_on(executor.forward_and_sample_batch(&desc, &tokens, &positions, &plan, &samplings))
+            .unwrap();
+
+    assert_eq!(sampled.len(), 2);
+
+    let feat_0 = executor.read_hidden_feature_at(64, 0);
+    let feat_1 = executor.read_hidden_feature_at(64, 1);
+
+    assert_eq!(feat_0.len(), 64);
+    assert_eq!(feat_1.len(), 64);
+
+    assert!(feat_0.iter().all(|x| x.is_finite()));
+    assert!(feat_1.iter().all(|x| x.is_finite()));
+
+    assert_ne!(
+        feat_0, feat_1,
+        "Distinct batched requests must produce non-identical root hidden features"
+    );
+
+    println!("Batched speculative root feature isolation verified successfully");
+}
+
 // ========================================================================
 // Helper Functions (duplicated from test_shader_compile.rs since test binaries are separate)
 // ========================================================================
@@ -838,6 +955,81 @@ fn q4_payload(elements: usize) -> kriya_core::quantizer::SavedTensorPayload {
     kriya_core::quantizer::SavedTensorPayload::Q4Group64(
         kriya_core::quantizer::quantize_f32_to_q4_group64(&weights).unwrap(),
     )
+}
+
+fn write_miniature_checkpoint_with_distinct_embeddings(dir: &std::path::Path) {
+    use kriya_core::quantizer::SavedTensorPayload;
+
+    let bf16_ones = || SavedTensorPayload::Bf16(vec![0x3F80_u16; 64]);
+    let q4_matrix = || q4_payload(64 * 64);
+
+    let embed_weights: Vec<f32> = (0..64 * 64)
+        .map(|i| {
+            let row = i / 64;
+            let col = i % 64;
+            (row as f32 + 1.0) * 0.01 + (col as f32) * 0.001
+        })
+        .collect();
+    let embed_payload = SavedTensorPayload::Q4Group64(
+        kriya_core::quantizer::quantize_f32_to_q4_group64(&embed_weights).unwrap(),
+    );
+
+    let tensors = vec![
+        (
+            "model.embed_tokens.weight".into(),
+            vec![64, 64],
+            embed_payload,
+        ),
+        ("model.norm.weight".into(), vec![64], bf16_ones()),
+        ("lm_head.weight".into(), vec![64, 64], q4_matrix()),
+        (
+            "model.layers.0.input_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+    ];
+    kriya_core::quantizer::write_mixed_safetensors(dir.join("model.safetensors"), &tensors)
+        .unwrap();
 }
 
 fn write_complete_miniature_checkpoint(dir: &std::path::Path) {

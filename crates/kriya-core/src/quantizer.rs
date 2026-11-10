@@ -56,7 +56,7 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
 /// Quantizes a slice of `f32` weights (length must be a multiple of 64) into
 /// 4-bit affine Group-64 blocks (`w_approx = q * scale + bias`, where `q in 0..=15`).
 pub fn quantize_f32_to_q4_group64(weights: &[f32]) -> Result<Vec<BlockQ4Group64>, TensorError> {
-    if !weights.len().is_multiple_of(64) {
+    if weights.len() % 64 != 0 {
         return Err(TensorError::ShapeMismatch {
             expected: weights.len().div_ceil(64) * 64,
             actual: weights.len(),
@@ -66,9 +66,7 @@ pub fn quantize_f32_to_q4_group64(weights: &[f32]) -> Result<Vec<BlockQ4Group64>
     let num_blocks = weights.len() / 64;
     let mut out_blocks = Vec::with_capacity(num_blocks);
 
-    let (chunks, remainder) = weights.as_chunks::<64>();
-    debug_assert!(remainder.is_empty());
-    for chunk in chunks {
+    for chunk in weights.chunks_exact(64) {
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;
         for &v in chunk {

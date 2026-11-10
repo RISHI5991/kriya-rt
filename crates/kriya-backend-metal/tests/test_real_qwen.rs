@@ -7,6 +7,7 @@ use metal::Device;
 use std::path::PathBuf;
 
 #[test]
+#[ignore = "Requires physical weights in models/qwen2.5-0.5b-instruct-kriya-q4"]
 fn test_real_qwen_inference() {
     let Some(_device) = Device::system_default() else {
         return;
@@ -21,8 +22,11 @@ fn test_real_qwen_inference() {
         .join("qwen2.5-0.5b-instruct-kriya-q4");
 
     if !model_dir.exists() {
-        println!("Model dir does not exist, skipping");
-        return;
+        panic!(
+            "Model checkpoint directory {:?} does not exist. \
+             Download or convert the model before running ignored real-model tests.",
+            model_dir
+        );
     }
 
     let config_path = model_dir.join("config.json");

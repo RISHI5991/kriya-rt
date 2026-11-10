@@ -21,6 +21,7 @@ Cargo.lock.orig
 /tmp/
 temp/
 dist/
+*.docx
 
 # Large Model Checkpoints & Virtual Environments
 models/

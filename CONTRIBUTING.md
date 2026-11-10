@@ -41,7 +41,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
   ```bash
   xcode-select --install
   ```
-* **Rust Toolchain:** Rust 1.81+ (stable):
+* **Rust Toolchain:** Rust 1.85+ (stable, required for Edition 2024):
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
@@ -51,7 +51,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 Clone the repository and build the workspace:
 
 ```bash
-git clone https://github.com/rishisharma/kriya-rt.git
+git clone https://github.com/RISHI5991/kriya-rt.git
 cd kriya-rt
 
 # Build all workspace crates in debug mode
@@ -65,14 +65,14 @@ The resulting server binary will be located at `target/aarch64-apple-darwin/rele
 
 ### Running the Test Suite
 
-We maintain a strict 100% test pass rate across the workspace:
+We maintain a deterministic 100% test pass rate across the workspace (43 self-contained unit and GPU kernel tests run in CI; model-checkpoint tests are gated with `#[ignore]` when weights are not downloaded):
 
 ```bash
-# Run all workspace unit and integration tests
+# Run all workspace unit and self-contained integration tests
 cargo test --workspace
 
-# Run real-world GPU validation tests against CPU reference implementations
-cargo test -p kriya-backend-metal --test real_world_validation -- --nocapture
+# Run physical-model integration tests (requires local model checkpoint)
+cargo test --workspace -- --ignored
 ```
 
 ---
