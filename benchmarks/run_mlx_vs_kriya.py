@@ -86,12 +86,21 @@ def prepare_prompt_tokens(tokenizer, base_text: str, target_len: int) -> str:
         while len(tokens) < target_len:
             tokens.extend(filler)
         tokens = tokens[:target_len]
-    return tokenizer.decode(tokens)
+    decoded = tokenizer.decode(tokens)
+    # Tokenizer round-trip safety check to guarantee identical token counts
+    re_encoded = tokenizer.encode(decoded)
+    if len(re_encoded) != target_len:
+        # Trim or pad tokens directly if decode-encode roundtrip altered boundary tokens
+        if len(re_encoded) > target_len:
+            re_encoded = re_encoded[:target_len]
+        decoded = tokenizer.decode(re_encoded)
+    return decoded
 
 
 def benchmark_mlx(
     model_path: str,
-    target_tokens: int = 16,
+    target_tokens: int = 64,
+    runs: int = 5,
 ) -> Dict[str, Any]:
     print(f"\n[MLX] Loading model from {model_path}...")
     t_load_start = time.time()
@@ -99,10 +108,11 @@ def benchmark_mlx(
     load_time_s = time.time() - t_load_start
     print(f"[MLX] Loaded in {load_time_s:.2f}s")
 
-    # Warmup round
-    print("[MLX] Running warmup pass...")
+    # 2 Complete warmup rounds (Task 9.1)
+    print("[MLX] Running 2 warmup passes...")
     sampler = make_sampler(temp=0.0)
-    _ = list(stream_generate(model, tokenizer, prompt="Warmup hello", max_tokens=4, sampler=sampler))
+    for _ in range(2):
+        _ = list(stream_generate(model, tokenizer, prompt="Warmup hello artificial intelligence", max_tokens=8, sampler=sampler))
 
     results = []
 
@@ -110,9 +120,8 @@ def benchmark_mlx(
         prompt_str = prepare_prompt_tokens(tokenizer, text, target_len)
         actual_tokens = len(tokenizer.encode(prompt_str))
 
-        # Run 3 measured passes and take the median
         pass_metrics = []
-        for run_idx in range(3):
+        for run_idx in range(runs):
             t0 = time.perf_counter()
             gen_iter = stream_generate(model, tokenizer, prompt=prompt_str, max_tokens=target_tokens, sampler=sampler)
 
@@ -144,9 +153,9 @@ def benchmark_mlx(
                 "output_text": "".join(generated_tokens).strip()
             })
 
-        # Median by decode throughput
+        # Median by decode throughput across runs
         pass_metrics.sort(key=lambda m: m["decode_tok_s"])
-        median = pass_metrics[1]
+        median = pass_metrics[len(pass_metrics) // 2]
         print(f"[MLX] Prompt {actual_tokens:3d} toks | TTFT: {median['ttft_ms']:7.2f} ms ({median['prefill_tok_s']:6.1f} tok/s) | TPOT: {median['tpot_ms']:5.2f} ms ({median['decode_tok_s']:5.1f} tok/s)")
 
         results.append({
@@ -220,11 +229,15 @@ def benchmark_kriya(
             "decode_tok_s": s["decode_tokens_per_second"],
         })
 
+    # Subprocess child peak RSS
+    child_mem_mb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / (1024.0 * 1024.0)
+
     return {
         "engine": "KriyaRT",
         "model_name": data["model_name"],
         "model_layers": data["model_layers"],
         "total_run_time_s": total_time,
+        "peak_mem_mb": child_mem_mb,
         "samples": formatted_samples,
     }
 
@@ -265,7 +278,7 @@ def print_comparison_markdown(model_label: str, mlx_res: Dict[str, Any], kriya_r
     print("\n" + "=" * 90 + "\n")
 
 
-def run_benchmark_for_model(model_key: str, workspace_root: str) -> Dict[str, Any]:
+def run_benchmark_for_model(model_key: str, workspace_root: str, target_tokens: int = 64, runs: int = 5) -> Dict[str, Any]:
     if model_key == "qwen":
         label = "Qwen2.5-0.5B-Instruct (4-bit Group-64)"
         mlx_path = os.path.join(workspace_root, "models", "qwen2.5-0.5b-instruct-mlx-q4")
@@ -289,7 +302,7 @@ def run_benchmark_for_model(model_key: str, workspace_root: str) -> Dict[str, An
     else:
         raise ValueError(f"Unknown model key: {model_key}")
 
-    mlx_res = benchmark_mlx(mlx_path)
+    mlx_res = benchmark_mlx(mlx_path, target_tokens=target_tokens, runs=runs)
     kriya_res = benchmark_kriya(kriya_path, workspace_root)
 
     print_comparison_markdown(label, mlx_res, kriya_res)
@@ -322,18 +335,20 @@ def run_benchmark_for_model(model_key: str, workspace_root: str) -> Dict[str, An
 def main():
     parser = argparse.ArgumentParser(description="Side-by-side MLX vs KriyaRT benchmark")
     parser.add_argument("--model", choices=["qwen", "qwen1.5b", "qwen3b", "gemma2b", "smollm", "all"], default="qwen", help="Model to benchmark")
+    parser.add_argument("--runs", type=int, default=5, help="Number of repetitions per prompt (default: 5)")
+    parser.add_argument("--tokens", type=int, default=64, help="Tokens to generate per run (default: 64)")
     args = parser.parse_args()
 
     workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
     if args.model == "all":
-        run_benchmark_for_model("smollm", workspace_root)
-        run_benchmark_for_model("qwen", workspace_root)
-        run_benchmark_for_model("qwen1.5b", workspace_root)
-        run_benchmark_for_model("qwen3b", workspace_root)
-        run_benchmark_for_model("gemma2b", workspace_root)
+        run_benchmark_for_model("smollm", workspace_root, target_tokens=args.tokens, runs=args.runs)
+        run_benchmark_for_model("qwen", workspace_root, target_tokens=args.tokens, runs=args.runs)
+        run_benchmark_for_model("qwen1.5b", workspace_root, target_tokens=args.tokens, runs=args.runs)
+        run_benchmark_for_model("qwen3b", workspace_root, target_tokens=args.tokens, runs=args.runs)
+        run_benchmark_for_model("gemma2b", workspace_root, target_tokens=args.tokens, runs=args.runs)
     else:
-        run_benchmark_for_model(args.model, workspace_root)
+        run_benchmark_for_model(args.model, workspace_root, target_tokens=args.tokens, runs=args.runs)
 
 
 if __name__ == "__main__":

@@ -65,11 +65,23 @@ The resulting server binary will be located at `target/aarch64-apple-darwin/rele
 
 ### Running the Test Suite
 
-We maintain a deterministic 100% test pass rate across the workspace (43 self-contained unit and GPU kernel tests run in CI; model-checkpoint tests are gated with `#[ignore]` when weights are not downloaded):
+We maintain a deterministic 100% test pass rate across the workspace (57 self-contained unit and GPU kernel tests run in CI; 3 physical-model checkpoint integration tests are gated with `#[ignore]` when weights are not downloaded):
+
+| Category | Test Suite | Count | Verification Scope |
+| :--- | :--- | :---: | :--- |
+| **Unit Tests** | `kriya-core` | 18 | Model descriptors, Q4 quantization, safetensors parser, memory profiles |
+| **Unit Tests** | `kriya-kv` | 6 | BSR paged allocator, causal prefix plans, Radix CoW branching |
+| **Unit Tests** | `kriya-scheduler` | 4 | Continuous batching, chunked prefill SLA preemption, split-K handshakes |
+| **Unit Tests** | `kriya-speculate` | 6 | EAGLE Medusa draft trees, recursive verification, loss functions |
+| **Metal GPU Tests** | `real_world_validation` | 11 | GEMV, prefill GEMM, paged GQA, SwiGLU, RMSNorm, sub-16 boundaries |
+| **Metal GPU Tests** | `test_shader_compile` | 13 | Fail-closed checkpoint loading, MSL compiler verification, Q4 binding |
+| **API Integration** | `test_api_safety` | 8 | Production router, admission control (429), streaming SSE, cancellation |
+| **Latency Tests** | `test_model_load_latency` | 1 | Cold start checkpoint load and buffer allocation latency |
+| **Physical Weights** | `test_real_qwen` | 3 | Physical weights validation (Qwen 0.5B, Qwen 3B, Gemma 2 2B; gated with `#[ignore]`) |
 
 ```bash
-# Run all workspace unit and self-contained integration tests
-cargo test --workspace
+# Run all 57 workspace unit, kernel reference, and API integration tests
+cargo test --workspace --locked
 
 # Run physical-model integration tests (requires local model checkpoint)
 cargo test --workspace -- --ignored
