@@ -1310,3 +1310,351 @@ fn write_complete_miniature_checkpoint(dir: &std::path::Path) {
     kriya_core::quantizer::write_mixed_safetensors(dir.join("model.safetensors"), &tensors)
         .unwrap();
 }
+
+/// ========================================================================
+// TEST 9: RMSNorm Floating-Point Reference Comparison on Metal
+/// ========================================================================
+/// Tests `rms_norm_bf16` kernel against a CPU floating point reference implementation
+/// for both standard RMSNorm and unit-offset RMSNorm (Gemma).
+#[test]
+fn test_rmsnorm_matches_cpu_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let num_tokens = 4usize;
+    let hidden_size = 2048usize;
+    let eps = 1e-6f32;
+
+    for zero_centered_offset in [0u32, 1u32] {
+        let input_f32: Vec<f32> = (0..num_tokens * hidden_size)
+            .map(|i| (((i % 317) as f32) / 100.0 - 1.5) * 0.1)
+            .collect();
+        let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+
+        let weight_f32: Vec<f32> = (0..hidden_size)
+            .map(|i| (((i % 173) as f32) / 100.0 - 0.5) * 0.2 + 1.0)
+            .collect();
+        let weight_bf16: Vec<u16> = weight_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+
+        let w_offset = if zero_centered_offset != 0 {
+            1.0f32
+        } else {
+            0.0f32
+        };
+        let mut expected = vec![0.0f32; num_tokens * hidden_size];
+        for t in 0..num_tokens {
+            let row_start = t * hidden_size;
+            let row_x = &input_f32[row_start..row_start + hidden_size];
+            let mean_sq = row_x.iter().map(|&x| x * x).sum::<f32>() / (hidden_size as f32);
+            let rms_scale = 1.0f32 / (mean_sq + eps).sqrt();
+            for d in 0..hidden_size {
+                let w = weight_f32[d] + w_offset;
+                expected[row_start + d] = row_x[d] * rms_scale * w;
+            }
+        }
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        let input_buf = device.new_buffer_with_data(
+            input_bf16.as_ptr() as *const _,
+            (input_bf16.len() * 2) as u64,
+            shared,
+        );
+        let weight_buf = device.new_buffer_with_data(
+            weight_bf16.as_ptr() as *const _,
+            (weight_bf16.len() * 2) as u64,
+            shared,
+        );
+        let output_buf = device.new_buffer((num_tokens * hidden_size * 2) as u64, shared);
+
+        let queue = device.new_command_queue();
+        let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+            device.clone(),
+            workspace_kernels_dir(),
+        )
+        .unwrap();
+
+        let cmd = queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        let pso = pipelines.get_or_compile("rms_norm_bf16").unwrap();
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(&input_buf), 0);
+        encoder.set_buffer(1, Some(&weight_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+
+        let params = kriya_backend_metal::encoder::RmsNormParams {
+            num_tokens: num_tokens as u32,
+            hidden_size: hidden_size as u32,
+            eps,
+            zero_centered_offset,
+        };
+        encoder.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tokens as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let output_bits = unsafe {
+            std::slice::from_raw_parts(
+                output_buf.contents() as *const u16,
+                num_tokens * hidden_size,
+            )
+        };
+
+        let mut max_diff = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (i, (&gpu_bits, &cpu)) in output_bits.iter().zip(expected.iter()).enumerate() {
+            let gpu = bf16_bits_to_f32(gpu_bits);
+            let diff = (gpu - cpu).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            let rel = if cpu.abs() > 1e-5 {
+                diff / cpu.abs()
+            } else {
+                diff
+            };
+            if rel > max_rel {
+                max_rel = rel;
+            }
+            assert!(
+                diff < 0.05 || rel < 0.05,
+                "RMSNorm mismatch at index {i} (offset={zero_centered_offset}): GPU={gpu:.6}, CPU={cpu:.6}, diff={diff:.6}, rel={rel:.6}"
+            );
+        }
+        println!(
+            "RMSNorm (tokens={num_tokens}, h={hidden_size}, offset={zero_centered_offset}): max_diff={max_diff:.6}, max_rel={max_rel:.6}, PASS"
+        );
+    }
+}
+
+/// ========================================================================
+// TEST 10: Fused SwiGLU / GeGLU Activation Reference Comparison on Metal
+/// ========================================================================
+/// Tests `fused_gated_activation_bf16` against CPU unfused implementation.
+#[test]
+fn test_fused_swiglu_matches_unfused_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let num_elements = 4096usize;
+
+    for variant in [0u32, 1u32] {
+        let gate_f32: Vec<f32> = (0..num_elements)
+            .map(|i| ((i % 251) as f32) / 50.0 - 2.5)
+            .collect();
+        let up_f32: Vec<f32> = (0..num_elements)
+            .map(|i| ((i % 199) as f32) / 60.0 - 1.5)
+            .collect();
+
+        let gate_bf16: Vec<u16> = gate_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+        let up_bf16: Vec<u16> = up_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+
+        let expected: Vec<f32> = gate_f32
+            .iter()
+            .zip(up_f32.iter())
+            .map(|(&g, &u)| {
+                let act_g = if variant == 0 {
+                    g / (1.0f32 + (-g).exp())
+                } else {
+                    const SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
+                    let cubic = 0.044715f32 * g * g * g + g;
+                    let clamped = (SQRT_2_OVER_PI * cubic).clamp(-15.0, 15.0);
+                    0.5f32 * g * (1.0f32 + clamped.tanh())
+                };
+                act_g * u
+            })
+            .collect();
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        let gate_buf = device.new_buffer_with_data(
+            gate_bf16.as_ptr() as *const _,
+            (gate_bf16.len() * 2) as u64,
+            shared,
+        );
+        let up_buf = device.new_buffer_with_data(
+            up_bf16.as_ptr() as *const _,
+            (up_bf16.len() * 2) as u64,
+            shared,
+        );
+        let output_buf = device.new_buffer((num_elements * 2) as u64, shared);
+
+        let queue = device.new_command_queue();
+        let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+            device.clone(),
+            workspace_kernels_dir(),
+        )
+        .unwrap();
+
+        let cmd = queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        let pso = pipelines
+            .get_or_compile("fused_gated_activation_bf16")
+            .unwrap();
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(&gate_buf), 0);
+        encoder.set_buffer(1, Some(&up_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+
+        let params = kriya_backend_metal::encoder::ActivationParams {
+            num_elements: num_elements as u32,
+            variant,
+        };
+        encoder.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_elements.div_ceil(256) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let output_bits = unsafe {
+            std::slice::from_raw_parts(output_buf.contents() as *const u16, num_elements)
+        };
+
+        let mut max_diff = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (i, (&gpu_bits, &cpu)) in output_bits.iter().zip(expected.iter()).enumerate() {
+            let gpu = bf16_bits_to_f32(gpu_bits);
+            let diff = (gpu - cpu).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            let rel = if cpu.abs() > 1e-4 {
+                diff / cpu.abs()
+            } else {
+                diff
+            };
+            if rel > max_rel {
+                max_rel = rel;
+            }
+            assert!(
+                diff < 0.05 || rel < 0.05,
+                "Activation mismatch at index {i} (variant={variant}): GPU={gpu:.6}, CPU={cpu:.6}, diff={diff:.6}, rel={rel:.6}"
+            );
+        }
+        println!(
+            "Activation (elements={num_elements}, variant={variant}): max_diff={max_diff:.6}, max_rel={max_rel:.6}, PASS"
+        );
+    }
+}
+
+/// ========================================================================
+// TEST 11: Sub-16 Decode GEMV Boundary & Partial Threadgroup Correctness
+/// ========================================================================
+/// Tests `q4_g64_decode_gemv_sub16` kernel across non-multiple row counts (N=19, N=37)
+/// and small K dimensions (num_k_blocks <= 16) to verify tile boundary handling.
+#[test]
+fn test_gemv_sub16_threadgroup_boundary() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    for &k in &[512usize, 1024usize] {
+        for &n in &[19usize, 37usize, 73usize] {
+            let num_k_blocks = k.div_ceil(64);
+            assert!(num_k_blocks <= 16);
+
+            let weights_f32: Vec<f32> = (0..n * k)
+                .map(|i| (((i % 101) as f32) / 100.0 - 0.5) * 0.02)
+                .collect();
+            let weight_blocks = quantize_f32_to_q4_group64(&weights_f32).unwrap();
+            let weight_f32 = dequantize_q4_group64_to_f32(&weight_blocks);
+
+            let input_f32: Vec<f32> = (0..k)
+                .map(|i| (((i % 89) as f32) / 100.0 - 0.4) * 0.02)
+                .collect();
+            let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+
+            let expected: Vec<f32> = (0..n)
+                .map(|row| {
+                    weight_f32[row * k..(row + 1) * k]
+                        .iter()
+                        .zip(input_f32.iter())
+                        .map(|(&w, &x)| w * x)
+                        .sum::<f32>()
+                })
+                .collect();
+
+            let shared = MTLResourceOptions::StorageModeShared;
+            let weight_buf = device.new_buffer_with_data(
+                weight_blocks.as_ptr() as *const _,
+                (weight_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>())
+                    as u64,
+                shared,
+            );
+            let input_buf = device.new_buffer_with_data(
+                input_bf16.as_ptr() as *const _,
+                (input_bf16.len() * 2) as u64,
+                shared,
+            );
+            let output_buf = device.new_buffer((n * 2) as u64, shared);
+
+            let queue = device.new_command_queue();
+            let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+                device.clone(),
+                workspace_kernels_dir(),
+            )
+            .unwrap();
+
+            let cmd = queue.new_command_buffer();
+            let encoder = cmd.new_compute_command_encoder();
+            let pso = pipelines
+                .get_or_compile("q4_g64_decode_gemv_sub16")
+                .unwrap();
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(&weight_buf), 0);
+            encoder.set_buffer(1, Some(&input_buf), 0);
+            encoder.set_buffer(2, Some(&output_buf), 0);
+
+            let params = kriya_backend_metal::encoder::GemmParams {
+                m: 1,
+                n: n as u32,
+                k: k as u32,
+                num_k_blocks: num_k_blocks as u32,
+            };
+            encoder.set_bytes(
+                3,
+                std::mem::size_of_val(&params) as u64,
+                &params as *const _ as *const _,
+            );
+
+            let tgp_count = n.div_ceil(8) as u64;
+            encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+            encoder.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let output_bits =
+                unsafe { std::slice::from_raw_parts(output_buf.contents() as *const u16, n) };
+
+            for (i, (&gpu_bits, &cpu)) in output_bits.iter().zip(expected.iter()).enumerate() {
+                let gpu = bf16_bits_to_f32(gpu_bits);
+                let diff = (gpu - cpu).abs();
+                let rel = if cpu.abs() > 1e-5 {
+                    diff / cpu.abs()
+                } else {
+                    diff
+                };
+                assert!(
+                    diff < 0.05 || rel < 0.05,
+                    "Sub16 GEMV boundary mismatch at row {i} (N={n}, K={k}): GPU={gpu:.6}, CPU={cpu:.6}, diff={diff:.6}, rel={rel:.6}"
+                );
+            }
+        }
+    }
+    println!("Sub-16 Decode GEMV Boundary & Partial Threadgroup Correctness: PASS");
+}

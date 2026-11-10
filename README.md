@@ -111,6 +111,15 @@ Direct, side-by-side benchmarks conducted on a physical **Apple Silicon M1 (8 GB
 > [!NOTE]
 > **Understanding the Prefill Delta:** On short prompts ($\le 64$ tokens), KriyaRT responds with sub-400ms TTFT. At 512+ tokens, Apple MLX achieves a higher prefill rate because MLX utilizes Apple's proprietary coprocessor micro-kernels (`acc += a @ b` AMX instructions). Integrating Metal Performance Shaders (`MPSGraph`) matrix prefill is actively targeted in [Phase 2 of our Roadmap](ROADMAP.md).
 
+### 3. Apple Silicon Hardware Compatibility Matrix
+
+| Hardware Generation | Memory Configurations | Validation Status | Verification Evidence |
+| :--- | :---: | :---: | :--- |
+| **Apple M1 / M1 Pro / Max / Ultra** | 8 GB – 128 GB Unified | :white_check_mark: **Primary Validation Target** | Full test suite passing + real weights (Qwen 0.5B/3B, Gemma 2 2B) |
+| **Apple M2 / M2 Pro / Max / Ultra** | 8 GB – 192 GB Unified | ⚙️ **Architecture Compatible** | Pending physical lab report; identical unified ISA |
+| **Apple M3 / M3 Pro / Max** | 8 GB – 128 GB Unified | ⚙️ **Architecture Compatible** | Metal 3 dynamic caching compatible; pending report |
+| **Apple M4 / M4 Pro / Max** | 16 GB – 128 GB Unified | ⚙️ **Architecture Compatible** | ARMv9.2-A / Metal 3.1 compatible; pending report |
+
 ---
 
 ## 🚀 Key Architectural Innovations
