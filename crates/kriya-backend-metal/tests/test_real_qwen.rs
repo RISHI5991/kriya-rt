@@ -56,7 +56,7 @@ fn test_real_qwen_inference() {
         .join("metal");
 
     let tokenizer = KriyaTokenizer::from_checkpoint_dir(&model_dir).unwrap();
-    let mut exec = MetalExecutor::new(&desc, &kernels_dir, Some(&model_dir), 512, 16).unwrap();
+    let mut exec = MetalExecutor::new_production(&desc, &kernels_dir, &model_dir, 512, 16).unwrap();
 
     let prompt = "The capital of France is";
     let input_ids = tokenizer.encode(prompt, false).unwrap();

@@ -7,7 +7,7 @@ class Kriya < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/RISHI5991/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "1c080c25363da0581a08f9820491921bd189708338f573625e58161bef0d891d"
+      sha256 "1a8fccd7fea1feb4166f890434eb392426f52d2adafad71f0a23eb1483d0143f"
     end
   end
 

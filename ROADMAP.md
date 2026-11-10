@@ -15,7 +15,7 @@ This document outlines the architectural milestones and engineering priorities f
 - [x] **Block-Sparse Row (BSR) Paged KV-Cache:** 16-token pages with radix prefix sharing and copy-on-write page recycling.
 - [x] **Vectorized BQ8 Prefill Attention:** 8 query tokens per SIMD threadgroup supporting $D=64, 128, 256$ head dimensions with online softmax in threadgroup SRAM.
 - [x] **OpenAI-Compatible HTTP Server:** Streaming Server-Sent Events (SSE) `/v1/chat/completions` API via Axum.
-- [x] **Turnkey Release Engineering:** Standalone release tarballs with SHA-256 verification and Homebrew formula (`brew install RISHI5991/tap/kriya`).
+- [ ] **Turnkey Release Engineering & Distribution (v0.1.0-rc.1):** Standalone release tarballs with SHA-256 verification and Homebrew formula (tap provisioning in progress).
 
 ---
 

@@ -407,8 +407,124 @@ fn test_strict_production_loader_rejects_missing_tensor_without_fallback() {
     };
 
     assert!(
-        err.to_string().contains("Production required"),
+        err.to_string().contains("model.norm.weight"),
         "Error should explain production failure: {err}"
+    );
+}
+
+#[test]
+fn test_production_checkpoint_rejects_gemma_missing_post_ffn_norm() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let mut descriptor = miniature_dense_gqa_descriptor();
+    descriptor.family = "gemma2".into();
+    let rms = kriya_core::descriptor::NormVariant::RmsNorm {
+        eps: 1e-6,
+        zero_centered_unit_offset: true,
+    };
+    descriptor.layers[0].post_attn_norm = Some(rms);
+    descriptor.layers[0].post_ffn_norm = Some(rms);
+
+    use kriya_core::quantizer::SavedTensorPayload;
+    let bf16_ones = || SavedTensorPayload::Bf16(vec![0x3F80_u16; 64]);
+    let q4_matrix = || q4_payload(64 * 64);
+
+    // Provide pre_feedforward and post_attention layernorms, but omit post_feedforward_layernorm
+    let tensors = vec![
+        (
+            "model.embed_tokens.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        ("model.norm.weight".into(), vec![64], bf16_ones()),
+        ("lm_head.weight".into(), vec![64, 64], q4_matrix()),
+        (
+            "model.layers.0.input_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        (
+            "model.layers.0.pre_feedforward_layernorm.weight".into(),
+            vec![64],
+            bf16_ones(),
+        ),
+        // OMITTED: model.layers.0.post_feedforward_layernorm.weight
+        (
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+    ];
+    kriya_core::quantizer::write_mixed_safetensors(
+        tmp_dir.path().join("model.safetensors"),
+        &tensors,
+    )
+    .unwrap();
+
+    let err = kriya_backend_metal::encoder::ModelGpuWeights::validate_production_checkpoint(
+        &descriptor,
+        tmp_dir.path(),
+    )
+    .expect_err("Gemma 2 checkpoint missing post_feedforward_layernorm must be rejected");
+
+    assert!(
+        err.to_string().contains("post_feedforward_layernorm"),
+        "Error must explicitly name the missing Gemma post-FFN norm: {err}"
+    );
+}
+
+#[test]
+fn test_production_executor_new_production_rejects_malformed_checkpoint_directly() {
+    let Some(_device) = require_metal_device() else {
+        return;
+    };
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let descriptor = miniature_dense_gqa_descriptor();
+    // Empty directory
+    let res = kriya_backend_metal::encoder::MetalExecutor::new_production(
+        &descriptor,
+        workspace_kernels_dir(),
+        tmp_dir.path(),
+        16,
+        16,
+    );
+    assert!(
+        res.is_err(),
+        "new_production must fail closed on missing/malformed checkpoint"
     );
 }
 

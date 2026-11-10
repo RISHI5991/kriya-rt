@@ -474,25 +474,30 @@ impl ModelGpuWeights {
             let p = format!("model.layers.{}", layer.layer_idx);
             Self::require_norm_tensor(&loader, &format!("{p}.input_layernorm.weight"), h)?;
 
-            // Support both standard FFN norm and Gemma 2 pre/post norm layouts
+            // Descriptor-driven normalization validation: descriptor is the single source of truth
             if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
-                if loader
-                    .get_tensor(&format!("{p}.pre_feedforward_layernorm.weight"))
-                    .is_ok()
-                {
-                    Self::require_norm_tensor(
-                        &loader,
-                        &format!("{p}.pre_feedforward_layernorm.weight"),
-                        h,
-                    )?;
-                } else {
+                // Gemma 2 architecture requires pre_feedforward_layernorm, post_attention_layernorm, and post_feedforward_layernorm
+                Self::require_norm_tensor(
+                    &loader,
+                    &format!("{p}.pre_feedforward_layernorm.weight"),
+                    h,
+                )?;
+                if layer.post_attn_norm.is_some() {
                     Self::require_norm_tensor(
                         &loader,
                         &format!("{p}.post_attention_layernorm.weight"),
                         h,
                     )?;
                 }
+                if layer.post_ffn_norm.is_some() {
+                    Self::require_norm_tensor(
+                        &loader,
+                        &format!("{p}.post_feedforward_layernorm.weight"),
+                        h,
+                    )?;
+                }
             } else {
+                // Standard LLaMA / Qwen / Mistral architecture
                 Self::require_norm_tensor(
                     &loader,
                     &format!("{p}.post_attention_layernorm.weight"),
@@ -569,6 +574,9 @@ impl ModelGpuWeights {
         desc: &ModelArchDescriptor,
         checkpoint_dir: P,
     ) -> Result<Self, MetalError> {
+        // Enforce single production validation boundary: strict loading always validates first
+        Self::validate_production_checkpoint(desc, checkpoint_dir.as_ref())?;
+
         let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
         let shared = MTLResourceOptions::StorageModeShared;
         let h = desc.hidden_size as usize;
@@ -746,18 +754,30 @@ impl ModelGpuWeights {
                 device.new_buffer(4, shared)
             };
 
-            let (ffn_norm, post_attn_norm, post_ffn_norm) = if loader
-                .get_tensor(&format!("{p}.pre_feedforward_layernorm.weight"))
-                .is_ok()
-            {
-                let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
-                let post_att = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h).ok();
-                let post_ff = bind_bf16(&format!("{p}.post_feedforward_layernorm.weight"), h).ok();
-                (pre, post_att, post_ff)
-            } else {
-                let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
-                (norm, None, None)
-            };
+            let (ffn_norm, post_attn_norm, post_ffn_norm) =
+                if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
+                    let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
+                    let post_att = if layer.post_attn_norm.is_some() {
+                        Some(bind_bf16(
+                            &format!("{p}.post_attention_layernorm.weight"),
+                            h,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let post_ff = if layer.post_ffn_norm.is_some() {
+                        Some(bind_bf16(
+                            &format!("{p}.post_feedforward_layernorm.weight"),
+                            h,
+                        )?)
+                    } else {
+                        None
+                    };
+                    (pre, post_att, post_ff)
+                } else {
+                    let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
+                    (norm, None, None)
+                };
 
             let gate_proj = bind_q4(&format!("{p}.mlp.gate_proj"), &[inter, h])?;
             let up_proj = bind_q4(&format!("{p}.mlp.up_proj"), &[inter, h])?;
@@ -1376,7 +1396,6 @@ impl MetalExecutor {
 
         let weights = if let Some(ckpt) = checkpoint_dir {
             if production_mode {
-                ModelGpuWeights::validate_production_checkpoint(descriptor, ckpt)?;
                 ModelGpuWeights::from_checkpoint_dir_strict(&device, descriptor, ckpt)?
             } else {
                 ModelGpuWeights::from_checkpoint_dir(&device, descriptor, ckpt)?

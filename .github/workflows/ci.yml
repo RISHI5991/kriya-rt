@@ -5,6 +5,11 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +43,7 @@ jobs:
           components: clippy
 
       - name: Run clippy on workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test-workspace:
     name: Workspace Tests (Apple Silicon)
@@ -53,7 +58,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run all workspace unit and integration tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   package-check:
     name: Release Packaging Verification
@@ -69,3 +74,12 @@ jobs:
 
       - name: Verify release build and packaging
         run: bash packaging/build_release_package.sh 0.1.0
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kriya-rt-v0.1.0-aarch64-apple-darwin
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 14

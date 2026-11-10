@@ -262,6 +262,25 @@ fn generate_eagle_draft_artifact(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "kriya_convert 0.1.0\n\
+             Python-Free Native Rust Quantization & Turnkey Conversion CLI\n\n\
+             Usage: kriya_convert --input <checkpoint_dir|model.safetensors> --output <output_dir> [options]\n\n\
+             Options:\n  \
+               --input, --input-dir   Input directory or safetensors file\n  \
+               --output, --output-dir Target directory for converted weights\n  \
+               --config               Optional explicit config.json path\n  \
+               --no-draft-head        Skip EAGLE draft artifact generation\n  \
+               --version, -V          Print version and exit\n  \
+               --help, -h             Print this help message and exit"
+        );
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("kriya_convert 0.1.0");
+        std::process::exit(0);
+    }
     let input_path = option_path(&args, &["--input", "--input-dir"]);
     let output_path = option_path(&args, &["--output", "--output-dir"]);
     let explicit_config = option_path(&args, &["--config"]);
