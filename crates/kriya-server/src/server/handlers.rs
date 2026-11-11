@@ -103,44 +103,55 @@ pub async fn metrics_handler(State(handle): State<ServerHandle>) -> impl IntoRes
     )
 }
 
+#[inline]
+fn api_error(
+    status: StatusCode,
+    message: impl Into<String>,
+    err_type: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+) -> Response {
+    let mut err = serde_json::json!({
+        "message": message.into(),
+        "type": err_type,
+    });
+    if let Some(c) = code {
+        err["code"] = serde_json::Value::String(c.to_string());
+    }
+    if let Some(p) = param {
+        err["param"] = serde_json::Value::String(p.to_string());
+    }
+    (status, Json(serde_json::json!({ "error": err }))).into_response()
+}
+
 pub async fn chat_completions_handler(
     State(handle): State<ServerHandle>,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Response {
     // 1. Validation: Messages must not be empty
     if payload.messages.is_empty() {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": "Missing required field: 'messages' array must not be empty",
-                    "type": "invalid_request_error",
-                    "param": "messages",
-                    "code": "missing_required_field"
-                }
-            })),
-        )
-            .into_response();
+            "Missing required field: 'messages' array must not be empty",
+            "invalid_request_error",
+            Some("missing_required_field"),
+            Some("messages"),
+        );
     }
 
     // 2. Validation: Max completion tokens limit
     let max_new = payload.max_tokens.unwrap_or(16);
     if max_new > handle.max_completion_tokens {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "Requested max_tokens ({}) exceeds server maximum of {}",
-                        max_new, handle.max_completion_tokens
-                    ),
-                    "type": "invalid_request_error",
-                    "param": "max_tokens",
-                    "code": "parameter_above_maximum"
-                }
-            })),
-        )
-            .into_response();
+            format!(
+                "Requested max_tokens ({max_new}) exceeds server maximum of {}",
+                handle.max_completion_tokens
+            ),
+            "invalid_request_error",
+            Some("parameter_above_maximum"),
+            Some("max_tokens"),
+        );
     }
 
     // 3. Admission Control: Check queue saturation
@@ -150,20 +161,16 @@ pub async fn chat_completions_handler(
             .metrics
             .rejected_requests
             .fetch_add(1, Ordering::Relaxed);
-        return (
+        return api_error(
             StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "Server admission queue saturated ({} active requests >= limit {})",
-                        current_active, handle.max_concurrent_requests
-                    ),
-                    "type": "rate_limit_error",
-                    "code": "queue_full"
-                }
-            })),
-        )
-            .into_response();
+            format!(
+                "Server admission queue saturated ({current_active} active requests >= limit {})",
+                handle.max_concurrent_requests
+            ),
+            "rate_limit_error",
+            Some("queue_full"),
+            None,
+        );
     }
 
     let temperature = payload.temperature.unwrap_or(0.0);
@@ -187,39 +194,29 @@ pub async fn chat_completions_handler(
         ) {
             Ok(t) => t,
             Err(e) => {
-                return (
+                return api_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": format!("Failed to encode chat prompt tokens: {e}"),
-                            "type": "invalid_request_error",
-                            "param": "messages",
-                            "code": "tokenization_failed"
-                        }
-                    })),
-                )
-                    .into_response();
+                    format!("Failed to encode chat prompt tokens: {e}"),
+                    "invalid_request_error",
+                    Some("tokenization_failed"),
+                    Some("messages"),
+                );
             }
         },
     };
 
     let prompt_len = prompt_tokens.len();
     if prompt_len > handle.max_prompt_tokens {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "Prompt length ({} tokens) exceeds server context limit of {}",
-                        prompt_len, handle.max_prompt_tokens
-                    ),
-                    "type": "invalid_request_error",
-                    "param": "messages",
-                    "code": "context_length_exceeded"
-                }
-            })),
-        )
-            .into_response();
+            format!(
+                "Prompt length ({prompt_len} tokens) exceeds server context limit of {}",
+                handle.max_prompt_tokens
+            ),
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+            Some("messages"),
+        );
     }
 
     handle
@@ -250,16 +247,13 @@ pub async fn chat_completions_handler(
         })
         .is_err()
     {
-        return (
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": {
-                    "message": "KriyaRT inference worker is unavailable",
-                    "type": "server_error"
-                }
-            })),
-        )
-            .into_response();
+            "KriyaRT inference worker is unavailable",
+            "server_error",
+            None,
+            None,
+        );
     }
 
     let tok_clone = handle.tokenizer.clone();

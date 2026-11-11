@@ -20,8 +20,13 @@ fn test_cold_start_model_load_latency() {
     let model_dir = root.join("models/qwen2.5-0.5b-instruct-kriya-q4");
     let kernels_dir = root.join("kernels/metal");
 
-    if !model_dir.exists() {
-        println!("Model directory not found, skipping.");
+    let has_weights = model_dir.join("model.safetensors").exists()
+        || model_dir.join("model.safetensors.index.json").exists();
+    if !has_weights {
+        println!(
+            "Model checkpoint weights not found in {}, skipping.",
+            model_dir.display()
+        );
         return;
     }
 

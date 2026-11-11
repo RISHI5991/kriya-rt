@@ -566,6 +566,38 @@ impl ModelGpuWeights {
         Ok(())
     }
 
+    fn tensor_view_to_bf16_bytes(
+        view: &kriya_core::tensor::TensorView,
+    ) -> Result<Vec<u8>, MetalError> {
+        match view.descriptor.dtype {
+            DType::BF16 => Ok(view.data.to_vec()),
+            DType::F16 => Ok(view
+                .data
+                .chunks_exact(2)
+                .flat_map(|c| {
+                    let f16_val = u16::from_le_bytes([c[0], c[1]]);
+                    let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(
+                        kriya_core::quantizer::f16_bits_to_f32(f16_val),
+                    );
+                    bf16_val.to_le_bytes()
+                })
+                .collect()),
+            DType::F32 => Ok(view
+                .data
+                .chunks_exact(4)
+                .flat_map(|c| {
+                    let f32_val = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
+                    bf16_val.to_le_bytes()
+                })
+                .collect()),
+            other => Err(MetalError::UnsupportedProductionConfiguration(format!(
+                "Tensor '{}' has unsupported dtype {other:?}",
+                view.descriptor.name
+            ))),
+        }
+    }
+
     /// Strictly loads real `.safetensors` / MLX 4-bit weights from a local checkpoint directory
     /// for production serving or benchmarking. Fails closed with an error if ANY required
     /// tensor, scale, or bias fails to load or pack. Zero synthetic fallback is allocated.
@@ -642,42 +674,7 @@ impl ModelGpuWeights {
                     view.descriptor.shape
                 )));
             }
-            let bf16_bytes: Vec<u8> = match view.descriptor.dtype {
-                DType::BF16 => view.data.to_vec(),
-                DType::F16 => {
-                    let num_elements = view.data.len() / 2;
-                    let mut converted = Vec::with_capacity(num_elements * 2);
-                    for i in 0..num_elements {
-                        let f16_val = u16::from_le_bytes([view.data[i * 2], view.data[i * 2 + 1]]);
-                        let f32_val = kriya_core::quantizer::f16_bits_to_f32(f16_val);
-                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
-                        converted.extend_from_slice(&bf16_val.to_le_bytes());
-                    }
-                    converted
-                }
-                DType::F32 => {
-                    let num_elements = view.data.len() / 4;
-                    let mut converted = Vec::with_capacity(num_elements * 2);
-                    for i in 0..num_elements {
-                        let bytes = [
-                            view.data[i * 4],
-                            view.data[i * 4 + 1],
-                            view.data[i * 4 + 2],
-                            view.data[i * 4 + 3],
-                        ];
-                        let f32_val = f32::from_le_bytes(bytes);
-                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
-                        converted.extend_from_slice(&bf16_val.to_le_bytes());
-                    }
-                    converted
-                }
-                other => {
-                    return Err(MetalError::UnsupportedProductionConfiguration(format!(
-                        "Tensor '{name}' has unsupported dtype {:?}",
-                        other
-                    )));
-                }
-            };
+            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
             Ok(device.new_buffer_with_data(
                 bf16_bytes.as_ptr() as *const _,
                 bf16_bytes.len() as u64,
@@ -863,37 +860,7 @@ impl ModelGpuWeights {
 
         let try_bind_bf16 = |name: &str| -> Option<Buffer> {
             let view = loader.get_tensor(name).ok()?;
-            let bf16_bytes: Vec<u8> = match view.descriptor.dtype {
-                DType::BF16 => view.data.to_vec(),
-                DType::F16 => {
-                    let num_elements = view.data.len() / 2;
-                    let mut converted = Vec::with_capacity(num_elements * 2);
-                    for i in 0..num_elements {
-                        let f16_val = u16::from_le_bytes([view.data[i * 2], view.data[i * 2 + 1]]);
-                        let f32_val = kriya_core::quantizer::f16_bits_to_f32(f16_val);
-                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
-                        converted.extend_from_slice(&bf16_val.to_le_bytes());
-                    }
-                    converted
-                }
-                DType::F32 => {
-                    let num_elements = view.data.len() / 4;
-                    let mut converted = Vec::with_capacity(num_elements * 2);
-                    for i in 0..num_elements {
-                        let bytes = [
-                            view.data[i * 4],
-                            view.data[i * 4 + 1],
-                            view.data[i * 4 + 2],
-                            view.data[i * 4 + 3],
-                        ];
-                        let f32_val = f32::from_le_bytes(bytes);
-                        let bf16_val = kriya_core::quantizer::f32_to_bf16_bits(f32_val);
-                        converted.extend_from_slice(&bf16_val.to_le_bytes());
-                    }
-                    converted
-                }
-                _ => view.data.to_vec(),
-            };
+            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view).ok()?;
             Some(device.new_buffer_with_data(
                 bf16_bytes.as_ptr() as *const _,
                 bf16_bytes.len() as u64,
@@ -1704,6 +1671,75 @@ impl MetalExecutor {
         Ok(())
     }
 
+    fn norm_eps(norm: &NormVariant) -> f32 {
+        match norm {
+            NormVariant::RmsNorm { eps, .. } | NormVariant::LayerNorm { eps, .. } => *eps,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rmsnorm(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        in_buf: &Buffer,
+        in_byte_offset: u64,
+        weight_buf: &Buffer,
+        out_buf: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+        norm_variant: &NormVariant,
+    ) -> Result<(), MetalError> {
+        let (eps, zero_centered_offset) = match norm_variant {
+            NormVariant::RmsNorm {
+                eps,
+                zero_centered_unit_offset,
+            } => (*eps, u32::from(*zero_centered_unit_offset)),
+            NormVariant::LayerNorm { eps, .. } => (*eps, 0),
+        };
+        let pso = pipeline_cache.get_or_compile("rms_norm_bf16")?;
+        let norm_params = RmsNormParams {
+            num_tokens,
+            hidden_size,
+            eps,
+            zero_centered_offset,
+        };
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(in_buf), in_byte_offset);
+        encoder.set_buffer(1, Some(weight_buf), 0);
+        encoder.set_buffer(2, Some(out_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<RmsNormParams>() as u64,
+            &norm_params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tokens as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        Ok(())
+    }
+
+    fn encode_residual_add(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        residual_buf: &Buffer,
+        add_buf: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+    ) -> Result<(), MetalError> {
+        let pso = pipeline_cache.get_or_compile("residual_add_bf16")?;
+        let total_elems = num_tokens * hidden_size;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(residual_buf), 0);
+        encoder.set_buffer(1, Some(add_buf), 0);
+        encoder.set_bytes(2, 4, &total_elems as *const _ as *const _);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_q4_linear(
         pipeline_cache: &mut MetalPipelineCache,
@@ -1723,53 +1759,42 @@ impl MetalExecutor {
             num_k_blocks: k.div_ceil(64),
         };
 
-        if m == 1 {
-            let (kernel_name, tgp_divisor) = if params.num_k_blocks <= 16 {
+        let (kernel_name, grid, threads) = if m == 1 {
+            let (name, divisor) = if params.num_k_blocks <= 16 {
                 ("q4_g64_decode_gemv_sub16", 8u32)
             } else {
                 ("q4_g64_decode_gemv", 4u32)
             };
-            let pso = pipeline_cache.get_or_compile(kernel_name)?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(weight_buf), 0);
-            encoder.set_buffer(1, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(2, Some(output_buf), 0);
-            encoder.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let tgp_count = n.div_ceil(tgp_divisor) as u64;
-            encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+            (
+                name,
+                MTLSize::new(n.div_ceil(divisor) as u64, 1, 1),
+                MTLSize::new(128, 1, 1),
+            )
         } else if m >= 64 {
-            // Adaptive Multi-Tile Dispatch: Use M=64 hardware simdgroup_matrix GEMM for long context prefill
-            let pso = pipeline_cache.get_or_compile("q4_g64_batched_simdgroup_gemm_m64")?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(weight_buf), 0);
-            encoder.set_buffer(1, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(2, Some(output_buf), 0);
-            encoder.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let grid = MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1);
-            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+            (
+                "q4_g64_batched_simdgroup_gemm_m64",
+                MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(128, 1, 1),
+            )
         } else {
-            // Route M < 64 batches to the threadgroup-tiled prefill GEMM kernel
-            let pso = pipeline_cache.get_or_compile("q4_g64_prefill_gemm")?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(weight_buf), 0);
-            encoder.set_buffer(1, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(2, Some(output_buf), 0);
-            encoder.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let grid = MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
-            encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
-        }
+            (
+                "q4_g64_prefill_gemm",
+                MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1),
+                MTLSize::new(16, 16, 1),
+            )
+        };
+
+        let pso = pipeline_cache.get_or_compile(kernel_name)?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(weight_buf), 0);
+        encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(2, Some(output_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(grid, threads);
         Ok(())
     }
 
@@ -1848,72 +1873,49 @@ impl MetalExecutor {
 
         let total_n = q_dim + kv_dim + kv_dim;
 
-        if m == 1 {
-            let (kernel_name, tgp_divisor) = if params.num_k_blocks <= 16 {
+        let (kernel_name, grid, threads) = if m == 1 {
+            let (name, divisor) = if params.num_k_blocks <= 16 {
                 ("q4_g64_decode_qkv_gemv_sub16", 8u32)
             } else {
                 ("q4_g64_decode_qkv_gemv", 4u32)
             };
-            let pso = pipeline_cache.get_or_compile(kernel_name)?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(q_weight), 0);
-            encoder.set_buffer(1, Some(k_weight), 0);
-            encoder.set_buffer(2, Some(v_weight), 0);
-            encoder.set_buffer(3, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(4, Some(q_buf), 0);
-            encoder.set_buffer(5, Some(k_buf), 0);
-            encoder.set_buffer(6, Some(v_buf), 0);
-            encoder.set_buffer(7, Some(q_bias), 0);
-            encoder.set_buffer(8, Some(k_bias), 0);
-            encoder.set_buffer(9, Some(v_bias), 0);
-            encoder.set_bytes(
-                10,
-                std::mem::size_of::<QkvGemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let tgp_count = total_n.div_ceil(tgp_divisor) as u64;
-            encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
+            (
+                name,
+                MTLSize::new(total_n.div_ceil(divisor) as u64, 1, 1),
+                MTLSize::new(128, 1, 1),
+            )
         } else if m >= 64 {
-            let pso = pipeline_cache.get_or_compile("q4_g64_batched_simdgroup_qkv_gemm_m64")?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(q_weight), 0);
-            encoder.set_buffer(1, Some(k_weight), 0);
-            encoder.set_buffer(2, Some(v_weight), 0);
-            encoder.set_buffer(3, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(4, Some(q_buf), 0);
-            encoder.set_buffer(5, Some(k_buf), 0);
-            encoder.set_buffer(6, Some(v_buf), 0);
-            encoder.set_buffer(7, Some(q_bias), 0);
-            encoder.set_buffer(8, Some(k_bias), 0);
-            encoder.set_buffer(9, Some(v_bias), 0);
-            encoder.set_bytes(
-                10,
-                std::mem::size_of::<QkvGemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let grid = MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1);
-            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+            (
+                "q4_g64_batched_simdgroup_qkv_gemm_m64",
+                MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(128, 1, 1),
+            )
         } else {
-            let pso = pipeline_cache.get_or_compile("q4_g64_prefill_qkv_gemm")?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(q_weight), 0);
-            encoder.set_buffer(1, Some(k_weight), 0);
-            encoder.set_buffer(2, Some(v_weight), 0);
-            encoder.set_buffer(3, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(4, Some(q_buf), 0);
-            encoder.set_buffer(5, Some(k_buf), 0);
-            encoder.set_buffer(6, Some(v_buf), 0);
-            encoder.set_buffer(7, Some(q_bias), 0);
-            encoder.set_buffer(8, Some(k_bias), 0);
-            encoder.set_buffer(9, Some(v_bias), 0);
-            encoder.set_bytes(
-                10,
-                std::mem::size_of::<QkvGemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let grid = MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
-            encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
-        }
+            (
+                "q4_g64_prefill_qkv_gemm",
+                MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1),
+                MTLSize::new(16, 16, 1),
+            )
+        };
+
+        let pso = pipeline_cache.get_or_compile(kernel_name)?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(q_weight), 0);
+        encoder.set_buffer(1, Some(k_weight), 0);
+        encoder.set_buffer(2, Some(v_weight), 0);
+        encoder.set_buffer(3, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(4, Some(q_buf), 0);
+        encoder.set_buffer(5, Some(k_buf), 0);
+        encoder.set_buffer(6, Some(v_buf), 0);
+        encoder.set_buffer(7, Some(q_bias), 0);
+        encoder.set_buffer(8, Some(k_bias), 0);
+        encoder.set_buffer(9, Some(v_bias), 0);
+        encoder.set_bytes(
+            10,
+            std::mem::size_of::<QkvGemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(grid, threads);
         Ok(())
     }
 
@@ -1968,47 +1970,6 @@ impl MetalExecutor {
                 1,
             );
             encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
-        } else if m == 1 {
-            let params = GateUpGemmParams {
-                m,
-                k,
-                num_k_blocks: k.div_ceil(64),
-                intermediate_size,
-            };
-            let pso = pipeline_cache.get_or_compile("q4_g64_decode_gate_up_gemv")?;
-            encoder.set_compute_pipeline_state(&pso);
-            encoder.set_buffer(0, Some(gate_weight), 0);
-            encoder.set_buffer(1, Some(up_weight), 0);
-            encoder.set_buffer(2, Some(input_buf), input_byte_offset);
-            encoder.set_buffer(3, Some(gate_buf), 0);
-            encoder.set_buffer(4, Some(up_buf), 0);
-            encoder.set_bytes(
-                5,
-                std::mem::size_of::<GateUpGemmParams>() as u64,
-                &params as *const _ as *const _,
-            );
-            let total_rows = intermediate_size * 2;
-            let tgp_count = total_rows.div_ceil(4) as u64;
-            encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
-
-            let pso_act = pipeline_cache.get_or_compile("fused_gated_activation_bf16")?;
-            let act_params = ActivationParams {
-                num_elements: intermediate_size,
-                variant: act_var,
-            };
-            encoder.set_compute_pipeline_state(&pso_act);
-            encoder.set_buffer(0, Some(gate_buf), 0);
-            encoder.set_buffer(1, Some(up_buf), 0);
-            encoder.set_buffer(2, Some(mlp_hidden_buf), 0);
-            encoder.set_bytes(
-                3,
-                std::mem::size_of::<ActivationParams>() as u64,
-                &act_params as *const _ as *const _,
-            );
-            encoder.dispatch_thread_groups(
-                MTLSize::new(intermediate_size.div_ceil(256) as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
         } else {
             let params = GateUpGemmParams {
                 m,
@@ -2016,7 +1977,22 @@ impl MetalExecutor {
                 num_k_blocks: k.div_ceil(64),
                 intermediate_size,
             };
-            let pso = pipeline_cache.get_or_compile("q4_g64_prefill_gate_up_gemm")?;
+            let total_rows = intermediate_size * 2;
+            let (kernel_name, grid, threads) = if m == 1 {
+                (
+                    "q4_g64_decode_gate_up_gemv",
+                    MTLSize::new(total_rows.div_ceil(4) as u64, 1, 1),
+                    MTLSize::new(128, 1, 1),
+                )
+            } else {
+                (
+                    "q4_g64_prefill_gate_up_gemm",
+                    MTLSize::new(total_rows.div_ceil(16) as u64, m.div_ceil(16) as u64, 1),
+                    MTLSize::new(16, 16, 1),
+                )
+            };
+
+            let pso = pipeline_cache.get_or_compile(kernel_name)?;
             encoder.set_compute_pipeline_state(&pso);
             encoder.set_buffer(0, Some(gate_weight), 0);
             encoder.set_buffer(1, Some(up_weight), 0);
@@ -2028,16 +2004,18 @@ impl MetalExecutor {
                 std::mem::size_of::<GateUpGemmParams>() as u64,
                 &params as *const _ as *const _,
             );
-            let total_rows = intermediate_size * 2;
-            let grid = MTLSize::new(total_rows.div_ceil(16) as u64, m.div_ceil(16) as u64, 1);
-            encoder.dispatch_thread_groups(grid, MTLSize::new(16, 16, 1));
+            encoder.dispatch_thread_groups(grid, threads);
 
-            let total_inter = m * intermediate_size;
-            let pso_act = pipeline_cache.get_or_compile("fused_gated_activation_bf16")?;
+            let num_elements = if m == 1 {
+                intermediate_size
+            } else {
+                m * intermediate_size
+            };
             let act_params = ActivationParams {
-                num_elements: total_inter,
+                num_elements,
                 variant: act_var,
             };
+            let pso_act = pipeline_cache.get_or_compile("fused_gated_activation_bf16")?;
             encoder.set_compute_pipeline_state(&pso_act);
             encoder.set_buffer(0, Some(gate_buf), 0);
             encoder.set_buffer(1, Some(up_buf), 0);
@@ -2048,7 +2026,7 @@ impl MetalExecutor {
                 &act_params as *const _ as *const _,
             );
             encoder.dispatch_thread_groups(
-                MTLSize::new(total_inter.div_ceil(256) as u64, 1, 1),
+                MTLSize::new(num_elements.div_ceil(256) as u64, 1, 1),
                 MTLSize::new(256, 1, 1),
             );
         }
@@ -2381,37 +2359,19 @@ impl MetalExecutor {
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
-            let (eps, zero_off) = match layer.attn_norm {
-                NormVariant::RmsNorm {
-                    eps,
-                    zero_centered_unit_offset,
-                } => (eps, u32::from(zero_centered_unit_offset)),
-                NormVariant::LayerNorm { eps, .. } => (eps, 0),
-            };
-
+            let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm
-            {
-                let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens: num_tree_nodes as u32,
-                    hidden_size: h as u32,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&lw.attn_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tree_nodes as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            }
+            Self::encode_rmsnorm(
+                &mut self.pipeline_cache,
+                enc,
+                &self.residual_buf,
+                0,
+                &lw.attn_norm,
+                &self.norm_out_buf,
+                num_tree_nodes as u32,
+                h as u32,
+                &layer.attn_norm,
+            )?;
 
             // 2b. Sequence Mixer
             match layer.seq_mixer {
@@ -2621,72 +2581,48 @@ impl MetalExecutor {
 
             // 2c. First Residual Add (with post-attention norm for Gemma 2)
             if let Some(ref post_attn) = lw.post_attn_norm {
-                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens: num_tree_nodes as u32,
-                    hidden_size: h as u32,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso_norm);
-                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
-                enc.set_buffer(1, Some(post_attn), 0);
-                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tree_nodes as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tree_nodes * h;
-                enc.set_compute_pipeline_state(&pso_add);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.proj_out_buf,
+                    0,
+                    post_attn,
+                    &self.attn_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                    &layer.attn_norm,
+                )?;
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.attn_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                )?;
             } else {
-                let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tree_nodes * h;
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.proj_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                )?;
             }
 
             // 2d. Pre-FFN RMSNorm
-            {
-                let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens: num_tree_nodes as u32,
-                    hidden_size: h as u32,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&lw.ffn_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tree_nodes as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            }
+            Self::encode_rmsnorm(
+                &mut self.pipeline_cache,
+                enc,
+                &self.residual_buf,
+                0,
+                &lw.ffn_norm,
+                &self.norm_out_buf,
+                num_tree_nodes as u32,
+                h as u32,
+                &layer.ffn_norm,
+            )?;
 
             // 2e. Channel Mixer (Dense MLP)
             match layer.channel_mixer {
@@ -2763,47 +2699,34 @@ impl MetalExecutor {
 
             // 2f. Second Residual Add (with post-FFN norm for Gemma 2)
             if let Some(ref post_ffn) = lw.post_ffn_norm {
-                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens: num_tree_nodes as u32,
-                    hidden_size: h as u32,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso_norm);
-                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
-                enc.set_buffer(1, Some(post_ffn), 0);
-                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tree_nodes as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tree_nodes * h;
-                enc.set_compute_pipeline_state(&pso_add);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.proj_out_buf,
+                    0,
+                    post_ffn,
+                    &self.attn_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                    &layer.ffn_norm,
+                )?;
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.attn_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                )?;
             } else {
-                let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tree_nodes * h;
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.proj_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                )?;
             }
 
             layers_in_chunk += 1;
@@ -2822,35 +2745,17 @@ impl MetalExecutor {
 
         // 3. Final RMSNorm (per tree node) — output in norm_out_buf.
         //    Read back hidden states HERE (before LM Head overwrites norm_out_buf).
-        {
-            let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-            let (eps, zero_off) = match descriptor.final_norm {
-                NormVariant::RmsNorm {
-                    eps,
-                    zero_centered_unit_offset,
-                } => (eps, u32::from(zero_centered_unit_offset)),
-                NormVariant::LayerNorm { eps, .. } => (eps, 0),
-            };
-            let norm_params = RmsNormParams {
-                num_tokens: num_tree_nodes as u32,
-                hidden_size: h as u32,
-                eps,
-                zero_centered_offset: zero_off,
-            };
-            enc.set_compute_pipeline_state(&pso);
-            enc.set_buffer(0, Some(&self.residual_buf), 0);
-            enc.set_buffer(1, Some(&self.weights.final_norm), 0);
-            enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<RmsNormParams>() as u64,
-                &norm_params as *const _ as *const _,
-            );
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_tree_nodes as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-        }
+        Self::encode_rmsnorm(
+            &mut self.pipeline_cache,
+            enc,
+            &self.residual_buf,
+            0,
+            &self.weights.final_norm,
+            &self.norm_out_buf,
+            num_tree_nodes as u32,
+            h as u32,
+            &descriptor.final_norm,
+        )?;
 
         // Read back hidden states per tree node (BF16 -> F32).
         // These are the ACTUAL target model hidden states — needed for correct EAGLE acceptance.
@@ -3141,37 +3046,19 @@ impl MetalExecutor {
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
-            let (eps, zero_off) = match layer.attn_norm {
-                NormVariant::RmsNorm {
-                    eps,
-                    zero_centered_unit_offset,
-                } => (eps, u32::from(zero_centered_unit_offset)),
-                NormVariant::LayerNorm { eps, .. } => (eps, 0),
-            };
-
+            let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm (batched)
-            {
-                let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&lw.attn_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            }
+            Self::encode_rmsnorm(
+                &mut self.pipeline_cache,
+                enc,
+                &self.residual_buf,
+                0,
+                &lw.attn_norm,
+                &self.norm_out_buf,
+                num_tokens,
+                h,
+                &layer.attn_norm,
+            )?;
 
             // 2b. Sequence Mixer
             match layer.seq_mixer {
@@ -3343,72 +3230,48 @@ impl MetalExecutor {
 
             // 2c. First Residual Add (batched, with post-attention norm for Gemma 2)
             if let Some(ref post_attn) = lw.post_attn_norm {
-                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.proj_out_buf,
+                    0,
+                    post_attn,
+                    &self.attn_out_buf,
                     num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso_norm);
-                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
-                enc.set_buffer(1, Some(post_attn), 0);
-                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso_add);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                    h,
+                    &layer.attn_norm,
+                )?;
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.attn_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             } else {
-                let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.proj_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             }
 
             // 2d. Pre-FFN RMSNorm (batched)
-            {
-                let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&lw.ffn_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            }
+            Self::encode_rmsnorm(
+                &mut self.pipeline_cache,
+                enc,
+                &self.residual_buf,
+                0,
+                &lw.ffn_norm,
+                &self.norm_out_buf,
+                num_tokens,
+                h,
+                &layer.ffn_norm,
+            )?;
 
             // 2e. Channel Mixer (Dense MLP, batched)
             match layer.channel_mixer {
@@ -3664,47 +3527,34 @@ impl MetalExecutor {
 
             // 2f. Second Residual Add (batched, with post-FFN norm for Gemma 2)
             if let Some(ref post_ffn) = lw.post_ffn_norm {
-                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.proj_out_buf,
+                    0,
+                    post_ffn,
+                    &self.attn_out_buf,
                     num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso_norm);
-                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
-                enc.set_buffer(1, Some(post_ffn), 0);
-                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso_add);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                    h,
+                    &layer.ffn_norm,
+                )?;
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.attn_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             } else {
-                let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.proj_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             }
 
             layers_in_chunk += 1;
@@ -3723,32 +3573,17 @@ impl MetalExecutor {
 
         // 3. Final RMSNorm on the last token only
         let last_token_byte_offset = ((num_tokens - 1) * h * 2) as u64;
-        {
-            let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-            let (eps, zero_off) = match descriptor.final_norm {
-                NormVariant::RmsNorm {
-                    eps,
-                    zero_centered_unit_offset,
-                } => (eps, u32::from(zero_centered_unit_offset)),
-                NormVariant::LayerNorm { eps, .. } => (eps, 0),
-            };
-            let norm_params = RmsNormParams {
-                num_tokens: 1,
-                hidden_size: h,
-                eps,
-                zero_centered_offset: zero_off,
-            };
-            enc.set_compute_pipeline_state(&pso);
-            enc.set_buffer(0, Some(&self.residual_buf), last_token_byte_offset);
-            enc.set_buffer(1, Some(&self.weights.final_norm), 0);
-            enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<RmsNormParams>() as u64,
-                &norm_params as *const _ as *const _,
-            );
-            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-        }
+        Self::encode_rmsnorm(
+            &mut self.pipeline_cache,
+            enc,
+            &self.residual_buf,
+            last_token_byte_offset,
+            &self.weights.final_norm,
+            &self.norm_out_buf,
+            1,
+            h,
+            &descriptor.final_norm,
+        )?;
 
         // 4. LM Head Projection (last token only)
         Self::encode_q4_linear(
@@ -3945,37 +3780,19 @@ impl MetalExecutor {
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
-            let (eps, zero_off) = match layer.attn_norm {
-                NormVariant::RmsNorm {
-                    eps,
-                    zero_centered_unit_offset,
-                } => (eps, u32::from(zero_centered_unit_offset)),
-                NormVariant::LayerNorm { eps, .. } => (eps, 0),
-            };
-
+            let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm
-            {
-                let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&lw.attn_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            }
+            Self::encode_rmsnorm(
+                &mut self.pipeline_cache,
+                enc,
+                &self.residual_buf,
+                0,
+                &lw.attn_norm,
+                &self.norm_out_buf,
+                num_tokens,
+                h,
+                &layer.attn_norm,
+            )?;
 
             // 2b. Sequence Mixer
             match layer.seq_mixer {
@@ -4239,72 +4056,48 @@ impl MetalExecutor {
 
             // 2c. First Residual Add (with post-attention norm for Gemma 2)
             if let Some(ref post_attn) = lw.post_attn_norm {
-                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.proj_out_buf,
+                    0,
+                    post_attn,
+                    &self.attn_out_buf,
                     num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso_norm);
-                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
-                enc.set_buffer(1, Some(post_attn), 0);
-                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso_add);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                    h,
+                    &layer.attn_norm,
+                )?;
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.attn_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             } else if num_tokens > 1 {
-                let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.proj_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             }
 
             // 2d. Pre-FFN RMSNorm
-            {
-                let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
-                    num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&lw.ffn_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            }
+            Self::encode_rmsnorm(
+                &mut self.pipeline_cache,
+                enc,
+                &self.residual_buf,
+                0,
+                &lw.ffn_norm,
+                &self.norm_out_buf,
+                num_tokens,
+                h,
+                &layer.ffn_norm,
+            )?;
 
             // 2e. Channel Mixer: Dense MLP vs. Full GPU-Resident SparseMoE (Closes Gap 4)
             match layer.channel_mixer {
@@ -4559,52 +4352,39 @@ impl MetalExecutor {
 
             // 2f. Second Residual Add (with post-FFN norm for Gemma 2)
             if let Some(ref post_ffn) = lw.post_ffn_norm {
-                let pso_norm = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-                let norm_params = RmsNormParams {
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.proj_out_buf,
+                    0,
+                    post_ffn,
+                    &self.attn_out_buf,
                     num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso_norm);
-                enc.set_buffer(0, Some(&self.proj_out_buf), 0);
-                enc.set_buffer(1, Some(post_ffn), 0);
-                enc.set_buffer(2, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                let pso_add = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso_add);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                    h,
+                    &layer.ffn_norm,
+                )?;
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.attn_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             } else if num_tokens > 1
                 || matches!(
                     layer.channel_mixer,
                     ChannelMixerDescriptor::SparseMoE { .. }
                 )
             {
-                let pso = self.pipeline_cache.get_or_compile("residual_add_bf16")?;
-                let total_elems = num_tokens * h;
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.proj_out_buf), 0);
-                enc.set_bytes(2, 4, &total_elems as *const _ as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                Self::encode_residual_add(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    &self.proj_out_buf,
+                    num_tokens,
+                    h,
+                )?;
             }
 
             layers_in_chunk += 1;
@@ -4622,55 +4402,22 @@ impl MetalExecutor {
         }
 
         // 3. Final RMSNorm
-        {
-            let pso = self.pipeline_cache.get_or_compile("rms_norm_bf16")?;
-            let (eps, zero_off) = match descriptor.final_norm {
-                NormVariant::RmsNorm {
-                    eps,
-                    zero_centered_unit_offset,
-                } => (eps, u32::from(zero_centered_unit_offset)),
-                NormVariant::LayerNorm { eps, .. } => (eps, 0),
-            };
-            if sample_all {
-                let norm_params = RmsNormParams {
-                    num_tokens,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), 0);
-                enc.set_buffer(1, Some(&self.weights.final_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_tokens as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            } else {
-                let last_token_byte_offset = ((num_tokens - 1) * h * 2) as u64;
-                let norm_params = RmsNormParams {
-                    num_tokens: 1,
-                    hidden_size: h,
-                    eps,
-                    zero_centered_offset: zero_off,
-                };
-                enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&self.residual_buf), last_token_byte_offset);
-                enc.set_buffer(1, Some(&self.weights.final_norm), 0);
-                enc.set_buffer(2, Some(&self.norm_out_buf), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<RmsNormParams>() as u64,
-                    &norm_params as *const _ as *const _,
-                );
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-            }
-        }
+        let (tokens_norm, in_offset) = if sample_all {
+            (num_tokens, 0)
+        } else {
+            (1, ((num_tokens - 1) * h * 2) as u64)
+        };
+        Self::encode_rmsnorm(
+            &mut self.pipeline_cache,
+            enc,
+            &self.residual_buf,
+            in_offset,
+            &self.weights.final_norm,
+            &self.norm_out_buf,
+            tokens_norm,
+            h,
+            &descriptor.final_norm,
+        )?;
 
         // 4. LM Head Projection
         let tokens_to_project = if sample_all { num_tokens } else { 1 };
