@@ -254,63 +254,56 @@ impl ShardedCheckpointLoader {
             });
         }
 
-        let mut packed_blocks = Vec::with_capacity(num_blocks);
-        for blk_idx in 0..num_blocks {
-            let mut qs = [0u8; 32];
-            qs.copy_from_slice(&w_bytes[blk_idx * 32..(blk_idx + 1) * 32]);
-            let s_raw = u16::from_le_bytes([s_bytes[blk_idx * 2], s_bytes[blk_idx * 2 + 1]]);
-            let scale_bf16 = if s_is_f16 {
-                crate::quantizer::f32_to_bf16_bits(crate::quantizer::f16_bits_to_f32(s_raw))
-            } else {
-                s_raw
-            };
-            let b_raw = u16::from_le_bytes([b_bytes[blk_idx * 2], b_bytes[blk_idx * 2 + 1]]);
-            let bias_bf16 = if b_is_f16 {
-                crate::quantizer::f32_to_bf16_bits(crate::quantizer::f16_bits_to_f32(b_raw))
-            } else {
-                b_raw
-            };
-            packed_blocks.push(BlockQ4Group64 {
-                scale_bf16,
-                bias_bf16,
-                qs,
-            });
-        }
+        let packed_blocks = (0..num_blocks)
+            .map(|i| {
+                let mut qs = [0u8; 32];
+                qs.copy_from_slice(&w_bytes[i * 32..(i + 1) * 32]);
+                BlockQ4Group64 {
+                    scale_bf16: parse_half_endian(&s_bytes[i * 2..i * 2 + 2], s_is_f16),
+                    bias_bf16: parse_half_endian(&b_bytes[i * 2..i * 2 + 2], b_is_f16),
+                    qs,
+                }
+            })
+            .collect();
 
         Ok(packed_blocks)
     }
 }
 
+#[inline]
+fn parse_half_endian(bytes: &[u8], is_f16: bool) -> u16 {
+    let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if is_f16 {
+        crate::quantizer::f32_to_bf16_bits(crate::quantizer::f16_bits_to_f32(raw))
+    } else {
+        raw
+    }
+}
+
 /// Packs MLX-style 4-bit affine quantized data (separate weight/scale/bias arrays)
 /// into contiguous [`BlockQ4Group64`] blocks.
-///
-/// # Arguments
-/// - `weight_nibbles`: packed 4-bit weight bytes (2 nibbles per byte, 32 bytes per group of 64)
-/// - `scales_bf16_raw`: raw bf16 scale values as u16 slices
-/// - `biases_bf16_raw`: raw bf16 bias values as u16 slices
-///
-/// # Returns
-/// A `Vec<BlockQ4Group64>` with interleaved scale, bias, and quantized weights.
 pub fn pack_mlx_affine_q4_group64(
     weight_nibbles: &[u8],
     scales_bf16_raw: &[u16],
     biases_bf16_raw: &[u16],
 ) -> Vec<BlockQ4Group64> {
-    let num_groups = scales_bf16_raw.len();
-    assert_eq!(biases_bf16_raw.len(), num_groups);
-    assert_eq!(weight_nibbles.len(), num_groups * 32);
+    assert_eq!(scales_bf16_raw.len(), biases_bf16_raw.len());
+    assert_eq!(weight_nibbles.len(), scales_bf16_raw.len() * 32);
 
-    let mut blocks = Vec::with_capacity(num_groups);
-    for g in 0..num_groups {
-        let mut qs = [0u8; 32];
-        qs.copy_from_slice(&weight_nibbles[g * 32..(g + 1) * 32]);
-        blocks.push(BlockQ4Group64 {
-            scale_bf16: scales_bf16_raw[g],
-            bias_bf16: biases_bf16_raw[g],
-            qs,
-        });
-    }
-    blocks
+    scales_bf16_raw
+        .iter()
+        .zip(biases_bf16_raw)
+        .zip(weight_nibbles.chunks_exact(32))
+        .map(|((&scale_bf16, &bias_bf16), chunk)| {
+            let mut qs = [0u8; 32];
+            qs.copy_from_slice(chunk);
+            BlockQ4Group64 {
+                scale_bf16,
+                bias_bf16,
+                qs,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

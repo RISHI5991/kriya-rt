@@ -427,8 +427,9 @@ impl EngineRuntime {
             }
         }
 
-        #[allow(clippy::unnecessary_unwrap)]
-        if self.draft_engine.is_some() && batch_size <= 4 {
+        if let Some(ref mut draft_engine) = self.draft_engine
+            && batch_size <= 4
+        {
             for &(req_id, primary_tok) in &primary_outputs {
                 if !self.scheduler.is_request_decoding(req_id) {
                     continue;
@@ -458,7 +459,7 @@ impl EngineRuntime {
                     .speculative_decode(
                         &self.descriptor,
                         &plan,
-                        self.draft_engine.as_mut().unwrap(),
+                        draft_engine,
                         primary_tok,
                         root_feature,
                         &topology,
@@ -480,19 +481,22 @@ impl EngineRuntime {
                         let start_pos = state.start_pos;
 
                         if finished.is_none() {
-                            let mut accepted_nodes = Vec::with_capacity(committed.len());
-                            for (index, _) in committed.iter().enumerate() {
-                                let cache_pos = (start_pos + index) as u32;
-                                if let Ok((phys_blk_id, slot_in_blk)) = self
-                                    .scheduler
-                                    .kv_manager
-                                    .block_for_position(req_id, cache_pos)
-                                {
+                            let accepted_nodes: Vec<_> = committed
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, _)| {
+                                    let cache_pos = (start_pos + index) as u32;
+                                    let (phys_blk_id, slot_in_blk) = self
+                                        .scheduler
+                                        .kv_manager
+                                        .block_for_position(req_id, cache_pos)
+                                        .ok()?;
                                     let tree_node_idx =
                                         accepted_node_indices.get(index).copied().unwrap_or(0);
-                                    accepted_nodes.push((tree_node_idx, phys_blk_id, slot_in_blk));
-                                }
-                            }
+                                    Some((tree_node_idx, phys_blk_id, slot_in_blk))
+                                })
+                                .collect();
+
                             if !accepted_nodes.is_empty()
                                 && self
                                     .executor

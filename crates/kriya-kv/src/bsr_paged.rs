@@ -45,18 +45,15 @@ pub struct BlockAllocator {
 
 impl BlockAllocator {
     pub fn new(device_name: &'static str, num_blocks: u32, block_size_tokens: u32) -> Self {
-        let mut blocks = Vec::with_capacity(num_blocks as usize);
-        let mut free_list = VecDeque::with_capacity(num_blocks as usize);
-
-        for id in 0..num_blocks {
-            blocks.push(PhysicalKvBlock {
+        let blocks = (0..num_blocks)
+            .map(|id| PhysicalKvBlock {
                 block_id: id,
                 ref_count: 0,
                 num_hashed_tokens: 0,
                 prefix_hash: None,
-            });
-            free_list.push_back(id);
-        }
+            })
+            .collect();
+        let free_list = (0..num_blocks).collect();
 
         Self {
             device_name,
@@ -242,11 +239,9 @@ impl SequenceBlockTable {
     /// Number of valid tokens stored in the final page (`1..=block_size_tokens`).
     #[inline]
     pub fn last_page_len(&self, block_size_tokens: u32) -> u32 {
-        if self.total_tokens == 0 {
-            0
-        } else {
-            let rem = self.total_tokens % block_size_tokens;
-            if rem == 0 { block_size_tokens } else { rem }
+        match self.total_tokens % block_size_tokens {
+            0 if self.total_tokens > 0 => block_size_tokens,
+            rem => rem,
         }
     }
 }
@@ -486,17 +481,13 @@ impl PagedKvCacheManager {
                 .get(&seq_id)
                 .ok_or(KvCacheError::InvalidSequenceId(seq_id))?;
 
-            for &phys_id in &seq.logical_blocks {
-                page_indices.push(phys_id as i32);
-            }
+            page_indices.extend(seq.logical_blocks.iter().map(|&id| id as i32));
             page_indptr.push(page_indices.len() as i32);
             last_page_len.push(seq.last_page_len(blk_sz) as i32);
 
             let num_blocks = seq.logical_blocks.len() as u32;
             let is_split_k = u32::from(num_blocks > max_blk_cta);
-            let mut start_blk = 0;
-
-            while start_blk < num_blocks {
+            for start_blk in (0..num_blocks).step_by(max_blk_cta as usize) {
                 let count = (num_blocks - start_blk).min(max_blk_cta);
                 cta_work_tiles.push(CtaWorkTile {
                     request_idx: req_idx as u32,
@@ -504,7 +495,6 @@ impl PagedKvCacheManager {
                     kv_block_count: count,
                     is_split_k,
                 });
-                start_blk += count;
             }
         }
 
@@ -540,20 +530,17 @@ impl PagedKvCacheManager {
         let blk_sz = self.gpu_allocator.block_size_tokens();
         let num_blocks = prefix_tokens.div_ceil(blk_sz) as usize;
         let max_blk_cta = max_blocks_per_cta.max(1);
-        let mut cta_work_tiles = Vec::new();
-        let mut start_blk = 0u32;
         let block_count = num_blocks as u32;
         let is_split_k = u32::from(block_count > max_blk_cta);
-        while start_blk < block_count {
-            let count = (block_count - start_blk).min(max_blk_cta);
-            cta_work_tiles.push(CtaWorkTile {
+        let cta_work_tiles = (0..block_count)
+            .step_by(max_blk_cta as usize)
+            .map(|start_blk| CtaWorkTile {
                 request_idx: 0,
                 kv_block_start: start_blk,
-                kv_block_count: count,
+                kv_block_count: (block_count - start_blk).min(max_blk_cta),
                 is_split_k,
-            });
-            start_blk += count;
-        }
+            })
+            .collect();
 
         Ok(FlashInferSchedulePlan {
             bsr_layout: BsrKvLayout {
@@ -562,10 +549,9 @@ impl PagedKvCacheManager {
                     .iter()
                     .map(|&id| id as i32)
                     .collect(),
-                last_page_len: vec![if prefix_tokens % blk_sz == 0 {
-                    blk_sz as i32
-                } else {
-                    (prefix_tokens % blk_sz) as i32
+                last_page_len: vec![match prefix_tokens % blk_sz {
+                    0 => blk_sz as i32,
+                    rem => rem as i32,
                 }],
             },
             cta_work_tiles,
@@ -619,25 +605,21 @@ impl PagedKvCacheManager {
             page_indptr.push(page_indices.len() as i32);
         }
 
-        // last_page_len: valid tokens in last page per position (causal clamp)
-        let mut last_page_len = Vec::with_capacity(num_tokens as usize);
-        for i in 0..num_tokens {
-            let valid = ((prefix_tokens + i) % blk_sz) + 1;
-            last_page_len.push(valid as i32);
-        }
+        let last_page_len = (0..num_tokens)
+            .map(|i| (((prefix_tokens + i) % blk_sz) + 1) as i32)
+            .collect();
 
-        // CTA work tiles: one per query token
-        let mut cta_work_tiles = Vec::new();
-        for i in 0..num_tokens {
-            let blocks_for_pos = (prefix_tokens + i + 1).div_ceil(blk_sz);
-            let is_split_k = u32::from(blocks_for_pos > max_blocks_per_cta);
-            cta_work_tiles.push(CtaWorkTile {
-                request_idx: 0,
-                kv_block_start: 0,
-                kv_block_count: blocks_for_pos,
-                is_split_k,
-            });
-        }
+        let cta_work_tiles = (0..num_tokens)
+            .map(|i| {
+                let blocks_for_pos = (prefix_tokens + i + 1).div_ceil(blk_sz);
+                CtaWorkTile {
+                    request_idx: 0,
+                    kv_block_start: 0,
+                    kv_block_count: blocks_for_pos,
+                    is_split_k: u32::from(blocks_for_pos > max_blocks_per_cta),
+                }
+            })
+            .collect();
 
         Ok(FlashInferSchedulePlan {
             bsr_layout: BsrKvLayout {
