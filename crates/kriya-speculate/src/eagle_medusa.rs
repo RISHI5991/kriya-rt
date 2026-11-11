@@ -271,19 +271,22 @@ impl EagleDraftEngine {
         fused.extend_from_slice(prev_feature);
 
         // 2. FC layer reduces dimensionality from `2 * hidden_dim` to `hidden_dim`
-        let mut reduced = vec![0.0f32; self.hidden_dim];
-        for (h, reduced_value) in reduced.iter_mut().enumerate() {
-            let row = &self.fc_fuse_weights[h * fused_dim..(h + 1) * fused_dim];
-            *reduced_value = row.iter().zip(fused.iter()).map(|(w, x)| w * x).sum();
-        }
+        let reduced: Vec<f32> = (0..self.hidden_dim)
+            .map(|h| {
+                let row = &self.fc_fuse_weights[h * fused_dim..(h + 1) * fused_dim];
+                row.iter().zip(&fused).map(|(w, x)| w * x).sum()
+            })
+            .collect();
 
         // 3. Decoder layer predicts next feature `\hat{f}_{i+1}` (with residual connection)
-        let mut next_feature = vec![0.0f32; self.hidden_dim];
-        for h in 0..self.hidden_dim {
-            let row = &self.decoder_layer_weights[h * self.hidden_dim..(h + 1) * self.hidden_dim];
-            let delta: f32 = row.iter().zip(reduced.iter()).map(|(w, x)| w * x).sum();
-            next_feature[h] = reduced[h] + delta;
-        }
+        let next_feature: Vec<f32> = (0..self.hidden_dim)
+            .map(|h| {
+                let row =
+                    &self.decoder_layer_weights[h * self.hidden_dim..(h + 1) * self.hidden_dim];
+                let delta: f32 = row.iter().zip(&reduced).map(|(w, x)| w * x).sum();
+                reduced[h] + delta
+            })
+            .collect();
 
         // 4. Frozen Target LM Head computes logits & Softmax distribution from `\hat{f}_{i+1}`
         let probs = self.compute_lm_head_probs(&next_feature);

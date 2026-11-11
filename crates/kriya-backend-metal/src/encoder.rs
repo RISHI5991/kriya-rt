@@ -2033,6 +2033,64 @@ impl MetalExecutor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_dense_mlp(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        lw: &LayerGpuBuffers,
+        norm_out_buf: &Buffer,
+        gate_buf: &Buffer,
+        up_buf: &Buffer,
+        mlp_hidden_buf: &Buffer,
+        residual_buf: &Buffer,
+        proj_out_buf: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+        intermediate_size: u32,
+        activation: ActivationVariant,
+    ) -> Result<(), MetalError> {
+        Self::encode_fused_gate_up(
+            pipeline_cache,
+            encoder,
+            &lw.gate_proj,
+            &lw.up_proj,
+            norm_out_buf,
+            0,
+            gate_buf,
+            up_buf,
+            mlp_hidden_buf,
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            activation,
+        )?;
+
+        if lw.post_ffn_norm.is_none() && num_tokens == 1 {
+            Self::encode_q4_linear_accumulate(
+                pipeline_cache,
+                encoder,
+                &lw.down_proj,
+                mlp_hidden_buf,
+                0,
+                residual_buf,
+                hidden_size,
+                intermediate_size,
+            )
+        } else {
+            Self::encode_q4_linear(
+                pipeline_cache,
+                encoder,
+                &lw.down_proj,
+                mlp_hidden_buf,
+                0,
+                proj_out_buf,
+                num_tokens,
+                hidden_size,
+                intermediate_size,
+            )
+        }
+    }
+
     #[allow(dead_code)]
     fn encode_bias_add(
         pipeline_cache: &mut MetalPipelineCache,
@@ -2631,65 +2689,20 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    Self::encode_q4_linear(
+                    Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.gate_proj,
+                        lw,
                         &self.norm_out_buf,
-                        0,
                         &self.gate_buf,
-                        num_tree_nodes as u32,
-                        intermediate_size,
-                        h as u32,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.up_proj,
-                        &self.norm_out_buf,
-                        0,
                         &self.up_buf,
-                        num_tree_nodes as u32,
-                        intermediate_size,
-                        h as u32,
-                    )?;
-
-                    let pso = self
-                        .pipeline_cache
-                        .get_or_compile("fused_gated_activation_bf16")?;
-                    let total_inter = num_tree_nodes * intermediate_size as usize;
-                    let act_params = ActivationParams {
-                        num_elements: total_inter as u32,
-                        variant: match activation {
-                            ActivationVariant::SwiGLU => 0,
-                            ActivationVariant::GeGLU => 1,
-                            ActivationVariant::ReLU => 2,
-                        },
-                    };
-                    enc.set_compute_pipeline_state(&pso);
-                    enc.set_buffer(0, Some(&self.gate_buf), 0);
-                    enc.set_buffer(1, Some(&self.up_buf), 0);
-                    enc.set_buffer(2, Some(&self.mlp_hidden_buf), 0);
-                    enc.set_bytes(
-                        3,
-                        std::mem::size_of::<ActivationParams>() as u64,
-                        &act_params as *const _ as *const _,
-                    );
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(total_inter.div_ceil(256) as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.down_proj,
                         &self.mlp_hidden_buf,
-                        0,
+                        &self.residual_buf,
                         &self.proj_out_buf,
                         num_tree_nodes as u32,
                         h as u32,
                         intermediate_size,
+                        activation,
                     )?;
                 }
                 ChannelMixerDescriptor::SparseMoE { .. } => {
@@ -3280,47 +3293,21 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    // Fused Gate+Up (+ In-Register Activation for M >= 64)
-                    Self::encode_fused_gate_up(
+                    Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.gate_proj,
-                        &lw.up_proj,
+                        lw,
                         &self.norm_out_buf,
-                        0,
                         &self.gate_buf,
                         &self.up_buf,
                         &self.mlp_hidden_buf,
+                        &self.residual_buf,
+                        &self.proj_out_buf,
                         num_tokens,
                         h,
                         intermediate_size,
                         activation,
                     )?;
-
-                    if lw.post_ffn_norm.is_none() && num_tokens == 1 {
-                        Self::encode_q4_linear_accumulate(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.residual_buf,
-                            h,
-                            intermediate_size,
-                        )?;
-                    } else {
-                        Self::encode_q4_linear(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.proj_out_buf,
-                            num_tokens,
-                            h,
-                            intermediate_size,
-                        )?;
-                    }
                 }
                 ChannelMixerDescriptor::SparseMoE {
                     num_total_experts,
@@ -4106,47 +4093,21 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    // Fused Gate+Up (+ In-Register Activation for M >= 64)
-                    Self::encode_fused_gate_up(
+                    Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.gate_proj,
-                        &lw.up_proj,
+                        lw,
                         &self.norm_out_buf,
-                        0,
                         &self.gate_buf,
                         &self.up_buf,
                         &self.mlp_hidden_buf,
+                        &self.residual_buf,
+                        &self.proj_out_buf,
                         num_tokens,
                         h,
                         intermediate_size,
                         activation,
                     )?;
-
-                    if lw.post_ffn_norm.is_none() && num_tokens == 1 {
-                        Self::encode_q4_linear_accumulate(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.residual_buf,
-                            h,
-                            intermediate_size,
-                        )?;
-                    } else {
-                        Self::encode_q4_linear(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.proj_out_buf,
-                            num_tokens,
-                            h,
-                            intermediate_size,
-                        )?;
-                    }
                 }
                 ChannelMixerDescriptor::SparseMoE {
                     num_total_experts,

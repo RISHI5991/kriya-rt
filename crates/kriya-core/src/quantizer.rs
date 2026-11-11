@@ -67,16 +67,11 @@ pub fn quantize_f32_to_q4_group64(weights: &[f32]) -> Result<Vec<BlockQ4Group64>
     let mut out_blocks = Vec::with_capacity(num_blocks);
 
     for chunk in weights.chunks_exact(64) {
-        let mut min_val = f32::INFINITY;
-        let mut max_val = f32::NEG_INFINITY;
-        for &v in chunk {
-            if v < min_val {
-                min_val = v;
-            }
-            if v > max_val {
-                max_val = v;
-            }
-        }
+        let (min_val, max_val) = chunk
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
 
         let range = (max_val - min_val).max(1e-8);
         let scale = range / 15.0;
@@ -112,18 +107,19 @@ pub fn quantize_f32_to_q4_group64(weights: &[f32]) -> Result<Vec<BlockQ4Group64>
 
 /// Dequantizes a `BlockQ4Group64` slice back to `f32` to verify quantization SQNR / MSE.
 pub fn dequantize_q4_group64_to_f32(blocks: &[BlockQ4Group64]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(blocks.len() * 64);
-    for blk in blocks {
-        let scale = bf16_bits_to_f32(blk.scale_bf16);
-        let bias = bf16_bits_to_f32(blk.bias_bf16);
-        for &packed in &blk.qs {
-            let q0 = (packed & 0x0F) as f32;
-            let q1 = (packed >> 4) as f32;
-            out.push(q0.mul_add(scale, bias));
-            out.push(q1.mul_add(scale, bias));
-        }
-    }
-    out
+    blocks
+        .iter()
+        .flat_map(|blk| {
+            let scale = bf16_bits_to_f32(blk.scale_bf16);
+            let bias = bf16_bits_to_f32(blk.bias_bf16);
+            blk.qs.iter().flat_map(move |&packed| {
+                [
+                    ((packed & 0x0F) as f32).mul_add(scale, bias),
+                    ((packed >> 4) as f32).mul_add(scale, bias),
+                ]
+            })
+        })
+        .collect()
 }
 
 /// Universal Hugging Face `config.json` Schema supporting Llama, Qwen2/3, Gemma, Mistral, Phi, and DeepSeek.
@@ -252,44 +248,45 @@ impl HuggingFaceModelConfig {
             .map(|f| f as f32)
             .unwrap_or(1.0);
 
-        let mut layers = Vec::with_capacity(self.num_hidden_layers as usize);
-        for idx in 0..self.num_hidden_layers {
-            let seq_mixer = if is_hybrid_deltanet && (idx + 1) % 4 != 0 {
-                SequenceMixerDescriptor::GatedDeltaNetRecurrence {
-                    num_heads: self.num_attention_heads,
-                    head_key_dim: head_dim,
-                    head_val_dim: head_dim,
-                    short_conv_kernel_size: 4,
-                }
-            } else {
-                SequenceMixerDescriptor::GroupedQueryAttention {
-                    num_q_heads: self.num_attention_heads,
-                    num_kv_heads,
-                    head_dim,
-                    pos_encoding: PositionalEncoding::RoPE {
-                        theta: self.rope_theta,
-                        rotary_dim: head_dim,
-                        interleaved: false,
-                        scaling_factor: rope_scaling_factor,
-                    },
-                    mask_variant: AttentionMaskVariant::Causal,
-                    qk_norm: if uses_qk_norm { Some(rms) } else { None },
-                    qkv_bias: uses_qkv_bias,
-                    attn_logit_softcap: self.attn_logit_softcapping,
-                    split_k_decode_threshold: 32_768,
-                }
-            };
+        let layers = (0..self.num_hidden_layers)
+            .map(|idx| {
+                let seq_mixer = if is_hybrid_deltanet && (idx + 1) % 4 != 0 {
+                    SequenceMixerDescriptor::GatedDeltaNetRecurrence {
+                        num_heads: self.num_attention_heads,
+                        head_key_dim: head_dim,
+                        head_val_dim: head_dim,
+                        short_conv_kernel_size: 4,
+                    }
+                } else {
+                    SequenceMixerDescriptor::GroupedQueryAttention {
+                        num_q_heads: self.num_attention_heads,
+                        num_kv_heads,
+                        head_dim,
+                        pos_encoding: PositionalEncoding::RoPE {
+                            theta: self.rope_theta,
+                            rotary_dim: head_dim,
+                            interleaved: false,
+                            scaling_factor: rope_scaling_factor,
+                        },
+                        mask_variant: AttentionMaskVariant::Causal,
+                        qk_norm: if uses_qk_norm { Some(rms) } else { None },
+                        qkv_bias: uses_qkv_bias,
+                        attn_logit_softcap: self.attn_logit_softcapping,
+                        split_k_decode_threshold: 32_768,
+                    }
+                };
 
-            layers.push(LayerDescriptor {
-                layer_idx: idx,
-                attn_norm: rms,
-                seq_mixer,
-                post_attn_norm: if is_gemma { Some(rms) } else { None },
-                ffn_norm: rms,
-                channel_mixer,
-                post_ffn_norm: if is_gemma { Some(rms) } else { None },
-            });
-        }
+                LayerDescriptor {
+                    layer_idx: idx,
+                    attn_norm: rms,
+                    seq_mixer,
+                    post_attn_norm: if is_gemma { Some(rms) } else { None },
+                    ffn_norm: rms,
+                    channel_mixer,
+                    post_ffn_norm: if is_gemma { Some(rms) } else { None },
+                }
+            })
+            .collect();
 
         ModelArchDescriptor {
             family: self.model_type.clone(),
@@ -312,37 +309,17 @@ pub fn write_quantized_safetensors<P: AsRef<Path>>(
     output_path: P,
     tensors: &[(String, Vec<usize>, Vec<BlockQ4Group64>)],
 ) -> Result<(), TensorError> {
-    let mut header_map = serde_json::Map::new();
-    let mut current_offset = 0usize;
-
-    for (name, shape, blocks) in tensors {
-        let byte_len = blocks.len() * std::mem::size_of::<BlockQ4Group64>();
-        header_map.insert(
-            name.clone(),
-            serde_json::json!({
-                "dtype": "Q4_G64",
-                "shape": shape,
-                "data_offsets": [current_offset, current_offset + byte_len]
-            }),
-        );
-        current_offset += byte_len;
-    }
-
-    let header_bytes =
-        serde_json::to_vec(&header_map).map_err(|e| TensorError::InvalidMetadata(e.to_string()))?;
-    let header_len = header_bytes.len() as u64;
-
-    let file = File::create(output_path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&header_len.to_le_bytes())?;
-    writer.write_all(&header_bytes)?;
-
-    for (_, _, blocks) in tensors {
-        let raw_bytes: &[u8] = bytemuck::cast_slice(blocks);
-        writer.write_all(raw_bytes)?;
-    }
-    writer.flush()?;
-    Ok(())
+    let mixed: Vec<_> = tensors
+        .iter()
+        .map(|(n, s, b)| {
+            (
+                n.clone(),
+                s.clone(),
+                SavedTensorPayload::Q4Group64(b.clone()),
+            )
+        })
+        .collect();
+    write_mixed_safetensors(output_path, &mixed)
 }
 
 /// Returns true if a tensor is a 1D normalization scale or bias that must stay in unquantized BF16.
