@@ -102,125 +102,63 @@ impl CompiledExecutionGraph {
     /// Compiles a model descriptor into a static topological graph of GPU execution nodes.
     pub fn compile(descriptor: &ModelArchDescriptor) -> Result<Self, GraphError> {
         let mut nodes = Vec::new();
-        let mut node_counter = 0;
+        let mut add_node = |layer_idx, node_type, depends_on: Vec<usize>| {
+            let id = nodes.len();
+            nodes.push(ExecNode {
+                node_id: id,
+                layer_idx,
+                node_type,
+                depends_on,
+            });
+            id
+        };
 
-        // Input embedding node
-        nodes.push(ExecNode {
-            node_id: node_counter,
-            layer_idx: 0,
-            node_type: ExecNodeType::ResidualAdd, // Placeholder for embedding lookup
-            depends_on: vec![],
-        });
-        node_counter += 1;
-
-        let mut prev_node = 0;
+        // Input embedding placeholder node
+        let mut prev_node = add_node(0, ExecNodeType::ResidualAdd, vec![]);
 
         for layer in &descriptor.layers {
-            // 1. Input LayerNorm
-            let norm_node = ExecNode {
-                node_id: node_counter,
-                layer_idx: layer.layer_idx,
-                node_type: ExecNodeType::RmsNorm,
-                depends_on: vec![prev_node],
-            };
-            nodes.push(norm_node);
-            let current_norm_id = node_counter;
-            node_counter += 1;
-
-            // 2. Sequence Mixer (GQA or Recurrent DeltaNet)
+            let norm_id = add_node(layer.layer_idx, ExecNodeType::RmsNorm, vec![prev_node]);
             let mixer_type = match layer.seq_mixer {
                 SequenceMixerDescriptor::GroupedQueryAttention { .. } => ExecNodeType::GqaAttention,
                 SequenceMixerDescriptor::GatedDeltaNetRecurrence { .. } => {
                     ExecNodeType::GatedDeltaNetScan
                 }
             };
+            let mixer_id = add_node(layer.layer_idx, mixer_type, vec![norm_id]);
+            let res1_id = add_node(
+                layer.layer_idx,
+                ExecNodeType::ResidualAdd,
+                vec![prev_node, mixer_id],
+            );
 
-            let mixer_node = ExecNode {
-                node_id: node_counter,
-                layer_idx: layer.layer_idx,
-                node_type: mixer_type,
-                depends_on: vec![current_norm_id],
-            };
-            nodes.push(mixer_node);
-            let mixer_id = node_counter;
-            node_counter += 1;
-
-            // Residual add after attention
-            let res1_node = ExecNode {
-                node_id: node_counter,
-                layer_idx: layer.layer_idx,
-                node_type: ExecNodeType::ResidualAdd,
-                depends_on: vec![prev_node, mixer_id],
-            };
-            nodes.push(res1_node);
-            let res1_id = node_counter;
-            node_counter += 1;
-
-            // 3. FFN / Channel Mixer Norm
-            let ffn_norm_node = ExecNode {
-                node_id: node_counter,
-                layer_idx: layer.layer_idx,
-                node_type: ExecNodeType::RmsNorm,
-                depends_on: vec![res1_id],
-            };
-            nodes.push(ffn_norm_node);
-            let ffn_norm_id = node_counter;
-            node_counter += 1;
-
-            // 4. Channel Mixer (Dense MLP or Sparse MoE)
+            let ffn_norm_id = add_node(layer.layer_idx, ExecNodeType::RmsNorm, vec![res1_id]);
             let channel_type = match layer.channel_mixer {
                 ChannelMixerDescriptor::DenseMlp { .. } => ExecNodeType::DenseMlp,
                 ChannelMixerDescriptor::SparseMoE { .. } => ExecNodeType::SparseMoeRouter,
             };
-
-            let channel_node = ExecNode {
-                node_id: node_counter,
-                layer_idx: layer.layer_idx,
-                node_type: channel_type,
-                depends_on: vec![ffn_norm_id],
-            };
-            nodes.push(channel_node);
-            let channel_id = node_counter;
-            node_counter += 1;
-
-            // If MoE, add explicit expert computation node depending on router
+            let channel_id = add_node(layer.layer_idx, channel_type, vec![ffn_norm_id]);
             let final_channel_id = if matches!(
                 layer.channel_mixer,
                 ChannelMixerDescriptor::SparseMoE { .. }
             ) {
-                let expert_node = ExecNode {
-                    node_id: node_counter,
-                    layer_idx: layer.layer_idx,
-                    node_type: ExecNodeType::SparseMoeExperts,
-                    depends_on: vec![channel_id],
-                };
-                nodes.push(expert_node);
-                let exp_id = node_counter;
-                node_counter += 1;
-                exp_id
+                add_node(
+                    layer.layer_idx,
+                    ExecNodeType::SparseMoeExperts,
+                    vec![channel_id],
+                )
             } else {
                 channel_id
             };
 
-            // Residual add after channel mixer
-            let res2_node = ExecNode {
-                node_id: node_counter,
-                layer_idx: layer.layer_idx,
-                node_type: ExecNodeType::ResidualAdd,
-                depends_on: vec![res1_id, final_channel_id],
-            };
-            nodes.push(res2_node);
-            prev_node = node_counter;
-            node_counter += 1;
+            prev_node = add_node(
+                layer.layer_idx,
+                ExecNodeType::ResidualAdd,
+                vec![res1_id, final_channel_id],
+            );
         }
 
         // Final lm_head and sampling node
-        nodes.push(ExecNode {
-            node_id: node_counter,
-            layer_idx: 0,
-            node_type: ExecNodeType::LmHeadAndSample,
-            depends_on: vec![prev_node],
-        });
+        add_node(0, ExecNodeType::LmHeadAndSample, vec![prev_node]);
 
         Ok(Self { nodes })
     }

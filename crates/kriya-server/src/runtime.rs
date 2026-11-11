@@ -228,6 +228,18 @@ impl EngineRuntime {
         Some(engine)
     }
 
+    #[inline]
+    fn make_sampling_config(&self, req_id: u64, pos: u32, temp: f32, top_p: f32) -> SamplingConfig {
+        SamplingConfig {
+            vocab_size: self.descriptor.vocab_size,
+            greedy: u32::from(temp <= 1e-5),
+            temperature: temp,
+            top_p,
+            top_k: 50,
+            rng_seed: (req_id as u32).wrapping_add(pos),
+        }
+    }
+
     /// Executes a single iteration tick across all concurrently running requests in the ORCA batch.
     pub async fn step_orca_iteration(
         &mut self,
@@ -289,19 +301,10 @@ impl EngineRuntime {
                     }
                 };
 
-                let positions: Vec<u32> = req_tokens
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| (start_pos + i) as u32)
+                let positions: Vec<u32> = (0..req_tokens.len())
+                    .map(|i| (start_pos + i) as u32)
                     .collect();
-                let samp_cfg = SamplingConfig {
-                    vocab_size: self.descriptor.vocab_size,
-                    greedy: u32::from(temp <= 1e-5),
-                    temperature: temp,
-                    top_p,
-                    top_k: 50,
-                    rng_seed: (*req_id as u32).wrapping_add(start_pos as u32),
-                };
+                let samp_cfg = self.make_sampling_config(*req_id, start_pos as u32, temp, top_p);
                 match self
                     .executor
                     .forward_prefill_batch(
@@ -325,14 +328,7 @@ impl EngineRuntime {
             } else {
                 let input_token = req_tokens[0];
                 let position = start_pos as u32;
-                let samp_cfg = SamplingConfig {
-                    vocab_size: self.descriptor.vocab_size,
-                    greedy: u32::from(temp <= 1e-5),
-                    temperature: temp,
-                    top_p,
-                    top_k: 50,
-                    rng_seed: (*req_id as u32).wrapping_add(position),
-                };
+                let samp_cfg = self.make_sampling_config(*req_id, position, temp, top_p);
                 let out_idx = primary_outputs.len();
                 primary_outputs.push((*req_id, 0));
                 client_visible_tokens.insert(*req_id, should_emit);
@@ -350,7 +346,7 @@ impl EngineRuntime {
                 .kv_manager
                 .build_schedule_plan(&decode_req_ids, self.scheduler.max_blocks_per_cta);
 
-            match decode_plan {
+            let decode_failed_err = match decode_plan {
                 Ok(plan) => {
                     match self
                         .executor
@@ -374,22 +370,19 @@ impl EngineRuntime {
                                         .insert(req_id, self.executor.read_hidden_feature_at(h, i));
                                 }
                             }
+                            None
                         }
-                        Err(err) => {
-                            eprintln!("KriyaRT batched decode failed: {err}");
-                            for req_id in &decode_req_ids {
-                                let _ = self.scheduler.abort_request(*req_id);
-                                active_streams.remove(req_id);
-                            }
-                        }
+                        Err(err) => Some(format!("KriyaRT batched decode failed: {err}")),
                     }
                 }
-                Err(err) => {
-                    eprintln!("KriyaRT decode schedule plan failed: {err}");
-                    for req_id in &decode_req_ids {
-                        let _ = self.scheduler.abort_request(*req_id);
-                        active_streams.remove(req_id);
-                    }
+                Err(err) => Some(format!("KriyaRT decode schedule plan failed: {err}")),
+            };
+
+            if let Some(msg) = decode_failed_err {
+                eprintln!("{msg}");
+                for req_id in &decode_req_ids {
+                    let _ = self.scheduler.abort_request(*req_id);
+                    active_streams.remove(req_id);
                 }
             }
         }
