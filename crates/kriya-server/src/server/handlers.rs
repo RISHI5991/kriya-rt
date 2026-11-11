@@ -179,19 +179,15 @@ pub async fn chat_completions_handler(
 
     let pairs: Vec<(String, String)> = payload
         .messages
-        .iter()
-        .map(|m| (m.role.clone(), m.content.clone()))
+        .into_iter()
+        .map(|m| (m.role, m.content))
         .collect();
     let prompt_tokens = match handle.tokenizer.encode_chat_messages(&pairs, true) {
         Ok(t) if !t.is_empty() => t,
-        _ => match handle.tokenizer.encode(
-            payload
-                .messages
-                .last()
-                .map(|m| m.content.as_str())
-                .unwrap_or(""),
-            false,
-        ) {
+        _ => match handle
+            .tokenizer
+            .encode(pairs.last().map(|m| m.1.as_str()).unwrap_or(""), false)
+        {
             Ok(t) => t,
             Err(e) => {
                 return api_error(

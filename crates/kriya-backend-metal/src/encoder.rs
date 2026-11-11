@@ -598,6 +598,95 @@ impl ModelGpuWeights {
         }
     }
 
+    fn bind_q4_buffer(
+        loader: &ShardedCheckpointLoader,
+        device: &Device,
+        prefix: &str,
+        expected_shape: Option<&[usize]>,
+    ) -> Result<Option<Buffer>, MetalError> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let direct_key = format!("{prefix}.weight");
+        for key in [&direct_key[..], prefix] {
+            if let Ok(raw_bytes) = loader.get_tensor_bytes(key)
+                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && loader
+                    .get_tensor_bytes(&format!("{prefix}.scales"))
+                    .is_err()
+            {
+                return Ok(Some(device.new_buffer_with_data(
+                    raw_bytes.as_ptr() as *const _,
+                    raw_bytes.len() as u64,
+                    shared,
+                )));
+            }
+        }
+
+        // Path B: MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
+        match loader.pack_mlx_affine_q4_group64(prefix) {
+            Ok(blocks) => {
+                if let Some(expected_shape) = expected_shape {
+                    let expected_blocks = expected_shape[0] * expected_shape[1].div_ceil(64);
+                    if blocks.len() != expected_blocks {
+                        return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                            "Packed blocks length {} does not match expected {} for tensor '{prefix}'",
+                            blocks.len(),
+                            expected_blocks
+                        )));
+                    }
+                }
+                Ok(Some(device.new_buffer_with_data(
+                    blocks.as_ptr() as *const _,
+                    (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
+                    shared,
+                )))
+            }
+            Err(err) => {
+                if expected_shape.is_some() {
+                    Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "Production required tensor '{prefix}' failed to load or pack: {err}"
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    fn bind_bf16_buffer(
+        loader: &ShardedCheckpointLoader,
+        device: &Device,
+        name: &str,
+        expected_len: Option<usize>,
+    ) -> Result<Option<Buffer>, MetalError> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let view = match loader.get_tensor(name) {
+            Ok(v) => v,
+            Err(err) => {
+                return if expected_len.is_some() {
+                    Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "Production required norm tensor '{name}' missing: {err}"
+                    )))
+                } else {
+                    Ok(None)
+                };
+            }
+        };
+        if let Some(expected_len) = expected_len
+            && view.descriptor.shape != [expected_len]
+        {
+            return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                "Tensor '{name}' shape {:?} does not match expected [{expected_len}]",
+                view.descriptor.shape
+            )));
+        }
+        let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
+        Ok(Some(device.new_buffer_with_data(
+            bf16_bytes.as_ptr() as *const _,
+            bf16_bytes.len() as u64,
+            shared,
+        )))
+    }
+
     /// Strictly loads real `.safetensors` / MLX 4-bit weights from a local checkpoint directory
     /// for production serving or benchmarking. Fails closed with an error if ANY required
     /// tensor, scale, or bias fails to load or pack. Zero synthetic fallback is allocated.
@@ -615,71 +704,15 @@ impl ModelGpuWeights {
         let vocab = desc.vocab_size as usize;
 
         let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
-            let direct_key = format!("{prefix}.weight");
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Ok(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Ok(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-
-            // Path B: MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
-            let blocks = loader.pack_mlx_affine_q4_group64(prefix).map_err(|err| {
-                MetalError::UnsupportedProductionConfiguration(format!(
-                    "Production required tensor '{prefix}' failed to load or pack: {err}"
-                ))
-            })?;
-            let expected_blocks = expected_shape[0] * expected_shape[1].div_ceil(64);
-            if blocks.len() != expected_blocks {
-                return Err(MetalError::UnsupportedProductionConfiguration(format!(
-                    "Packed blocks length {} does not match expected {} for tensor '{prefix}'",
-                    blocks.len(),
-                    expected_blocks
-                )));
-            }
-            Ok(device.new_buffer_with_data(
-                blocks.as_ptr() as *const _,
-                (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
-                shared,
-            ))
+            Self::bind_q4_buffer(&loader, device, prefix, Some(expected_shape))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {prefix}"))
+            })
         };
 
         let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
-            let view = loader.get_tensor(name).map_err(|err| {
-                MetalError::UnsupportedProductionConfiguration(format!(
-                    "Production required norm tensor '{name}' missing: {err}"
-                ))
-            })?;
-            if view.descriptor.shape != [expected_len] {
-                return Err(MetalError::UnsupportedProductionConfiguration(format!(
-                    "Tensor '{name}' shape {:?} does not match expected [{expected_len}]",
-                    view.descriptor.shape
-                )));
-            }
-            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
-            Ok(device.new_buffer_with_data(
-                bf16_bytes.as_ptr() as *const _,
-                bf16_bytes.len() as u64,
-                shared,
-            ))
+            Self::bind_bf16_buffer(&loader, device, name, Some(expected_len))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {name}"))
+            })
         };
 
         let embed_tokens = bind_q4("model.embed_tokens", &[vocab, h])?;
@@ -819,53 +852,17 @@ impl ModelGpuWeights {
     ) -> Result<Self, MetalError> {
         let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
         let mut weights = Self::allocate_for_descriptor(device, desc);
-        let shared = MTLResourceOptions::StorageModeShared;
 
         let try_bind_q4 = |prefix: &str| -> Option<Buffer> {
-            // Path A: Try binding a unified `Q4_G64` tensor produced by `kriya_convert`
-            let direct_key = format!("{prefix}.weight");
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Some(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Some(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-
-            // Path B: Fall back to MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
-            let blocks = loader.pack_mlx_affine_q4_group64(prefix).ok()?;
-            Some(device.new_buffer_with_data(
-                blocks.as_ptr() as *const _,
-                (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
-                shared,
-            ))
+            Self::bind_q4_buffer(&loader, device, prefix, None)
+                .ok()
+                .flatten()
         };
 
         let try_bind_bf16 = |name: &str| -> Option<Buffer> {
-            let view = loader.get_tensor(name).ok()?;
-            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view).ok()?;
-            Some(device.new_buffer_with_data(
-                bf16_bytes.as_ptr() as *const _,
-                bf16_bytes.len() as u64,
-                shared,
-            ))
+            Self::bind_bf16_buffer(&loader, device, name, None)
+                .ok()
+                .flatten()
         };
 
         if let Some(buf) = try_bind_q4("model.embed_tokens") {
@@ -882,36 +879,65 @@ impl ModelGpuWeights {
 
         for (idx, layer_bufs) in weights.layers.iter_mut().enumerate() {
             let p = format!("model.layers.{idx}");
-            if let Some(b) = try_bind_bf16(&format!("{p}.input_layernorm.weight")) {
-                layer_bufs.attn_norm = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.q_proj")) {
-                layer_bufs.q_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.k_proj")) {
-                layer_bufs.k_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.v_proj")) {
-                layer_bufs.v_proj = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.q_proj.bias")) {
-                layer_bufs.q_bias = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.k_proj.bias")) {
-                layer_bufs.k_bias = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.v_proj.bias")) {
-                layer_bufs.v_bias = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.o_proj")) {
-                layer_bufs.o_proj = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.q_norm.weight")) {
-                layer_bufs.q_norm = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.k_norm.weight")) {
-                layer_bufs.k_norm = b;
-            }
+            let update = |buf: &mut Buffer, key: &str, is_q4: bool| {
+                if let Some(b) = if is_q4 {
+                    try_bind_q4(key)
+                } else {
+                    try_bind_bf16(key)
+                } {
+                    *buf = b;
+                }
+            };
+            update(
+                &mut layer_bufs.attn_norm,
+                &format!("{p}.input_layernorm.weight"),
+                false,
+            );
+            update(
+                &mut layer_bufs.q_proj,
+                &format!("{p}.self_attn.q_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.k_proj,
+                &format!("{p}.self_attn.k_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.v_proj,
+                &format!("{p}.self_attn.v_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.q_bias,
+                &format!("{p}.self_attn.q_proj.bias"),
+                false,
+            );
+            update(
+                &mut layer_bufs.k_bias,
+                &format!("{p}.self_attn.k_proj.bias"),
+                false,
+            );
+            update(
+                &mut layer_bufs.v_bias,
+                &format!("{p}.self_attn.v_proj.bias"),
+                false,
+            );
+            update(
+                &mut layer_bufs.o_proj,
+                &format!("{p}.self_attn.o_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.q_norm,
+                &format!("{p}.self_attn.q_norm.weight"),
+                false,
+            );
+            update(
+                &mut layer_bufs.k_norm,
+                &format!("{p}.self_attn.k_norm.weight"),
+                false,
+            );
             if let Some(pre_ffn) = try_bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight")) {
                 layer_bufs.ffn_norm = pre_ffn;
                 layer_bufs.post_attn_norm =
@@ -923,18 +949,22 @@ impl ModelGpuWeights {
                 layer_bufs.post_attn_norm = None;
                 layer_bufs.post_ffn_norm = None;
             }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.gate_proj")) {
-                layer_bufs.gate_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.up_proj")) {
-                layer_bufs.up_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.down_proj")) {
-                layer_bufs.down_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.gate")) {
-                layer_bufs.moe_router_gate = b;
-            }
+            update(
+                &mut layer_bufs.gate_proj,
+                &format!("{p}.mlp.gate_proj"),
+                true,
+            );
+            update(&mut layer_bufs.up_proj, &format!("{p}.mlp.up_proj"), true);
+            update(
+                &mut layer_bufs.down_proj,
+                &format!("{p}.mlp.down_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.moe_router_gate,
+                &format!("{p}.mlp.gate"),
+                true,
+            );
         }
 
         Ok(weights)

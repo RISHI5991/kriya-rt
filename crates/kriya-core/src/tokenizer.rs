@@ -33,11 +33,9 @@ impl KriyaTokenizer {
         let inner =
             Tokenizer::from_file(path).map_err(|e| TokenizerError::LoadError(e.to_string()))?;
 
-        let eos_token_id = inner
-            .token_to_id("<|im_end|>")
-            .or_else(|| inner.token_to_id("<|eot_id|>"))
-            .or_else(|| inner.token_to_id("<|endoftext|>"))
-            .or_else(|| inner.token_to_id("</s>"))
+        let eos_token_id = ["<|im_end|>", "<|eot_id|>", "<|endoftext|>", "</s>"]
+            .into_iter()
+            .find_map(|t| inner.token_to_id(t))
             .unwrap_or(151_645);
 
         Ok(Self {
