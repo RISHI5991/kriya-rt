@@ -241,6 +241,136 @@ inline void q4_g64_2row_block_dot_distributive(
     acc1 += fma(sum_qx0_r1 + sum_qx1_r1, scale1, (sum_x0 + sum_x1) * bias1);
 }
 
+/// In-register distributive 64-element block dot product computed across FOUR rows simultaneously.
+/// Shares activation vector load and conversion from DRAM across all four rows, cutting activation
+/// DRAM memory bandwidth and instruction overhead by 75% (4x reduction).
+inline void q4_g64_4row_block_dot_distributive(
+    device const BlockQ4Group64& blk0,
+    device const BlockQ4Group64& blk1,
+    device const BlockQ4Group64& blk2,
+    device const BlockQ4Group64& blk3,
+    device const ushort* x_ptr,
+    thread float& acc0,
+    thread float& acc1,
+    thread float& acc2,
+    thread float& acc3
+) {
+    const float scale0 = bf16_to_f32(blk0.scale_bf16);
+    const float bias0  = bf16_to_f32(blk0.bias_bf16);
+    const float scale1 = bf16_to_f32(blk1.scale_bf16);
+    const float bias1  = bf16_to_f32(blk1.bias_bf16);
+    const float scale2 = bf16_to_f32(blk2.scale_bf16);
+    const float bias2  = bf16_to_f32(blk2.bias_bf16);
+    const float scale3 = bf16_to_f32(blk3.scale_bf16);
+    const float bias3  = bf16_to_f32(blk3.bias_bf16);
+
+    device const packed_uint4* qs_vec0 = reinterpret_cast<device const packed_uint4*>(blk0.qs);
+    device const packed_uint4* qs_vec1 = reinterpret_cast<device const packed_uint4*>(blk1.qs);
+    device const packed_uint4* qs_vec2 = reinterpret_cast<device const packed_uint4*>(blk2.qs);
+    device const packed_uint4* qs_vec3 = reinterpret_cast<device const packed_uint4*>(blk3.qs);
+
+    const uint4 vec_lo0 = uint4(qs_vec0[0]);
+    const uint4 vec_hi0 = uint4(qs_vec0[1]);
+    const uint4 vec_lo1 = uint4(qs_vec1[0]);
+    const uint4 vec_hi1 = uint4(qs_vec1[1]);
+    const uint4 vec_lo2 = uint4(qs_vec2[0]);
+    const uint4 vec_hi2 = uint4(qs_vec2[1]);
+    const uint4 vec_lo3 = uint4(qs_vec3[0]);
+    const uint4 vec_hi3 = uint4(qs_vec3[1]);
+
+    float sum_qx0_r0 = 0.0f, sum_qx1_r0 = 0.0f;
+    float sum_qx0_r1 = 0.0f, sum_qx1_r1 = 0.0f;
+    float sum_qx0_r2 = 0.0f, sum_qx1_r2 = 0.0f;
+    float sum_qx0_r3 = 0.0f, sum_qx1_r3 = 0.0f;
+    float sum_x0     = 0.0f;
+    float sum_x1     = 0.0f;
+
+    // Unroll first 16 bytes (32 elements) from vec_lo with 128-bit vectorized activation fetches
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_lo0[w_i];
+        uint word1 = vec_lo1[w_i];
+        uint word2 = vec_lo2[w_i];
+        uint word3 = vec_lo3[w_i];
+        uint x_base = w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            uint byte_val2 = (word2 >> b_shift) & 0xFFu;
+            uint byte_val3 = (word3 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            float q0_2 = float(byte_val2 & 0x0Fu);
+            float q1_2 = float(byte_val2 >> 4u);
+            float q0_3 = float(byte_val3 & 0x0Fu);
+            float q1_3 = float(byte_val3 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_qx0_r2 = fma(q0_2, x0, sum_qx0_r2);
+            sum_qx1_r2 = fma(q1_2, x1, sum_qx1_r2);
+            sum_qx0_r3 = fma(q0_3, x0, sum_qx0_r3);
+            sum_qx1_r3 = fma(q1_3, x1, sum_qx1_r3);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    // Unroll second 16 bytes (32 elements) from vec_hi with 128-bit vectorized activation fetches
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_hi0[w_i];
+        uint word1 = vec_hi1[w_i];
+        uint word2 = vec_hi2[w_i];
+        uint word3 = vec_hi3[w_i];
+        uint x_base = 32u + w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            uint byte_val2 = (word2 >> b_shift) & 0xFFu;
+            uint byte_val3 = (word3 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            float q0_2 = float(byte_val2 & 0x0Fu);
+            float q1_2 = float(byte_val2 >> 4u);
+            float q0_3 = float(byte_val3 & 0x0Fu);
+            float q1_3 = float(byte_val3 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_qx0_r2 = fma(q0_2, x0, sum_qx0_r2);
+            sum_qx1_r2 = fma(q1_2, x1, sum_qx1_r2);
+            sum_qx0_r3 = fma(q0_3, x0, sum_qx0_r3);
+            sum_qx1_r3 = fma(q1_3, x1, sum_qx1_r3);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    acc0 += fma(sum_qx0_r0 + sum_qx1_r0, scale0, (sum_x0 + sum_x1) * bias0);
+    acc1 += fma(sum_qx0_r1 + sum_qx1_r1, scale1, (sum_x0 + sum_x1) * bias1);
+    acc2 += fma(sum_qx0_r2 + sum_qx1_r2, scale2, (sum_x0 + sum_x1) * bias2);
+    acc3 += fma(sum_qx0_r3 + sum_qx1_r3, scale3, (sum_x0 + sum_x1) * bias3);
+}
+
 /// 128-Bit Vector-Coalesced M=1 Decode GEMV Kernel (32 lanes per row).
 kernel void q4_g64_decode_gemv(
     device const BlockQ4Group64* weights   [[buffer(0)]],
@@ -487,6 +617,261 @@ kernel void q4_g64_decode_gemv_accumulate_2row(
     }
 }
 
+/// 4-Row Distributive M=1 Decode GEMV Kernel (64-element blocks).
+/// Each SIMDgroup computes FOUR output rows simultaneously using shared activation loads.
+/// Dispatched with 128 threads/threadgroup (4 SIMDgroups = 16 rows/threadgroup).
+kernel void q4_g64_decode_gemv_4row(
+    device const BlockQ4Group64* weights   [[buffer(0)]],
+    device const ushort*         input_x   [[buffer(1)]], // bf16 [1, K]
+    device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
+    constant GemmParams&         params    [[buffer(3)]],
+    uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint                         simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tgp_pos.x * 16u + simd_id * 4u;
+    const uint row1 = row0 + 1u;
+    const uint row2 = row0 + 2u;
+    const uint row3 = row0 + 3u;
+    if (row0 >= params.N) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+    const bool has_row1 = (row1 < params.N);
+    const bool has_row2 = (row2 < params.N);
+    const bool has_row3 = (row3 < params.N);
+    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
+    device const BlockQ4Group64* row2_blocks = has_row2 ? weights + (row2 * num_blocks) : row0_blocks;
+    device const BlockQ4Group64* row3_blocks = has_row3 ? weights + (row3 * num_blocks) : row0_blocks;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    if (has_row3) {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_4row_block_dot_distributive(
+                row0_blocks[blk_idx],
+                row1_blocks[blk_idx],
+                row2_blocks[blk_idx],
+                row3_blocks[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc0, acc1, acc2, acc3
+            );
+        }
+    } else {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            device const ushort* x_p = input_x + (blk_idx * 64u);
+            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], x_p);
+            if (has_row1) acc1 += q4_g64_block_dot_distributive(row1_blocks[blk_idx], x_p);
+            if (has_row2) acc2 += q4_g64_block_dot_distributive(row2_blocks[blk_idx], x_p);
+        }
+    }
+
+    float res0 = simd_sum(acc0);
+    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+    float res2 = has_row2 ? simd_sum(acc2) : 0.0f;
+    float res3 = has_row3 ? simd_sum(acc3) : 0.0f;
+
+    if (simd_lane == 0u) {
+        output_y[row0] = f32_to_bf16(res0);
+        if (has_row1) output_y[row1] = f32_to_bf16(res1);
+        if (has_row2) output_y[row2] = f32_to_bf16(res2);
+        if (has_row3) output_y[row3] = f32_to_bf16(res3);
+    }
+}
+
+/// 4-Row Fused Decode GEMV + Residual Accumulate Kernel (M = 1).
+/// Each SIMDgroup computes FOUR output rows simultaneously using shared activation loads
+/// and adds directly into residual_inout in registers.
+kernel void q4_g64_decode_gemv_accumulate_4row(
+    device const BlockQ4Group64* weights        [[buffer(0)]],
+    device const ushort*         input_x        [[buffer(1)]], // bf16 [1, K]
+    device ushort*               residual_inout [[buffer(2)]], // bf16 [1, N]
+    constant GemmParams&         params         [[buffer(3)]],
+    uint3                        tgp_pos        [[threadgroup_position_in_grid]],
+    uint                         simd_id        [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane      [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tgp_pos.x * 16u + simd_id * 4u;
+    const uint row1 = row0 + 1u;
+    const uint row2 = row0 + 2u;
+    const uint row3 = row0 + 3u;
+    if (row0 >= params.N) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+    const bool has_row1 = (row1 < params.N);
+    const bool has_row2 = (row2 < params.N);
+    const bool has_row3 = (row3 < params.N);
+    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
+    device const BlockQ4Group64* row2_blocks = has_row2 ? weights + (row2 * num_blocks) : row0_blocks;
+    device const BlockQ4Group64* row3_blocks = has_row3 ? weights + (row3 * num_blocks) : row0_blocks;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    if (has_row3) {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_4row_block_dot_distributive(
+                row0_blocks[blk_idx],
+                row1_blocks[blk_idx],
+                row2_blocks[blk_idx],
+                row3_blocks[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc0, acc1, acc2, acc3
+            );
+        }
+    } else {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            device const ushort* x_p = input_x + (blk_idx * 64u);
+            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], x_p);
+            if (has_row1) acc1 += q4_g64_block_dot_distributive(row1_blocks[blk_idx], x_p);
+            if (has_row2) acc2 += q4_g64_block_dot_distributive(row2_blocks[blk_idx], x_p);
+        }
+    }
+
+    float res0 = simd_sum(acc0);
+    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+    float res2 = has_row2 ? simd_sum(acc2) : 0.0f;
+    float res3 = has_row3 ? simd_sum(acc3) : 0.0f;
+
+    if (simd_lane == 0u) {
+        float r0 = bf16_to_f32(residual_inout[row0]);
+        residual_inout[row0] = f32_to_bf16(res0 + r0);
+        if (has_row1) {
+            float r1 = bf16_to_f32(residual_inout[row1]);
+            residual_inout[row1] = f32_to_bf16(res1 + r1);
+        }
+        if (has_row2) {
+            float r2 = bf16_to_f32(residual_inout[row2]);
+            residual_inout[row2] = f32_to_bf16(res2 + r2);
+        }
+        if (has_row3) {
+            float r3 = bf16_to_f32(residual_inout[row3]);
+            residual_inout[row3] = f32_to_bf16(res3 + r3);
+        }
+    }
+}
+
+/// Helper struct capturing QKV row metadata for multi-row decode GEMV.
+struct QkvRowMeta {
+    device const BlockQ4Group64* row_blocks;
+    device ushort* out_ptr;
+    uint out_idx;
+    device const ushort* bias_ptr;
+};
+
+inline QkvRowMeta get_qkv_row_meta(
+    uint row_idx,
+    constant QkvGemmParams& params,
+    device const BlockQ4Group64* q_weights,
+    device const BlockQ4Group64* k_weights,
+    device const BlockQ4Group64* v_weights,
+    device ushort* q_out,
+    device ushort* k_out,
+    device ushort* v_out,
+    device const ushort* q_bias,
+    device const ushort* k_bias,
+    device const ushort* v_bias
+) {
+    QkvRowMeta meta;
+    if (row_idx < params.q_dim) {
+        meta.row_blocks = q_weights + (row_idx * params.num_k_blocks);
+        meta.out_ptr = q_out;
+        meta.out_idx = row_idx;
+        meta.bias_ptr = (params.has_bias != 0u) ? (q_bias + row_idx) : nullptr;
+    } else if (row_idx < params.q_dim + params.k_dim) {
+        uint k_idx = row_idx - params.q_dim;
+        meta.row_blocks = k_weights + (k_idx * params.num_k_blocks);
+        meta.out_ptr = k_out;
+        meta.out_idx = k_idx;
+        meta.bias_ptr = (params.has_bias != 0u) ? (k_bias + k_idx) : nullptr;
+    } else {
+        uint v_idx = row_idx - (params.q_dim + params.k_dim);
+        meta.row_blocks = v_weights + (v_idx * params.num_k_blocks);
+        meta.out_ptr = v_out;
+        meta.out_idx = v_idx;
+        meta.bias_ptr = (params.has_bias != 0u) ? (v_bias + v_idx) : nullptr;
+    }
+    return meta;
+}
+
+/// 2-Row Distributive Fused QKV Decode GEMV Kernel (M = 1).
+/// Each SIMDgroup computes TWO output rows simultaneously using shared activation vector loads,
+/// cutting activation DRAM memory traffic and instruction overhead by 50%.
+kernel void q4_g64_decode_qkv_gemv_2row(
+    device const BlockQ4Group64* q_weights [[buffer(0)]],
+    device const BlockQ4Group64* k_weights [[buffer(1)]],
+    device const BlockQ4Group64* v_weights [[buffer(2)]],
+    device const ushort*         input_x   [[buffer(3)]], // bf16 [1, K]
+    device ushort*               q_out     [[buffer(4)]], // bf16 [1, q_dim]
+    device ushort*               k_out     [[buffer(5)]], // bf16 [1, k_dim]
+    device ushort*               v_out     [[buffer(6)]], // bf16 [1, v_dim]
+    device const ushort*         q_bias    [[buffer(7)]], // bf16 [q_dim]
+    device const ushort*         k_bias    [[buffer(8)]], // bf16 [k_dim]
+    device const ushort*         v_bias    [[buffer(9)]], // bf16 [v_dim]
+    constant QkvGemmParams&      params    [[buffer(10)]],
+    uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint                         simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane [[thread_index_in_simdgroup]]
+) {
+    const uint total_rows = params.q_dim + params.k_dim + params.v_dim;
+    const uint row0 = tgp_pos.x * 8u + simd_id * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= total_rows) {
+        return;
+    }
+
+    QkvRowMeta meta0 = get_qkv_row_meta(
+        row0, params, q_weights, k_weights, v_weights,
+        q_out, k_out, v_out, q_bias, k_bias, v_bias
+    );
+    const bool has_row1 = (row1 < total_rows);
+    QkvRowMeta meta1 = has_row1 ? get_qkv_row_meta(
+        row1, params, q_weights, k_weights, v_weights,
+        q_out, k_out, v_out, q_bias, k_bias, v_bias
+    ) : meta0;
+
+    const uint num_blocks = params.num_k_blocks;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (has_row1) {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_2row_block_dot_distributive(
+                meta0.row_blocks[blk_idx],
+                meta1.row_blocks[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc0,
+                acc1
+            );
+        }
+    } else {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc0 += q4_g64_block_dot_distributive(meta0.row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+    }
+
+    float res0 = simd_sum(acc0);
+    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+    if (simd_lane == 0u) {
+        if (meta0.bias_ptr != nullptr) {
+            res0 += bf16_to_f32(*meta0.bias_ptr);
+        }
+        meta0.out_ptr[meta0.out_idx] = f32_to_bf16(res0);
+
+        if (has_row1) {
+            if (meta1.bias_ptr != nullptr) {
+                res1 += bf16_to_f32(*meta1.bias_ptr);
+            }
+            meta1.out_ptr[meta1.out_idx] = f32_to_bf16(res1);
+        }
+    }
+}
+
 /// Fused QKV Decode GEMV Kernel (M=1, 32 lanes per row).
 /// Projects input_x into Q, K, and V buffers in a SINGLE compute dispatch,
 /// directly incorporating optional learned QKV bias in registers before unified memory store.
@@ -727,6 +1112,94 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv(
             act_g = max(g, 0.0f);
         }
         mlp_out[row_idx] = f32_to_bf16(act_g * u);
+    }
+}
+
+/// 2-Channel Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 4 rows per SIMDgroup).
+/// Concurrently computes Gate and Up projections for TWO intermediate channels in registers
+/// using 4-row distributive dot product, cutting activation DRAM bandwidth by 75%.
+/// Eliminates intermediate DRAM writes and reads for both gate and up channels.
+kernel void q4_g64_decode_gate_up_swiglu_gemv_2chan(
+    device const BlockQ4Group64* gate_weights [[buffer(0)]],
+    device const BlockQ4Group64* up_weights   [[buffer(1)]],
+    device const ushort*         input_x      [[buffer(2)]], // bf16 [1, K]
+    device ushort*               mlp_out      [[buffer(3)]], // bf16 [1, intermediate_size]
+    constant GateUpSwigluGemmParams& params   [[buffer(4)]],
+    uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint                         simd_id      [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane    [[thread_index_in_simdgroup]]
+) {
+    const uint chan0 = tgp_pos.x * 8u + simd_id * 2u;
+    const uint chan1 = chan0 + 1u;
+    if (chan0 >= params.intermediate_size) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* gate_row0 = gate_weights + (chan0 * num_blocks);
+    device const BlockQ4Group64* up_row0   = up_weights   + (chan0 * num_blocks);
+    const bool has_chan1 = (chan1 < params.intermediate_size);
+    device const BlockQ4Group64* gate_row1 = has_chan1 ? gate_weights + (chan1 * num_blocks) : gate_row0;
+    device const BlockQ4Group64* up_row1   = has_chan1 ? up_weights   + (chan1 * num_blocks) : up_row0;
+
+    float acc_gate0 = 0.0f, acc_up0 = 0.0f;
+    float acc_gate1 = 0.0f, acc_up1 = 0.0f;
+
+    if (has_chan1) {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_4row_block_dot_distributive(
+                gate_row0[blk_idx],
+                up_row0[blk_idx],
+                gate_row1[blk_idx],
+                up_row1[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc_gate0, acc_up0, acc_gate1, acc_up1
+            );
+        }
+    } else {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_2row_block_dot_distributive(
+                gate_row0[blk_idx],
+                up_row0[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc_gate0, acc_up0
+            );
+        }
+    }
+
+    float g0 = simd_sum(acc_gate0);
+    float u0 = simd_sum(acc_up0);
+    float g1 = has_chan1 ? simd_sum(acc_gate1) : 0.0f;
+    float u1 = has_chan1 ? simd_sum(acc_up1) : 0.0f;
+
+    if (simd_lane == 0u) {
+        // Channel 0 activation
+        float act_g0 = 0.0f;
+        if (params.activation_variant == 0u) {
+            act_g0 = g0 / (1.0f + exp(-g0));
+        } else if (params.activation_variant == 1u) {
+            constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+            float cubic = fma(0.044715f * g0, g0 * g0, g0);
+            act_g0 = 0.5f * g0 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+        } else {
+            act_g0 = max(g0, 0.0f);
+        }
+        mlp_out[chan0] = f32_to_bf16(act_g0 * u0);
+
+        // Channel 1 activation
+        if (has_chan1) {
+            float act_g1 = 0.0f;
+            if (params.activation_variant == 0u) {
+                act_g1 = g1 / (1.0f + exp(-g1));
+            } else if (params.activation_variant == 1u) {
+                constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+                float cubic = fma(0.044715f * g1, g1 * g1, g1);
+                act_g1 = 0.5f * g1 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+            } else {
+                act_g1 = max(g1, 0.0f);
+            }
+            mlp_out[chan1] = f32_to_bf16(act_g1 * u1);
+        }
     }
 }
 
