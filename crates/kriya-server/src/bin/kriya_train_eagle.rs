@@ -68,35 +68,52 @@ fn update_manifest(manifest_path: &Path, draft_file_name: &str, byte_len: u64, s
     }
 }
 
+fn find_arg<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| flags.contains(&w[0].as_str()))
+        .map(|w| w[1].as_str())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "kriya_train_eagle 0.1.0\n\
+             Pure-Rust Native EAGLE Speculative Draft Head Trainer\n\n\
+             Usage: kriya_train_eagle --model <model_dir> [--steps <num_steps>] [--lr <learning_rate>] [--out <output_path>]\n\n\
+             Options:\n  \
+               --model, --input   Target model directory containing config.json and weights\n  \
+               --steps            Training steps (default: 200)\n  \
+               --lr               Learning rate (default: 1e-3)\n  \
+               --out              Output draft artifact path (default: <model_dir>/kriya_eagle_draft_v1.bin)\n  \
+               --version, -V      Print version and exit\n  \
+               --help, -h         Print this help message and exit"
+        );
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("kriya_train_eagle 0.1.0");
+        std::process::exit(0);
+    }
 
-    let model_dir = args
-        .windows(2)
-        .find(|w| w[0] == "--model" || w[0] == "--input")
-        .map(|w| PathBuf::from(&w[1]))
+    let model_dir = find_arg(&args, &["--model", "--input"])
+        .map(PathBuf::from)
         .unwrap_or_else(|| {
             eprintln!("Usage: kriya_train_eagle --model <model_dir> [--steps <num_steps>] [--lr <learning_rate>] [--out <output_path>]");
             std::process::exit(2);
         });
 
-    let steps = args
-        .windows(2)
-        .find(|w| w[0] == "--steps")
-        .and_then(|w| w[1].parse::<usize>().ok())
+    let steps = find_arg(&args, &["--steps"])
+        .and_then(|w| w.parse::<usize>().ok())
         .unwrap_or(200);
 
-    let lr = args
-        .windows(2)
-        .find(|w| w[0] == "--lr")
-        .and_then(|w| w[1].parse::<f32>().ok())
+    let lr = find_arg(&args, &["--lr"])
+        .and_then(|w| w.parse::<f32>().ok())
         .unwrap_or(1e-3);
 
-    let output_path = args
-        .windows(2)
-        .find(|w| w[0] == "--out")
-        .map(|w| PathBuf::from(&w[1]))
+    let output_path = find_arg(&args, &["--out"])
+        .map(PathBuf::from)
         .unwrap_or_else(|| model_dir.join("kriya_eagle_draft_v1.bin"));
 
     println!(

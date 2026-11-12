@@ -21,9 +21,7 @@ use kriya_kv::bsr_paged::{CtaWorkTile, FlashInferSchedulePlan};
 use metal::*;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Notify;
 
 /// Maximum layers per command buffer chunk to avoid macOS command-buffer
 /// watchdog timeout (~5-9s on Apple Silicon). Deep models (42+ layers) must
@@ -50,6 +48,8 @@ pub enum MetalError {
     UnsupportedProductionConfiguration(String),
     #[error("invalid execution input: {0}")]
     InvalidExecutionInput(String),
+    #[error("Metal GPU command buffer execution error: {0}")]
+    ExecutionError(String),
 }
 
 // ============================================================================
@@ -598,6 +598,95 @@ impl ModelGpuWeights {
         }
     }
 
+    fn bind_q4_buffer(
+        loader: &ShardedCheckpointLoader,
+        device: &Device,
+        prefix: &str,
+        expected_shape: Option<&[usize]>,
+    ) -> Result<Option<Buffer>, MetalError> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let direct_key = format!("{prefix}.weight");
+        for key in [&direct_key[..], prefix] {
+            if let Ok(raw_bytes) = loader.get_tensor_bytes(key)
+                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && loader
+                    .get_tensor_bytes(&format!("{prefix}.scales"))
+                    .is_err()
+            {
+                return Ok(Some(device.new_buffer_with_data(
+                    raw_bytes.as_ptr() as *const _,
+                    raw_bytes.len() as u64,
+                    shared,
+                )));
+            }
+        }
+
+        // Path B: MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
+        match loader.pack_mlx_affine_q4_group64(prefix) {
+            Ok(blocks) => {
+                if let Some(expected_shape) = expected_shape {
+                    let expected_blocks = expected_shape[0] * expected_shape[1].div_ceil(64);
+                    if blocks.len() != expected_blocks {
+                        return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                            "Packed blocks length {} does not match expected {} for tensor '{prefix}'",
+                            blocks.len(),
+                            expected_blocks
+                        )));
+                    }
+                }
+                Ok(Some(device.new_buffer_with_data(
+                    blocks.as_ptr() as *const _,
+                    (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
+                    shared,
+                )))
+            }
+            Err(err) => {
+                if expected_shape.is_some() {
+                    Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "Production required tensor '{prefix}' failed to load or pack: {err}"
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    fn bind_bf16_buffer(
+        loader: &ShardedCheckpointLoader,
+        device: &Device,
+        name: &str,
+        expected_len: Option<usize>,
+    ) -> Result<Option<Buffer>, MetalError> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let view = match loader.get_tensor(name) {
+            Ok(v) => v,
+            Err(err) => {
+                return if expected_len.is_some() {
+                    Err(MetalError::UnsupportedProductionConfiguration(format!(
+                        "Production required norm tensor '{name}' missing: {err}"
+                    )))
+                } else {
+                    Ok(None)
+                };
+            }
+        };
+        if let Some(expected_len) = expected_len
+            && view.descriptor.shape != [expected_len]
+        {
+            return Err(MetalError::UnsupportedProductionConfiguration(format!(
+                "Tensor '{name}' shape {:?} does not match expected [{expected_len}]",
+                view.descriptor.shape
+            )));
+        }
+        let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
+        Ok(Some(device.new_buffer_with_data(
+            bf16_bytes.as_ptr() as *const _,
+            bf16_bytes.len() as u64,
+            shared,
+        )))
+    }
+
     /// Strictly loads real `.safetensors` / MLX 4-bit weights from a local checkpoint directory
     /// for production serving or benchmarking. Fails closed with an error if ANY required
     /// tensor, scale, or bias fails to load or pack. Zero synthetic fallback is allocated.
@@ -615,71 +704,15 @@ impl ModelGpuWeights {
         let vocab = desc.vocab_size as usize;
 
         let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
-            let direct_key = format!("{prefix}.weight");
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Ok(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Ok(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-
-            // Path B: MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
-            let blocks = loader.pack_mlx_affine_q4_group64(prefix).map_err(|err| {
-                MetalError::UnsupportedProductionConfiguration(format!(
-                    "Production required tensor '{prefix}' failed to load or pack: {err}"
-                ))
-            })?;
-            let expected_blocks = expected_shape[0] * expected_shape[1].div_ceil(64);
-            if blocks.len() != expected_blocks {
-                return Err(MetalError::UnsupportedProductionConfiguration(format!(
-                    "Packed blocks length {} does not match expected {} for tensor '{prefix}'",
-                    blocks.len(),
-                    expected_blocks
-                )));
-            }
-            Ok(device.new_buffer_with_data(
-                blocks.as_ptr() as *const _,
-                (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
-                shared,
-            ))
+            Self::bind_q4_buffer(&loader, device, prefix, Some(expected_shape))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {prefix}"))
+            })
         };
 
         let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
-            let view = loader.get_tensor(name).map_err(|err| {
-                MetalError::UnsupportedProductionConfiguration(format!(
-                    "Production required norm tensor '{name}' missing: {err}"
-                ))
-            })?;
-            if view.descriptor.shape != [expected_len] {
-                return Err(MetalError::UnsupportedProductionConfiguration(format!(
-                    "Tensor '{name}' shape {:?} does not match expected [{expected_len}]",
-                    view.descriptor.shape
-                )));
-            }
-            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
-            Ok(device.new_buffer_with_data(
-                bf16_bytes.as_ptr() as *const _,
-                bf16_bytes.len() as u64,
-                shared,
-            ))
+            Self::bind_bf16_buffer(&loader, device, name, Some(expected_len))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {name}"))
+            })
         };
 
         let embed_tokens = bind_q4("model.embed_tokens", &[vocab, h])?;
@@ -819,53 +852,17 @@ impl ModelGpuWeights {
     ) -> Result<Self, MetalError> {
         let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
         let mut weights = Self::allocate_for_descriptor(device, desc);
-        let shared = MTLResourceOptions::StorageModeShared;
 
         let try_bind_q4 = |prefix: &str| -> Option<Buffer> {
-            // Path A: Try binding a unified `Q4_G64` tensor produced by `kriya_convert`
-            let direct_key = format!("{prefix}.weight");
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(&direct_key)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Some(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-            if let Ok(raw_bytes) = loader.get_tensor_bytes(prefix)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                && loader
-                    .get_tensor_bytes(&format!("{prefix}.scales"))
-                    .is_err()
-            {
-                return Some(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
-                ));
-            }
-
-            // Path B: Fall back to MLX 3-tensor triplet repacking (`.weight`, `.scales`, `.biases`)
-            let blocks = loader.pack_mlx_affine_q4_group64(prefix).ok()?;
-            Some(device.new_buffer_with_data(
-                blocks.as_ptr() as *const _,
-                (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
-                shared,
-            ))
+            Self::bind_q4_buffer(&loader, device, prefix, None)
+                .ok()
+                .flatten()
         };
 
         let try_bind_bf16 = |name: &str| -> Option<Buffer> {
-            let view = loader.get_tensor(name).ok()?;
-            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view).ok()?;
-            Some(device.new_buffer_with_data(
-                bf16_bytes.as_ptr() as *const _,
-                bf16_bytes.len() as u64,
-                shared,
-            ))
+            Self::bind_bf16_buffer(&loader, device, name, None)
+                .ok()
+                .flatten()
         };
 
         if let Some(buf) = try_bind_q4("model.embed_tokens") {
@@ -882,36 +879,65 @@ impl ModelGpuWeights {
 
         for (idx, layer_bufs) in weights.layers.iter_mut().enumerate() {
             let p = format!("model.layers.{idx}");
-            if let Some(b) = try_bind_bf16(&format!("{p}.input_layernorm.weight")) {
-                layer_bufs.attn_norm = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.q_proj")) {
-                layer_bufs.q_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.k_proj")) {
-                layer_bufs.k_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.v_proj")) {
-                layer_bufs.v_proj = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.q_proj.bias")) {
-                layer_bufs.q_bias = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.k_proj.bias")) {
-                layer_bufs.k_bias = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.v_proj.bias")) {
-                layer_bufs.v_bias = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.self_attn.o_proj")) {
-                layer_bufs.o_proj = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.q_norm.weight")) {
-                layer_bufs.q_norm = b;
-            }
-            if let Some(b) = try_bind_bf16(&format!("{p}.self_attn.k_norm.weight")) {
-                layer_bufs.k_norm = b;
-            }
+            let update = |buf: &mut Buffer, key: &str, is_q4: bool| {
+                if let Some(b) = if is_q4 {
+                    try_bind_q4(key)
+                } else {
+                    try_bind_bf16(key)
+                } {
+                    *buf = b;
+                }
+            };
+            update(
+                &mut layer_bufs.attn_norm,
+                &format!("{p}.input_layernorm.weight"),
+                false,
+            );
+            update(
+                &mut layer_bufs.q_proj,
+                &format!("{p}.self_attn.q_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.k_proj,
+                &format!("{p}.self_attn.k_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.v_proj,
+                &format!("{p}.self_attn.v_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.q_bias,
+                &format!("{p}.self_attn.q_proj.bias"),
+                false,
+            );
+            update(
+                &mut layer_bufs.k_bias,
+                &format!("{p}.self_attn.k_proj.bias"),
+                false,
+            );
+            update(
+                &mut layer_bufs.v_bias,
+                &format!("{p}.self_attn.v_proj.bias"),
+                false,
+            );
+            update(
+                &mut layer_bufs.o_proj,
+                &format!("{p}.self_attn.o_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.q_norm,
+                &format!("{p}.self_attn.q_norm.weight"),
+                false,
+            );
+            update(
+                &mut layer_bufs.k_norm,
+                &format!("{p}.self_attn.k_norm.weight"),
+                false,
+            );
             if let Some(pre_ffn) = try_bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight")) {
                 layer_bufs.ffn_norm = pre_ffn;
                 layer_bufs.post_attn_norm =
@@ -923,18 +949,22 @@ impl ModelGpuWeights {
                 layer_bufs.post_attn_norm = None;
                 layer_bufs.post_ffn_norm = None;
             }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.gate_proj")) {
-                layer_bufs.gate_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.up_proj")) {
-                layer_bufs.up_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.down_proj")) {
-                layer_bufs.down_proj = b;
-            }
-            if let Some(b) = try_bind_q4(&format!("{p}.mlp.gate")) {
-                layer_bufs.moe_router_gate = b;
-            }
+            update(
+                &mut layer_bufs.gate_proj,
+                &format!("{p}.mlp.gate_proj"),
+                true,
+            );
+            update(&mut layer_bufs.up_proj, &format!("{p}.mlp.up_proj"), true);
+            update(
+                &mut layer_bufs.down_proj,
+                &format!("{p}.mlp.down_proj"),
+                true,
+            );
+            update(
+                &mut layer_bufs.moe_router_gate,
+                &format!("{p}.mlp.gate"),
+                true,
+            );
         }
 
         Ok(weights)
@@ -1261,12 +1291,6 @@ pub struct MetalExecutor {
     /// committed to the KV cache without re-running the full forward pass.
     pub tree_k_buf: Buffer,
     pub tree_v_buf: Buffer,
-    /// Shared event for GPU completion signaling (async pipeline).
-    /// Eliminates CPU stall from wait_until_completed() by allowing
-    /// the CPU to continue scheduling while the GPU executes.
-    pub shared_event: SharedEvent,
-    /// Signal value counter for tracking command buffer completion.
-    pub signal_value: u64,
     /// Ping-pong scratch toggle for double-buffered CPU/GPU overlap.
     /// Iteration N encodes into scratch[idx], iteration N+1 encodes into scratch[idx^1].
     pub scratch_ping_pong_idx: u32,
@@ -1322,7 +1346,6 @@ impl MetalExecutor {
             MetalError::DeviceInitFailed("No Apple Silicon Metal GPU found".into())
         })?;
         let command_queue = device.new_command_queue();
-        let shared_event = device.new_shared_event();
         let mut pipeline_cache = MetalPipelineCache::from_shader_dir(device.clone(), shader_dir)?;
 
         for kernel in [
@@ -1516,9 +1539,6 @@ impl MetalExecutor {
             // Layout: [num_layers, max_tree_nodes, max_q_dim] in BF16
             tree_k_buf: alloc(num_layers * 16 * max_q_dim * 2),
             tree_v_buf: alloc(num_layers * 16 * max_q_dim * 2),
-            // Shared event for async GPU completion signaling
-            shared_event,
-            signal_value: 0,
             scratch_ping_pong_idx: 0,
             // Ping-pong scratch buffers (double-buffer for CPU/GPU overlap)
             residual_buf_ping: alloc(max_batch_toks * h * 2),
@@ -1540,25 +1560,47 @@ impl MetalExecutor {
 
     /// Waits for a submitted Metal command buffer to complete asynchronously.
     ///
-    /// Replaces the CPU spin-yield busy-wait that pinned a core at 100%, caused
-    /// thermal throttling on M-series Macs, and stole memory bandwidth from the GPU.
-    /// Uses `MTLCommandBuffer.addCompletedHandler` with a `tokio::sync::Notify` so
-    /// the async worker loop can yield control back to Tokio while the GPU executes.
-    pub async fn wait_for_gpu(&self, signal_value: u64) -> Result<(), MetalError> {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = Arc::clone(&notify);
-        let shared_event = self.shared_event.clone();
-        let sv = signal_value;
+    /// Uses cooperative hybrid spin-polling and Tokio task yielding without spawning
+    /// OS pthreads on every wait, eliminating thread creation latency while
+    /// avoiding CPU starvation and thermal throttling.
+    pub async fn wait_for_gpu(&self, cmd_buf: &CommandBufferRef) -> Result<(), MetalError> {
+        if cmd_buf.status() == MTLCommandBufferStatus::Completed {
+            return Ok(());
+        }
+        if cmd_buf.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalError::ExecutionError(
+                "Metal command buffer failed".into(),
+            ));
+        }
 
-        // Poller thread waits on the GPU signal so the Tokio task can yield control.
-        // This avoids the 100% CPU spin-yield that caused thermal throttling.
-        std::thread::spawn(move || {
-            while shared_event.signaled_value() < sv {
+        // Fast path: quick hybrid spin for immediate GPU completions (sub-microsecond)
+        for _ in 0..1000 {
+            if cmd_buf.status() == MTLCommandBufferStatus::Completed {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+
+        // Async non-blocking polling: yield to Tokio runtime without spawning OS threads
+        let mut yields = 0u32;
+        while cmd_buf.status() != MTLCommandBufferStatus::Completed {
+            if cmd_buf.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalError::ExecutionError(
+                    "Metal command buffer failed".into(),
+                ));
+            }
+            for _ in 0..128 {
+                if cmd_buf.status() == MTLCommandBufferStatus::Completed {
+                    return Ok(());
+                }
                 std::hint::spin_loop();
             }
-            notify_clone.notify_one();
-        });
-        notify.notified().await;
+            yields = yields.saturating_add(1);
+            if yields % 16 == 0 {
+                std::thread::yield_now();
+            }
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 
@@ -2033,31 +2075,62 @@ impl MetalExecutor {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn encode_bias_add(
+    #[allow(clippy::too_many_arguments)]
+    fn encode_dense_mlp(
         pipeline_cache: &mut MetalPipelineCache,
         encoder: &ComputeCommandEncoderRef,
-        values: &Buffer,
-        bias: &Buffer,
+        lw: &LayerGpuBuffers,
+        norm_out_buf: &Buffer,
+        gate_buf: &Buffer,
+        up_buf: &Buffer,
+        mlp_hidden_buf: &Buffer,
+        residual_buf: &Buffer,
+        proj_out_buf: &Buffer,
         num_tokens: u32,
         hidden_size: u32,
+        intermediate_size: u32,
+        activation: ActivationVariant,
     ) -> Result<(), MetalError> {
-        let pso = pipeline_cache.get_or_compile("add_bias_bf16")?;
-        let shape = [num_tokens, hidden_size];
-        encoder.set_compute_pipeline_state(&pso);
-        encoder.set_buffer(0, Some(values), 0);
-        encoder.set_buffer(1, Some(bias), 0);
-        encoder.set_bytes(
-            2,
-            std::mem::size_of_val(&shape) as u64,
-            shape.as_ptr() as *const _,
-        );
-        let elements = num_tokens.saturating_mul(hidden_size);
-        encoder.dispatch_thread_groups(
-            MTLSize::new(elements.div_ceil(256) as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-        Ok(())
+        Self::encode_fused_gate_up(
+            pipeline_cache,
+            encoder,
+            &lw.gate_proj,
+            &lw.up_proj,
+            norm_out_buf,
+            0,
+            gate_buf,
+            up_buf,
+            mlp_hidden_buf,
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            activation,
+        )?;
+
+        if lw.post_ffn_norm.is_none() && num_tokens == 1 {
+            Self::encode_q4_linear_accumulate(
+                pipeline_cache,
+                encoder,
+                &lw.down_proj,
+                mlp_hidden_buf,
+                0,
+                residual_buf,
+                hidden_size,
+                intermediate_size,
+            )
+        } else {
+            Self::encode_q4_linear(
+                pipeline_cache,
+                encoder,
+                &lw.down_proj,
+                mlp_hidden_buf,
+                0,
+                proj_out_buf,
+                num_tokens,
+                hidden_size,
+                intermediate_size,
+            )
+        }
     }
 
     /// Reads the normalized hidden state vector (`[hidden_size]` in f32) from unified memory
@@ -2158,10 +2231,8 @@ impl MetalExecutor {
             let is_last_layer = l_idx + 1 == num_layers;
             if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
+                self.wait_for_gpu(cmd_buf).await?;
                 cmd_buf = self.command_queue.new_command_buffer();
                 enc = cmd_buf.new_compute_command_encoder();
                 layers_in_chunk = 0;
@@ -2323,8 +2394,8 @@ impl MetalExecutor {
             }
         }
 
-        let mut cmd_buf = self.command_queue.new_command_buffer();
-        let mut enc = cmd_buf.new_compute_command_encoder();
+        let cmd_buf = self.command_queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
 
         // 1. Token Embedding Lookup for all tree nodes
         {
@@ -2353,9 +2424,6 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer layers (tree mode — no KV cache writes)
-        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
-        let mut layers_in_chunk = 0usize;
-        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -2631,65 +2699,20 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    Self::encode_q4_linear(
+                    Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.gate_proj,
+                        lw,
                         &self.norm_out_buf,
-                        0,
                         &self.gate_buf,
-                        num_tree_nodes as u32,
-                        intermediate_size,
-                        h as u32,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.up_proj,
-                        &self.norm_out_buf,
-                        0,
                         &self.up_buf,
-                        num_tree_nodes as u32,
-                        intermediate_size,
-                        h as u32,
-                    )?;
-
-                    let pso = self
-                        .pipeline_cache
-                        .get_or_compile("fused_gated_activation_bf16")?;
-                    let total_inter = num_tree_nodes * intermediate_size as usize;
-                    let act_params = ActivationParams {
-                        num_elements: total_inter as u32,
-                        variant: match activation {
-                            ActivationVariant::SwiGLU => 0,
-                            ActivationVariant::GeGLU => 1,
-                            ActivationVariant::ReLU => 2,
-                        },
-                    };
-                    enc.set_compute_pipeline_state(&pso);
-                    enc.set_buffer(0, Some(&self.gate_buf), 0);
-                    enc.set_buffer(1, Some(&self.up_buf), 0);
-                    enc.set_buffer(2, Some(&self.mlp_hidden_buf), 0);
-                    enc.set_bytes(
-                        3,
-                        std::mem::size_of::<ActivationParams>() as u64,
-                        &act_params as *const _ as *const _,
-                    );
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(total_inter.div_ceil(256) as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.down_proj,
                         &self.mlp_hidden_buf,
-                        0,
+                        &self.residual_buf,
                         &self.proj_out_buf,
                         num_tree_nodes as u32,
                         h as u32,
                         intermediate_size,
+                        activation,
                     )?;
                 }
                 ChannelMixerDescriptor::SparseMoE { .. } => {
@@ -2728,23 +2751,9 @@ impl MetalExecutor {
                     h as u32,
                 )?;
             }
-
-            layers_in_chunk += 1;
-            let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
-                enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-                cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-                layers_in_chunk = 0;
-            }
         }
 
         // 3. Final RMSNorm (per tree node) — output in norm_out_buf.
-        //    Read back hidden states HERE (before LM Head overwrites norm_out_buf).
         Self::encode_rmsnorm(
             &mut self.pipeline_cache,
             enc,
@@ -2756,18 +2765,6 @@ impl MetalExecutor {
             h as u32,
             &descriptor.final_norm,
         )?;
-
-        // Read back hidden states per tree node (BF16 -> F32).
-        // These are the ACTUAL target model hidden states — needed for correct EAGLE acceptance.
-        let hidden_data =
-            self.read_u16_slice_as_f32_from_buffer(&self.norm_out_buf, 0, num_tree_nodes * h);
-        let mut target_features = Vec::with_capacity(num_tree_nodes);
-        for node in 0..num_tree_nodes {
-            let start = node * h;
-            let end = start + h;
-            let node_feat: Vec<f32> = hidden_data[start..end].to_vec();
-            target_features.push(node_feat);
-        }
 
         // 4. LM Head Projection -> logits per tree node (writes to temp buffer)
         Self::encode_q4_linear(
@@ -2783,10 +2780,20 @@ impl MetalExecutor {
         )?;
 
         enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        self.wait_for_gpu(self.signal_value).await?;
+        self.wait_for_gpu(cmd_buf).await?;
+
+        // Read back hidden states per tree node (BF16 -> F32) after GPU execution.
+        // These are the ACTUAL target model hidden states — needed for correct EAGLE acceptance.
+        let hidden_data =
+            self.read_u16_slice_as_f32_from_buffer(&self.norm_out_buf, 0, num_tree_nodes * h);
+        let mut target_features = Vec::with_capacity(num_tree_nodes);
+        for node in 0..num_tree_nodes {
+            let start = node * h;
+            let end = start + h;
+            let node_feat: Vec<f32> = hidden_data[start..end].to_vec();
+            target_features.push(node_feat);
+        }
 
         // Read back logits for all tree nodes (BF16 -> F32)
         let logits_data =
@@ -3280,47 +3287,21 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    // Fused Gate+Up (+ In-Register Activation for M >= 64)
-                    Self::encode_fused_gate_up(
+                    Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.gate_proj,
-                        &lw.up_proj,
+                        lw,
                         &self.norm_out_buf,
-                        0,
                         &self.gate_buf,
                         &self.up_buf,
                         &self.mlp_hidden_buf,
+                        &self.residual_buf,
+                        &self.proj_out_buf,
                         num_tokens,
                         h,
                         intermediate_size,
                         activation,
                     )?;
-
-                    if lw.post_ffn_norm.is_none() && num_tokens == 1 {
-                        Self::encode_q4_linear_accumulate(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.residual_buf,
-                            h,
-                            intermediate_size,
-                        )?;
-                    } else {
-                        Self::encode_q4_linear(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.proj_out_buf,
-                            num_tokens,
-                            h,
-                            intermediate_size,
-                        )?;
-                    }
                 }
                 ChannelMixerDescriptor::SparseMoE {
                     num_total_experts,
@@ -3561,10 +3542,8 @@ impl MetalExecutor {
             let is_last_layer = l_idx + 1 == num_layers;
             if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
+                self.wait_for_gpu(cmd_buf).await?;
                 cmd_buf = self.command_queue.new_command_buffer();
                 enc = cmd_buf.new_compute_command_encoder();
                 layers_in_chunk = 0;
@@ -3615,10 +3594,8 @@ impl MetalExecutor {
         }
 
         enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        self.wait_for_gpu(self.signal_value).await?;
+        self.wait_for_gpu(cmd_buf).await?;
 
         let sampled_token = self.read_u32_from_buffer(&self.sampled_token_buf, 0);
         Ok(sampled_token)
@@ -3744,8 +3721,8 @@ impl MetalExecutor {
             }
         }
 
-        let mut cmd_buf = self.command_queue.new_command_buffer();
-        let mut enc = cmd_buf.new_compute_command_encoder();
+        let cmd_buf = self.command_queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
 
         // 1. Token Embedding Lookup (Q4_G64 -> BF16 residual stream)
         {
@@ -3774,9 +3751,6 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
-        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
-        let mut layers_in_chunk = 0usize;
-        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -4106,47 +4080,21 @@ impl MetalExecutor {
                     activation,
                     ..
                 } => {
-                    // Fused Gate+Up (+ In-Register Activation for M >= 64)
-                    Self::encode_fused_gate_up(
+                    Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.gate_proj,
-                        &lw.up_proj,
+                        lw,
                         &self.norm_out_buf,
-                        0,
                         &self.gate_buf,
                         &self.up_buf,
                         &self.mlp_hidden_buf,
+                        &self.residual_buf,
+                        &self.proj_out_buf,
                         num_tokens,
                         h,
                         intermediate_size,
                         activation,
                     )?;
-
-                    if lw.post_ffn_norm.is_none() && num_tokens == 1 {
-                        Self::encode_q4_linear_accumulate(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.residual_buf,
-                            h,
-                            intermediate_size,
-                        )?;
-                    } else {
-                        Self::encode_q4_linear(
-                            &mut self.pipeline_cache,
-                            enc,
-                            &lw.down_proj,
-                            &self.mlp_hidden_buf,
-                            0,
-                            &self.proj_out_buf,
-                            num_tokens,
-                            h,
-                            intermediate_size,
-                        )?;
-                    }
                 }
                 ChannelMixerDescriptor::SparseMoE {
                     num_total_experts,
@@ -4386,19 +4334,6 @@ impl MetalExecutor {
                     h,
                 )?;
             }
-
-            layers_in_chunk += 1;
-            let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
-                enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-                cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-                layers_in_chunk = 0;
-            }
         }
 
         // 3. Final RMSNorm
@@ -4468,10 +4403,8 @@ impl MetalExecutor {
         }
 
         enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        self.wait_for_gpu(self.signal_value).await?;
+        self.wait_for_gpu(cmd_buf).await?;
 
         let ptr = self.sampled_token_buf.contents() as *const u32;
         let count = if sample_all { num_tokens as usize } else { 1 };

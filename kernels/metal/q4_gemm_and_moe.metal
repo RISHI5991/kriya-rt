@@ -1021,8 +1021,9 @@ kernel void q4_g64_batched_simdgroup_gemm_m64(
     constexpr uint TGP_M  = 64u;
     constexpr uint TGP_N  = 16u;
     constexpr uint TILE_K = 64u;
+    constexpr uint STRIDE_K = 68u; // Bank padding: 68 * 2 = 136 bytes eliminates 32-way L1 bank conflict
 
-    threadgroup half  x_tile[TGP_M][TILE_K];  // [64, 64] = 8 KB
+    threadgroup half  x_tile[TGP_M][STRIDE_K];  // [64, 68] = 8.5 KB
     threadgroup half  w_tile[TILE_K][TGP_N];  // [64, 16] = 2 KB
     threadgroup float out_tile[TGP_M][TGP_N]; // [64, 16] = 4 KB
 
@@ -1118,19 +1119,19 @@ kernel void q4_g64_batched_simdgroup_gemm_m64(
             simdgroup_load(b_mat, &w_tile[k_step * 8u][n_sub], TGP_N);
 
             simdgroup_matrix<half, 8, 8> a_mat0;
-            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc0, a_mat0, b_mat, acc0);
 
             simdgroup_matrix<half, 8, 8> a_mat1;
-            simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc1, a_mat1, b_mat, acc1);
 
             simdgroup_matrix<half, 8, 8> a_mat2;
-            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc2, a_mat2, b_mat, acc2);
 
             simdgroup_matrix<half, 8, 8> a_mat3;
-            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc3, a_mat3, b_mat, acc3);
         }
 
@@ -1177,8 +1178,9 @@ kernel void q4_g64_batched_simdgroup_qkv_gemm_m64(
     constexpr uint TGP_M  = 64u;
     constexpr uint TGP_N  = 16u;
     constexpr uint TILE_K = 64u;
+    constexpr uint STRIDE_K = 68u; // Bank padding: 68 * 2 = 136 bytes eliminates 32-way L1 bank conflict
 
-    threadgroup half  x_tile[TGP_M][TILE_K];
+    threadgroup half  x_tile[TGP_M][STRIDE_K];
     threadgroup half  w_tile[TILE_K][TGP_N];
     threadgroup float out_tile[TGP_M][TGP_N];
 
@@ -1285,19 +1287,19 @@ kernel void q4_g64_batched_simdgroup_qkv_gemm_m64(
             simdgroup_load(b_mat, &w_tile[k_step * 8u][n_sub], TGP_N);
 
             simdgroup_matrix<half, 8, 8> a_mat0;
-            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc0, a_mat0, b_mat, acc0);
 
             simdgroup_matrix<half, 8, 8> a_mat1;
-            simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc1, a_mat1, b_mat, acc1);
 
             simdgroup_matrix<half, 8, 8> a_mat2;
-            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc2, a_mat2, b_mat, acc2);
 
             simdgroup_matrix<half, 8, 8> a_mat3;
-            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc3, a_mat3, b_mat, acc3);
         }
 
@@ -1352,8 +1354,9 @@ kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
     constexpr uint TGP_M  = 64u;
     constexpr uint TGP_N  = 16u;
     constexpr uint TILE_K = 64u;
+    constexpr uint STRIDE_K = 68u; // Bank padding: 68 * 2 = 136 bytes eliminates 32-way L1 bank conflict
 
-    threadgroup half  x_tile[TGP_M][TILE_K];       // [64, 64] = 8 KB
+    threadgroup half  x_tile[TGP_M][STRIDE_K];       // [64, 68] = 8.5 KB
     threadgroup half  w_gate_tile[TILE_K][TGP_N];  // [64, 16] = 2 KB
     threadgroup half  w_up_tile[TILE_K][TGP_N];    // [64, 16] = 2 KB
     threadgroup float gate_out_tile[TGP_M][TGP_N]; // [64, 16] = 4 KB
@@ -1468,22 +1471,22 @@ kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
             simdgroup_load(b_up,   &w_up_tile[k_step * 8u][n_sub],   TGP_N);
 
             simdgroup_matrix<half, 8, 8> a_mat0;
-            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc_gate0, a_mat0, b_gate, acc_gate0);
             simdgroup_multiply_accumulate(acc_up0,   a_mat0, b_up,   acc_up0);
 
             simdgroup_matrix<half, 8, 8> a_mat1;
-            simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc_gate1, a_mat1, b_gate, acc_gate1);
             simdgroup_multiply_accumulate(acc_up1,   a_mat1, b_up,   acc_up1);
 
             simdgroup_matrix<half, 8, 8> a_mat2;
-            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc_gate2, a_mat2, b_gate, acc_gate2);
             simdgroup_multiply_accumulate(acc_up2,   a_mat2, b_up,   acc_up2);
 
             simdgroup_matrix<half, 8, 8> a_mat3;
-            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], TILE_K);
+            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], STRIDE_K);
             simdgroup_multiply_accumulate(acc_gate3, a_mat3, b_gate, acc_gate3);
             simdgroup_multiply_accumulate(acc_up3,   a_mat3, b_up,   acc_up3);
         }

@@ -116,23 +116,21 @@ impl EagleTrainer {
             fused.extend_from_slice(&noisy_prev);
 
             // Layer 1: FC Fuse
-            let mut reduced = vec![0.0f32; h];
-            for (i, r) in reduced.iter_mut().enumerate() {
-                let row = &engine.fc_fuse_weights[i * fused_dim..(i + 1) * fused_dim];
-                *r = row.iter().zip(fused.iter()).map(|(w, x)| w * x).sum();
-            }
+            let reduced: Vec<f32> = (0..h)
+                .map(|i| {
+                    let row = &engine.fc_fuse_weights[i * fused_dim..(i + 1) * fused_dim];
+                    row.iter().zip(&fused).map(|(w, x)| w * x).sum()
+                })
+                .collect();
 
             // Layer 2: Decoder Layer with residual skip
-            let mut delta = vec![0.0f32; h];
-            for (i, d) in delta.iter_mut().enumerate() {
-                let row = &engine.decoder_layer_weights[i * h..(i + 1) * h];
-                *d = row.iter().zip(reduced.iter()).map(|(w, x)| w * x).sum();
-            }
-
-            let mut pred_feature = vec![0.0f32; h];
-            for i in 0..h {
-                pred_feature[i] = reduced[i] + delta[i];
-            }
+            let pred_feature: Vec<f32> = (0..h)
+                .map(|i| {
+                    let row = &engine.decoder_layer_weights[i * h..(i + 1) * h];
+                    let delta: f32 = row.iter().zip(&reduced).map(|(w, x)| w * x).sum();
+                    reduced[i] + delta
+                })
+                .collect();
 
             // 3. Smooth L1 Loss & Gradient on pred_feature
             let mut g_feat = vec![0.0f32; h];
