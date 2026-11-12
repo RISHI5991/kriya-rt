@@ -1099,6 +1099,10 @@ fn test_paged_attention_matches_cpu_reference_on_metal() {
         apply_qk_norm: 0,
         rms_eps: 1e-6,
         rope_theta: 10_000.0,
+        max_seq_len: 4096,
+        has_table: 0,
+        _pad0: 0,
+        _pad1: 0,
     };
     let gqa_params = kriya_backend_metal::encoder::BsrGqaParams {
         num_q_heads: 1,
@@ -2174,4 +2178,424 @@ fn test_eagle_topk_and_probs_matches_cpu() {
             "f32 prob mismatch at rank {k}: GPU={gpu_p}, CPU={cpu_p}"
         );
     }
+}
+
+#[test]
+fn test_precomputed_rope_matches_transcendental() {
+    let Some(device) = Device::system_default() else {
+        eprintln!("Skipping test: no Metal GPU available");
+        return;
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+    let queue = device.new_command_queue();
+
+    const HEAD_DIM: usize = 64;
+    const NUM_TOKENS: usize = 4;
+    let rotary_dim = 64u32;
+    let rope_theta = 10_000.0f32;
+    let max_seq_len = 128u32;
+    let half_rot = rotary_dim / 2;
+
+    // Build precomputed table
+    let mut cos_sin_table = Vec::with_capacity((max_seq_len * half_rot * 2) as usize);
+    for pos in 0..max_seq_len {
+        for pair_i in 0..half_rot {
+            let freq_exp = (2.0 * pair_i as f32) / (rotary_dim as f32);
+            let inv_freq = rope_theta.powf(-freq_exp);
+            let angle = (pos as f32) * inv_freq;
+            cos_sin_table.push(angle.cos());
+            cos_sin_table.push(angle.sin());
+        }
+    }
+    let table_buf = device.new_buffer_with_data(
+        cos_sin_table.as_ptr() as *const _,
+        (cos_sin_table.len() * 4) as u64,
+        shared,
+    );
+
+    // Initial Q and K in BF16
+    let initial_data: Vec<u16> = (0..(NUM_TOKENS * HEAD_DIM))
+        .map(|i| kriya_core::quantizer::f32_to_bf16_bits(((i % 17) as f32 - 8.0) * 0.25))
+        .collect();
+    let positions: Vec<u32> = vec![0, 5, 23, 67];
+
+    let pos_buf = device.new_buffer_with_data(
+        positions.as_ptr() as *const _,
+        (positions.len() * 4) as u64,
+        shared,
+    );
+
+    // Run without table (transcendental)
+    let q_buf_trans = device.new_buffer_with_data(
+        initial_data.as_ptr() as *const _,
+        (initial_data.len() * 2) as u64,
+        shared,
+    );
+    let k_buf_trans = device.new_buffer_with_data(
+        initial_data.as_ptr() as *const _,
+        (initial_data.len() * 2) as u64,
+        shared,
+    );
+    let params_trans = kriya_backend_metal::encoder::RopeKvWriteParams {
+        num_q_heads: 1,
+        num_kv_heads: 1,
+        head_dim: HEAD_DIM as u32,
+        rotary_dim,
+        block_size_tokens: 16,
+        apply_qk_norm: 0,
+        rms_eps: 1e-6,
+        rope_theta,
+        max_seq_len,
+        has_table: 0,
+        _pad0: 0,
+        _pad1: 0,
+    };
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipelines.get_or_compile("apply_rope_inplace").unwrap());
+    enc.set_buffer(0, Some(&q_buf_trans), 0);
+    enc.set_buffer(1, Some(&k_buf_trans), 0);
+    enc.set_buffer(2, Some(&pos_buf), 0);
+    enc.set_buffer(3, None, 0);
+    enc.set_buffer(4, None, 0);
+    enc.set_bytes(
+        11,
+        std::mem::size_of_val(&params_trans) as u64,
+        &params_trans as *const _ as *const _,
+    );
+    enc.dispatch_thread_groups(
+        MTLSize::new(1, NUM_TOKENS as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    // Run WITH table (precomputed)
+    let q_buf_table = device.new_buffer_with_data(
+        initial_data.as_ptr() as *const _,
+        (initial_data.len() * 2) as u64,
+        shared,
+    );
+    let k_buf_table = device.new_buffer_with_data(
+        initial_data.as_ptr() as *const _,
+        (initial_data.len() * 2) as u64,
+        shared,
+    );
+    let params_table = kriya_backend_metal::encoder::RopeKvWriteParams {
+        num_q_heads: 1,
+        num_kv_heads: 1,
+        head_dim: HEAD_DIM as u32,
+        rotary_dim,
+        block_size_tokens: 16,
+        apply_qk_norm: 0,
+        rms_eps: 1e-6,
+        rope_theta,
+        max_seq_len,
+        has_table: 1,
+        _pad0: 0,
+        _pad1: 0,
+    };
+
+    let cmd2 = queue.new_command_buffer();
+    let enc2 = cmd2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&pipelines.get_or_compile("apply_rope_inplace").unwrap());
+    enc2.set_buffer(0, Some(&q_buf_table), 0);
+    enc2.set_buffer(1, Some(&k_buf_table), 0);
+    enc2.set_buffer(2, Some(&pos_buf), 0);
+    enc2.set_buffer(3, None, 0);
+    enc2.set_buffer(4, None, 0);
+    enc2.set_bytes(
+        11,
+        std::mem::size_of_val(&params_table) as u64,
+        &params_table as *const _ as *const _,
+    );
+    enc2.set_buffer(12, Some(&table_buf), 0);
+    enc2.dispatch_thread_groups(
+        MTLSize::new(1, NUM_TOKENS as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
+    enc2.end_encoding();
+    cmd2.commit();
+    cmd2.wait_until_completed();
+
+    let q_trans = unsafe {
+        std::slice::from_raw_parts(q_buf_trans.contents() as *const u16, initial_data.len())
+    };
+    let q_table = unsafe {
+        std::slice::from_raw_parts(q_buf_table.contents() as *const u16, initial_data.len())
+    };
+    let k_trans = unsafe {
+        std::slice::from_raw_parts(k_buf_trans.contents() as *const u16, initial_data.len())
+    };
+    let k_table = unsafe {
+        std::slice::from_raw_parts(k_buf_table.contents() as *const u16, initial_data.len())
+    };
+
+    for i in 0..initial_data.len() {
+        let f_trans = kriya_core::quantizer::bf16_bits_to_f32(q_trans[i]);
+        let f_table = kriya_core::quantizer::bf16_bits_to_f32(q_table[i]);
+        assert!(
+            (f_trans - f_table).abs() <= 1e-3,
+            "Q mismatch at {i}: trans={f_trans}, table={f_table}"
+        );
+        let k_f_trans = kriya_core::quantizer::bf16_bits_to_f32(k_trans[i]);
+        let k_f_table = kriya_core::quantizer::bf16_bits_to_f32(k_table[i]);
+        assert!(
+            (k_f_trans - k_f_table).abs() <= 1e-3,
+            "K mismatch at {i}: trans={k_f_trans}, table={k_f_table}"
+        );
+    }
+}
+
+#[test]
+fn test_fused_residual_add_rmsnorm_matches_unfused() {
+    let Some(device) = Device::system_default() else {
+        eprintln!("Skipping test: no Metal GPU available");
+        return;
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+    let queue = device.new_command_queue();
+
+    const NUM_TOKENS: usize = 3;
+    const HIDDEN_SIZE: usize = 256;
+    let total_elems = NUM_TOKENS * HIDDEN_SIZE;
+
+    let res_initial: Vec<u16> = (0..total_elems)
+        .map(|i| kriya_core::quantizer::f32_to_bf16_bits(((i % 29) as f32 - 14.0) * 0.1))
+        .collect();
+    let proj_data: Vec<u16> = (0..total_elems)
+        .map(|i| kriya_core::quantizer::f32_to_bf16_bits(((i % 19) as f32 - 9.0) * 0.15))
+        .collect();
+    let weight_data: Vec<u16> = (0..HIDDEN_SIZE)
+        .map(|i| kriya_core::quantizer::f32_to_bf16_bits(0.8 + (i % 7) as f32 * 0.05))
+        .collect();
+
+    let weight_buf = device.new_buffer_with_data(
+        weight_data.as_ptr() as *const _,
+        (weight_data.len() * 2) as u64,
+        shared,
+    );
+
+    // Unfused path: residual_add_bf16 then rms_norm_bf16
+    let res_unfused = device.new_buffer_with_data(
+        res_initial.as_ptr() as *const _,
+        (res_initial.len() * 2) as u64,
+        shared,
+    );
+    let proj_unfused = device.new_buffer_with_data(
+        proj_data.as_ptr() as *const _,
+        (proj_data.len() * 2) as u64,
+        shared,
+    );
+    let norm_out_unfused = device.new_buffer((total_elems * 2) as u64, shared);
+
+    let norm_params = kriya_backend_metal::encoder::RmsNormParams {
+        num_tokens: NUM_TOKENS as u32,
+        hidden_size: HIDDEN_SIZE as u32,
+        eps: 1e-5,
+        zero_centered_offset: 0,
+    };
+
+    let cmd1 = queue.new_command_buffer();
+    let enc1 = cmd1.new_compute_command_encoder();
+    // 1. residual add
+    enc1.set_compute_pipeline_state(&pipelines.get_or_compile("residual_add_bf16").unwrap());
+    enc1.set_buffer(0, Some(&res_unfused), 0);
+    enc1.set_buffer(1, Some(&proj_unfused), 0);
+    let total_elems_u32 = total_elems as u32;
+    enc1.set_bytes(2, 4, &total_elems_u32 as *const _ as *const _);
+    enc1.dispatch_thread_groups(
+        MTLSize::new(total_elems.div_ceil(256) as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    // 2. rms norm
+    enc1.set_compute_pipeline_state(&pipelines.get_or_compile("rms_norm_bf16").unwrap());
+    enc1.set_buffer(0, Some(&res_unfused), 0);
+    enc1.set_buffer(1, Some(&weight_buf), 0);
+    enc1.set_buffer(2, Some(&norm_out_unfused), 0);
+    enc1.set_bytes(
+        3,
+        std::mem::size_of_val(&norm_params) as u64,
+        &norm_params as *const _ as *const _,
+    );
+    enc1.dispatch_thread_groups(
+        MTLSize::new(NUM_TOKENS as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc1.end_encoding();
+    cmd1.commit();
+    cmd1.wait_until_completed();
+
+    // Fused path: fused_residual_add_rms_norm_bf16
+    let res_fused = device.new_buffer_with_data(
+        res_initial.as_ptr() as *const _,
+        (res_initial.len() * 2) as u64,
+        shared,
+    );
+    let proj_fused = device.new_buffer_with_data(
+        proj_data.as_ptr() as *const _,
+        (proj_data.len() * 2) as u64,
+        shared,
+    );
+    let norm_out_fused = device.new_buffer((total_elems * 2) as u64, shared);
+
+    let cmd2 = queue.new_command_buffer();
+    let enc2 = cmd2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(
+        &pipelines
+            .get_or_compile("fused_residual_add_rms_norm_bf16")
+            .unwrap(),
+    );
+    enc2.set_buffer(0, Some(&res_fused), 0);
+    enc2.set_buffer(1, Some(&proj_fused), 0);
+    enc2.set_buffer(2, Some(&weight_buf), 0);
+    enc2.set_buffer(3, Some(&norm_out_fused), 0);
+    enc2.set_bytes(
+        4,
+        std::mem::size_of_val(&norm_params) as u64,
+        &norm_params as *const _ as *const _,
+    );
+    enc2.dispatch_thread_groups(
+        MTLSize::new(NUM_TOKENS as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc2.end_encoding();
+    cmd2.commit();
+    cmd2.wait_until_completed();
+
+    let res_unfused_slice =
+        unsafe { std::slice::from_raw_parts(res_unfused.contents() as *const u16, total_elems) };
+    let res_fused_slice =
+        unsafe { std::slice::from_raw_parts(res_fused.contents() as *const u16, total_elems) };
+    let norm_unfused_slice = unsafe {
+        std::slice::from_raw_parts(norm_out_unfused.contents() as *const u16, total_elems)
+    };
+    let norm_fused_slice =
+        unsafe { std::slice::from_raw_parts(norm_out_fused.contents() as *const u16, total_elems) };
+
+    assert_eq!(
+        res_unfused_slice, res_fused_slice,
+        "Residual update mismatch between unfused and fused"
+    );
+    for i in 0..total_elems {
+        let u = kriya_core::quantizer::bf16_bits_to_f32(norm_unfused_slice[i]);
+        let f = kriya_core::quantizer::bf16_bits_to_f32(norm_fused_slice[i]);
+        assert!(
+            (u - f).abs() <= 1e-3,
+            "Normalized output mismatch at {i}: unfused={u}, fused={f}"
+        );
+    }
+}
+
+#[test]
+fn test_persistent_threadgroup_gemv_matches_reference() {
+    let Some(device) = Device::system_default() else {
+        eprintln!("Skipping test: no Metal GPU available");
+        return;
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+    let queue = device.new_command_queue();
+
+    const N: usize = 256;
+    const K: usize = 256;
+    let num_k_blocks = (K / 64) as u32;
+
+    // Synthetic Q4_G64 weight matrix
+    let blocks_total = (N * K) / 64;
+    let mut weight_bytes = vec![0u8; blocks_total * 36];
+    for b in 0..blocks_total {
+        let base = b * 36;
+        let scale = kriya_core::quantizer::f32_to_bf16_bits(0.05);
+        let bias = kriya_core::quantizer::f32_to_bf16_bits(-0.4);
+        weight_bytes[base..base + 2].copy_from_slice(&scale.to_le_bytes());
+        weight_bytes[base + 2..base + 4].copy_from_slice(&bias.to_le_bytes());
+        for byte_idx in 0..32 {
+            weight_bytes[base + 4 + byte_idx] = ((b * 31 + byte_idx * 7) % 256) as u8;
+        }
+    }
+    let weight_buf = device.new_buffer_with_data(
+        weight_bytes.as_ptr() as *const _,
+        weight_bytes.len() as u64,
+        shared,
+    );
+
+    let input_x: Vec<u16> = (0..K)
+        .map(|i| kriya_core::quantizer::f32_to_bf16_bits(((i % 13) as f32 - 6.0) * 0.1))
+        .collect();
+    let input_buf = device.new_buffer_with_data(
+        input_x.as_ptr() as *const _,
+        (input_x.len() * 2) as u64,
+        shared,
+    );
+
+    let params = kriya_backend_metal::encoder::GemmParams {
+        m: 1,
+        n: N as u32,
+        k: K as u32,
+        num_k_blocks,
+    };
+
+    let total_tiles = (N as u64).div_ceil(16); // 16 threadgroups for 256 rows
+
+    // Reference: full grid (1 threadgroup per tile)
+    let out_ref = device.new_buffer((N * 2) as u64, shared);
+    let cmd1 = queue.new_command_buffer();
+    let enc1 = cmd1.new_compute_command_encoder();
+    enc1.set_compute_pipeline_state(&pipelines.get_or_compile("q4_g64_decode_gemv_4row").unwrap());
+    enc1.set_buffer(0, Some(&weight_buf), 0);
+    enc1.set_buffer(1, Some(&input_buf), 0);
+    enc1.set_buffer(2, Some(&out_ref), 0);
+    enc1.set_bytes(
+        3,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    enc1.dispatch_thread_groups(MTLSize::new(total_tiles, 1, 1), MTLSize::new(128, 1, 1));
+    enc1.end_encoding();
+    cmd1.commit();
+    cmd1.wait_until_completed();
+
+    // Persistent: small grid (e.g. 4 persistent threadgroups looping over 16 tiles)
+    let out_persistent = device.new_buffer((N * 2) as u64, shared);
+    let cmd2 = queue.new_command_buffer();
+    let enc2 = cmd2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&pipelines.get_or_compile("q4_g64_decode_gemv_4row").unwrap());
+    enc2.set_buffer(0, Some(&weight_buf), 0);
+    enc2.set_buffer(1, Some(&input_buf), 0);
+    enc2.set_buffer(2, Some(&out_persistent), 0);
+    enc2.set_bytes(
+        3,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    enc2.dispatch_thread_groups(MTLSize::new(4, 1, 1), MTLSize::new(128, 1, 1));
+    enc2.end_encoding();
+    cmd2.commit();
+    cmd2.wait_until_completed();
+
+    let ref_slice = unsafe { std::slice::from_raw_parts(out_ref.contents() as *const u16, N) };
+    let pers_slice =
+        unsafe { std::slice::from_raw_parts(out_persistent.contents() as *const u16, N) };
+
+    assert_eq!(
+        ref_slice, pers_slice,
+        "Persistent threadgroups produced different results than full grid dispatch"
+    );
 }

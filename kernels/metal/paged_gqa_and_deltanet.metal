@@ -45,6 +45,10 @@ struct RopeKvWriteParams {
     uint apply_qk_norm;
     float rms_eps;
     float rope_theta;
+    uint max_seq_len;
+    uint has_table;
+    uint _pad0;
+    uint _pad1;
 };
 
 /// Parameters for Gated DeltaNet Recurrent State Update.
@@ -88,6 +92,7 @@ kernel void fused_qknorm_rope_and_kv_append(
     device const int*              last_page_len   [[buffer(9)]],  // [B]
     device const uint*             seq_positions   [[buffer(10)]], // [B] token position index
     constant RopeKvWriteParams&    params          [[buffer(11)]],
+    device const float2*           cos_sin_table   [[buffer(12)]], // [max_seq_len, rotary_dim / 2] (optional precomputed)
     uint2                          tgp_id          [[threadgroup_position_in_grid]],
     uint                           lane_id         [[thread_index_in_simdgroup]]
 ) {
@@ -153,11 +158,18 @@ kernel void fused_qknorm_rope_and_kv_append(
         }
 
         if (pair_i < half_rot) {
-            float freq_exp = float(2u * pair_i) / float(params.rotary_dim);
-            float inv_freq = pow(params.rope_theta, -freq_exp);
-            float angle = pos * inv_freq;
-            float cos_a = cos(angle);
-            float sin_a = sin(angle);
+            float cos_a, sin_a;
+            if (params.has_table != 0u && uint(pos) < params.max_seq_len && cos_sin_table != nullptr) {
+                float2 cs = cos_sin_table[uint(pos) * half_rot + pair_i];
+                cos_a = cs.x;
+                sin_a = cs.y;
+            } else {
+                float freq_exp = float(2u * pair_i) / float(params.rotary_dim);
+                float inv_freq = pow(params.rope_theta, -freq_exp);
+                float angle = pos * inv_freq;
+                cos_a = cos(angle);
+                sin_a = sin(angle);
+            }
 
             float rot0 = fma(x0, cos_a, -x1 * sin_a);
             float rot1 = fma(x0, sin_a,  x1 * cos_a);
@@ -1683,14 +1695,15 @@ kernel void bsr_paged_gqa_tree_verify(
 /// Each threadgroup processes one (token, head) pair, applying RoPE to
 /// pairs (d0, d1) across the head dimension.
 kernel void apply_rope_inplace(
-    device ushort* q_inout       [[buffer(0)]], // [num_tokens, num_q_heads, head_dim] (in/out)
-    device ushort* k_inout       [[buffer(1)]], // [num_tokens, num_kv_heads, head_dim] (in/out)
-    device const uint* seq_positions [[buffer(2)]], // [num_tokens]
-    device const ushort* q_norm_weight [[buffer(3)]], // [head_dim] (optional)
-    device const ushort* k_norm_weight [[buffer(4)]], // [head_dim] (optional)
-    constant RopeKvWriteParams& params  [[buffer(5)]],
-    uint2 tgp_id             [[threadgroup_position_in_grid]], // (head_idx, token_idx)
-    uint lane_id             [[thread_index_in_simdgroup]]
+    device ushort* q_inout              [[buffer(0)]], // [num_tokens, num_q_heads, head_dim] (in/out)
+    device ushort* k_inout              [[buffer(1)]], // [num_tokens, num_kv_heads, head_dim] (in/out)
+    device const uint* seq_positions    [[buffer(2)]], // [num_tokens]
+    device const ushort* q_norm_weight  [[buffer(3)]], // [head_dim] (optional)
+    device const ushort* k_norm_weight  [[buffer(4)]], // [head_dim] (optional)
+    constant RopeKvWriteParams& params  [[buffer(11)]],
+    device const float2* cos_sin_table  [[buffer(12)]],
+    uint2 tgp_id                        [[threadgroup_position_in_grid]], // (head_idx, token_idx)
+    uint lane_id                        [[thread_index_in_simdgroup]]
 ) {
     const uint token_idx = tgp_id.y;
     const uint head_idx  = tgp_id.x;
@@ -1744,11 +1757,18 @@ kernel void apply_rope_inplace(
         }
 
         if (pair_i < half_rot) {
-            float freq_exp = float(2u * pair_i) / float(params.rotary_dim);
-            float inv_freq = pow(params.rope_theta, -freq_exp);
-            float angle = pos * inv_freq;
-            float cos_a = cos(angle);
-            float sin_a = sin(angle);
+            float cos_a, sin_a;
+            if (params.has_table != 0u && uint(pos) < params.max_seq_len && cos_sin_table != nullptr) {
+                float2 cs = cos_sin_table[uint(pos) * half_rot + pair_i];
+                cos_a = cs.x;
+                sin_a = cs.y;
+            } else {
+                float freq_exp = float(2u * pair_i) / float(params.rotary_dim);
+                float inv_freq = pow(params.rope_theta, -freq_exp);
+                float angle = pos * inv_freq;
+                cos_a = cos(angle);
+                sin_a = sin(angle);
+            }
 
             float rot0 = fma(x0, cos_a, -x1 * sin_a);
             float rot1 = fma(x0, sin_a,  x1 * cos_a);

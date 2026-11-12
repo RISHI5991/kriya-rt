@@ -167,6 +167,10 @@ pub struct RopeKvWriteParams {
     pub apply_qk_norm: u32,
     pub rms_eps: f32,
     pub rope_theta: f32,
+    pub max_seq_len: u32,
+    pub has_table: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 #[repr(C)]
@@ -1350,6 +1354,8 @@ pub struct MetalExecutor {
     pub eagle_topk_tokens_buf: Buffer,
     pub eagle_topk_probs_buf: Buffer,
     pub eagle_draft_logits_buf: Buffer,
+    pub rope_cos_sin_table_buf: Buffer,
+    pub rope_max_seq_len: u32,
 }
 
 impl MetalExecutor {
@@ -1441,6 +1447,7 @@ impl MetalExecutor {
             "bsr_paged_gqa_tree_verify",
             "gated_deltanet_recurrent_step",
             "apply_rope_inplace",
+            "fused_residual_add_rms_norm_bf16",
             "fused_gated_activation_bf16",
             "residual_add_bf16",
             "add_bias_bf16",
@@ -1554,6 +1561,47 @@ impl MetalExecutor {
             shared,
         );
 
+        let (rope_theta, rotary_dim) = descriptor
+            .layers
+            .iter()
+            .find_map(|l| match &l.seq_mixer {
+                SequenceMixerDescriptor::GroupedQueryAttention {
+                    pos_encoding:
+                        PositionalEncoding::RoPE {
+                            theta, rotary_dim, ..
+                        },
+                    head_dim,
+                    ..
+                } => {
+                    let r_dim = if *rotary_dim > 0 {
+                        *rotary_dim
+                    } else {
+                        *head_dim
+                    };
+                    Some((*theta, r_dim))
+                }
+                _ => None,
+            })
+            .unwrap_or((10_000.0, 64));
+
+        let rope_max_seq_len = descriptor.max_position_embeddings.max(4096);
+        let half_rot = (rotary_dim / 2).max(1);
+        let mut cos_sin_table = Vec::with_capacity((rope_max_seq_len * half_rot * 2) as usize);
+        for pos in 0..rope_max_seq_len {
+            for pair_i in 0..half_rot {
+                let freq_exp = (2.0 * pair_i as f32) / (rotary_dim as f32);
+                let inv_freq = rope_theta.powf(-freq_exp);
+                let angle = (pos as f32) * inv_freq;
+                cos_sin_table.push(angle.cos());
+                cos_sin_table.push(angle.sin());
+            }
+        }
+        let rope_cos_sin_table_buf = device.new_buffer_with_data(
+            cos_sin_table.as_ptr() as *const _,
+            (cos_sin_table.len() * std::mem::size_of::<f32>()) as u64,
+            shared,
+        );
+
         Ok(Self {
             device,
             command_queue,
@@ -1626,6 +1674,8 @@ impl MetalExecutor {
             eagle_topk_tokens_buf: alloc(16 * 4),
             eagle_topk_probs_buf: alloc(16 * 4),
             eagle_draft_logits_buf: alloc((vocab_capped * 2).max(1024)),
+            rope_cos_sin_table_buf,
+            rope_max_seq_len,
         })
     }
 
@@ -1860,6 +1910,49 @@ impl MetalExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn encode_fused_residual_add_rmsnorm(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        residual_inout: &Buffer,
+        proj_in: &Buffer,
+        weight_buf: &Buffer,
+        output_norm: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+        norm_variant: &NormVariant,
+    ) -> Result<(), MetalError> {
+        let (eps, zero_centered_offset) = match norm_variant {
+            NormVariant::RmsNorm {
+                eps,
+                zero_centered_unit_offset,
+            } => (*eps, u32::from(*zero_centered_unit_offset)),
+            NormVariant::LayerNorm { eps, .. } => (*eps, 0),
+        };
+        let pso = pipeline_cache.get_or_compile("fused_residual_add_rms_norm_bf16")?;
+        let norm_params = RmsNormParams {
+            num_tokens,
+            hidden_size,
+            eps,
+            zero_centered_offset,
+        };
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(residual_inout), 0);
+        encoder.set_buffer(1, Some(proj_in), 0);
+        encoder.set_buffer(2, Some(weight_buf), 0);
+        encoder.set_buffer(3, Some(output_norm), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<RmsNormParams>() as u64,
+            &norm_params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tokens as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn encode_q4_linear(
         pipeline_cache: &mut MetalPipelineCache,
         encoder: &ComputeCommandEncoderRef,
@@ -1886,9 +1979,11 @@ impl MetalExecutor {
             } else {
                 ("q4_g64_decode_gemv_2row", 8u32)
             };
+            let total_tgs = n.div_ceil(divisor) as u64;
+            let persistent_tgs = total_tgs.min(128);
             (
                 name,
-                MTLSize::new(n.div_ceil(divisor) as u64, 1, 1),
+                MTLSize::new(persistent_tgs, 1, 1),
                 MTLSize::new(128, 1, 1),
             )
         } else if m >= 64 {
@@ -1956,7 +2051,7 @@ impl MetalExecutor {
             std::mem::size_of::<GemmParams>() as u64,
             &params as *const _ as *const _,
         );
-        let tgp_count = n.div_ceil(tgp_divisor) as u64;
+        let tgp_count = (n.div_ceil(tgp_divisor) as u64).min(128);
         encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
     }
@@ -2002,9 +2097,11 @@ impl MetalExecutor {
             } else {
                 ("q4_g64_decode_qkv_gemv_2row", 8u32)
             };
+            let total_tgs = total_n.div_ceil(divisor) as u64;
+            let persistent_tgs = total_tgs.min(128);
             (
                 name,
-                MTLSize::new(total_n.div_ceil(divisor) as u64, 1, 1),
+                MTLSize::new(persistent_tgs, 1, 1),
                 MTLSize::new(128, 1, 1),
             )
         } else if m >= 64 {
@@ -2121,7 +2218,9 @@ impl MetalExecutor {
                 std::mem::size_of::<GateUpSwigluGemmParams>() as u64,
                 &params as *const _ as *const _,
             );
-            let grid = MTLSize::new(intermediate_size.div_ceil(tgp_divisor) as u64, 1, 1);
+            let total_tgs = intermediate_size.div_ceil(tgp_divisor) as u64;
+            let persistent_tgs = total_tgs.min(128);
+            let grid = MTLSize::new(persistent_tgs, 1, 1);
             encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
         } else {
             let params = GateUpGemmParams {
@@ -2132,9 +2231,11 @@ impl MetalExecutor {
             };
             let total_rows = intermediate_size * 2;
             let (kernel_name, grid, threads) = if m == 1 {
+                let total_tgs = total_rows.div_ceil(4) as u64;
+                let persistent_tgs = total_tgs.min(128);
                 (
                     "q4_g64_decode_gate_up_gemv",
-                    MTLSize::new(total_rows.div_ceil(4) as u64, 1, 1),
+                    MTLSize::new(persistent_tgs, 1, 1),
                     MTLSize::new(128, 1, 1),
                 )
             } else {
@@ -2617,6 +2718,10 @@ impl MetalExecutor {
                         apply_qk_norm: u32::from(qk_norm.is_some()),
                         rms_eps: eps,
                         rope_theta,
+                        max_seq_len: self.rope_max_seq_len,
+                        has_table: 1,
+                        _pad0: 0,
+                        _pad1: 0,
                     };
                     // Tree positions are all 0 (relative positions within the draft tree)
                     let zero_positions: Vec<u32> = vec![0; num_tree_nodes];
@@ -2639,6 +2744,7 @@ impl MetalExecutor {
                         std::mem::size_of::<RopeKvWriteParams>() as u64,
                         &rope_params as *const _ as *const _,
                     );
+                    enc.set_buffer(12, Some(&self.rope_cos_sin_table_buf), 0);
                     let grid_size = (num_q_heads.max(num_kv_heads) * num_tree_nodes as u32).max(1);
                     enc.dispatch_thread_groups(
                         MTLSize::new(grid_size as u64, 1, 1),
@@ -2779,29 +2885,30 @@ impl MetalExecutor {
                     num_tree_nodes as u32,
                     h as u32,
                 )?;
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                    &layer.ffn_norm,
+                )?;
             } else {
-                Self::encode_residual_add(
+                Self::encode_fused_residual_add_rmsnorm(
                     &mut self.pipeline_cache,
                     enc,
                     &self.residual_buf,
                     &self.proj_out_buf,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
                     num_tree_nodes as u32,
                     h as u32,
+                    &layer.ffn_norm,
                 )?;
             }
-
-            // 2d. Pre-FFN RMSNorm
-            Self::encode_rmsnorm(
-                &mut self.pipeline_cache,
-                enc,
-                &self.residual_buf,
-                0,
-                &lw.ffn_norm,
-                &self.norm_out_buf,
-                num_tree_nodes as u32,
-                h as u32,
-                &layer.ffn_norm,
-            )?;
 
             // 2e. Channel Mixer (Dense MLP)
             match layer.channel_mixer {
@@ -3563,6 +3670,10 @@ impl MetalExecutor {
                         apply_qk_norm: u32::from(qk_norm.is_some()),
                         rms_eps: eps,
                         rope_theta,
+                        max_seq_len: self.rope_max_seq_len,
+                        has_table: 1,
+                        _pad0: 0,
+                        _pad1: 0,
                     };
                     enc.set_compute_pipeline_state(&rope_pso);
                     enc.set_buffer(0, Some(&self.q_buf), 0);
@@ -3581,6 +3692,7 @@ impl MetalExecutor {
                         std::mem::size_of::<RopeKvWriteParams>() as u64,
                         &rope_params as *const _ as *const _,
                     );
+                    enc.set_buffer(12, Some(&self.rope_cos_sin_table_buf), 0);
                     enc.dispatch_thread_groups(
                         MTLSize::new((num_q_heads + num_kv_heads) as u64, num_tokens as u64, 1),
                         MTLSize::new(32, 1, 1),
@@ -3684,7 +3796,7 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add (batched, with post-attention norm for Gemma 2)
+            // 2c & 2d. First Residual Add + Pre-FFN RMSNorm (batched)
             if let Some(ref post_attn) = lw.post_attn_norm {
                 Self::encode_rmsnorm(
                     &mut self.pipeline_cache,
@@ -3705,29 +3817,30 @@ impl MetalExecutor {
                     num_tokens,
                     h,
                 )?;
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tokens,
+                    h,
+                    &layer.ffn_norm,
+                )?;
             } else {
-                Self::encode_residual_add(
+                Self::encode_fused_residual_add_rmsnorm(
                     &mut self.pipeline_cache,
                     enc,
                     &self.residual_buf,
                     &self.proj_out_buf,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
                     num_tokens,
                     h,
+                    &layer.ffn_norm,
                 )?;
             }
-
-            // 2d. Pre-FFN RMSNorm (batched)
-            Self::encode_rmsnorm(
-                &mut self.pipeline_cache,
-                enc,
-                &self.residual_buf,
-                0,
-                &lw.ffn_norm,
-                &self.norm_out_buf,
-                num_tokens,
-                h,
-                &layer.ffn_norm,
-            )?;
 
             // 2e. Channel Mixer (Dense MLP, batched)
             match layer.channel_mixer {
@@ -4274,6 +4387,10 @@ impl MetalExecutor {
                         apply_qk_norm: u32::from(qk_norm.is_some()),
                         rms_eps: eps,
                         rope_theta,
+                        max_seq_len: self.rope_max_seq_len,
+                        has_table: 1,
+                        _pad0: 0,
+                        _pad1: 0,
                     };
                     enc.set_compute_pipeline_state(&rope_pso);
                     enc.set_buffer(0, Some(&self.q_buf), 0);
@@ -4292,6 +4409,7 @@ impl MetalExecutor {
                         std::mem::size_of::<RopeKvWriteParams>() as u64,
                         &rope_params as *const _ as *const _,
                     );
+                    enc.set_buffer(12, Some(&self.rope_cos_sin_table_buf), 0);
                     enc.dispatch_thread_groups(
                         MTLSize::new((num_q_heads + num_kv_heads) as u64, num_tokens as u64, 1),
                         MTLSize::new(32, 1, 1),
@@ -4477,7 +4595,7 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add (with post-attention norm for Gemma 2)
+            // 2c & 2d. First Residual Add + Pre-FFN RMSNorm
             if let Some(ref post_attn) = lw.post_attn_norm {
                 Self::encode_rmsnorm(
                     &mut self.pipeline_cache,
@@ -4498,29 +4616,42 @@ impl MetalExecutor {
                     num_tokens,
                     h,
                 )?;
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tokens,
+                    h,
+                    &layer.ffn_norm,
+                )?;
             } else if num_tokens > 1 {
-                Self::encode_residual_add(
+                Self::encode_fused_residual_add_rmsnorm(
                     &mut self.pipeline_cache,
                     enc,
                     &self.residual_buf,
                     &self.proj_out_buf,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
                     num_tokens,
                     h,
+                    &layer.ffn_norm,
+                )?;
+            } else {
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tokens,
+                    h,
+                    &layer.ffn_norm,
                 )?;
             }
-
-            // 2d. Pre-FFN RMSNorm
-            Self::encode_rmsnorm(
-                &mut self.pipeline_cache,
-                enc,
-                &self.residual_buf,
-                0,
-                &lw.ffn_norm,
-                &self.norm_out_buf,
-                num_tokens,
-                h,
-                &layer.ffn_norm,
-            )?;
 
             // 2e. Channel Mixer: Dense MLP vs. Full GPU-Resident SparseMoE (Closes Gap 4)
             match layer.channel_mixer {

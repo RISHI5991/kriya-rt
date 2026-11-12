@@ -371,36 +371,41 @@ inline void q4_g64_4row_block_dot_distributive(
     acc3 += fma(sum_qx0_r3 + sum_qx1_r3, scale3, (sum_x0 + sum_x1) * bias3);
 }
 
-/// 128-Bit Vector-Coalesced M=1 Decode GEMV Kernel (32 lanes per row).
+/// 128-Bit Vector-Coalesced M=1 Decode GEMV Kernel (32 lanes per row, persistent threadgroups).
 kernel void q4_g64_decode_gemv(
     device const BlockQ4Group64* weights   [[buffer(0)]],
     device const ushort*         input_x   [[buffer(1)]], // bf16 [1, K]
     device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params    [[buffer(3)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
-    const uint row_idx = tgp_pos.x * 4u + simd_id;
-    if (row_idx >= params.N) {
-        return;
-    }
-
+    const uint total_tiles = (params.N + 3u) / 4u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
 
-    float acc = 0.0f;
-    for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= params.N) {
+            continue;
+        }
 
-    float row_result = simd_sum(acc);
-    if (simd_lane == 0u) {
-        output_y[row_idx] = f32_to_bf16(row_result);
+        device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            output_y[row_idx] = f32_to_bf16(row_result);
+        }
     }
 }
 
-/// Multi-Row Decode GEMV Kernel for small/medium dimensions (num_k_blocks <= 16).
+/// Multi-Row Decode GEMV Kernel for small/medium dimensions (num_k_blocks <= 16, persistent threadgroups).
 /// Each 32-lane SIMD group computes 2 rows simultaneously (16 threads per row).
 /// Grid: N.div_ceil(8) threadgroups, each threadgroup has 128 threads (4 simdgroups * 2 rows = 8 rows).
 kernel void q4_g64_decode_gemv_sub16(
@@ -409,36 +414,41 @@ kernel void q4_g64_decode_gemv_sub16(
     device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params    [[buffer(3)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
+    const uint total_tiles = (params.N + 7u) / 8u;
+    const uint num_blocks = params.num_k_blocks;
     const uint sub_group = simd_lane / 16u; // 0 or 1
     const uint sub_lane  = simd_lane % 16u; // 0..15
-    const uint row_idx   = tgp_pos.x * 8u + simd_id * 2u + sub_group;
-    if (row_idx >= params.N) {
-        return;
-    }
 
-    const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 8u + simd_id * 2u + sub_group;
+        if (row_idx >= params.N) {
+            continue;
+        }
 
-    float acc = 0.0f;
-    for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
+        device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
 
-    // 16-lane reduction within half-simdgroup
-    acc += simd_shuffle_down(acc, 8u);
-    acc += simd_shuffle_down(acc, 4u);
-    acc += simd_shuffle_down(acc, 2u);
-    acc += simd_shuffle_down(acc, 1u);
+        float acc = 0.0f;
+        for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
 
-    if (sub_lane == 0u) {
-        output_y[row_idx] = f32_to_bf16(acc);
+        // 16-lane reduction within half-simdgroup
+        acc += simd_shuffle_down(acc, 8u);
+        acc += simd_shuffle_down(acc, 4u);
+        acc += simd_shuffle_down(acc, 2u);
+        acc += simd_shuffle_down(acc, 1u);
+
+        if (sub_lane == 0u) {
+            output_y[row_idx] = f32_to_bf16(acc);
+        }
     }
 }
 
-/// Fused Decode GEMV + Residual Accumulate Kernel (M = 1).
+/// Fused Decode GEMV + Residual Accumulate Kernel (M = 1, persistent threadgroups).
 /// Projects input_x and adds directly into residual_inout in registers, eliminating
 /// the separate residual_add kernel and avoiding extra unified memory roundtrips.
 kernel void q4_g64_decode_gemv_accumulate(
@@ -447,30 +457,35 @@ kernel void q4_g64_decode_gemv_accumulate(
     device ushort*               residual_inout [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params         [[buffer(3)]],
     uint3                        tgp_pos        [[threadgroup_position_in_grid]],
+    uint3                        grid_dim       [[threadgroups_per_grid]],
     uint                         simd_id        [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane      [[thread_index_in_simdgroup]]
 ) {
-    const uint row_idx = tgp_pos.x * 4u + simd_id;
-    if (row_idx >= params.N) {
-        return;
-    }
-
+    const uint total_tiles = (params.N + 3u) / 4u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
 
-    float acc = 0.0f;
-    for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= params.N) {
+            continue;
+        }
 
-    float row_result = simd_sum(acc);
-    if (simd_lane == 0u) {
-        float r = bf16_to_f32(residual_inout[row_idx]);
-        residual_inout[row_idx] = f32_to_bf16(row_result + r);
+        device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            float r = bf16_to_f32(residual_inout[row_idx]);
+            residual_inout[row_idx] = f32_to_bf16(row_result + r);
+        }
     }
 }
 
-/// 16-Lane Sub-Warp Fused Decode GEMV + Residual Accumulate Kernel (M = 1, K <= 1024).
+/// 16-Lane Sub-Warp Fused Decode GEMV + Residual Accumulate Kernel (M = 1, K <= 1024, persistent threadgroups).
 /// Each SIMDgroup of 32 lanes computes TWO rows concurrently (16 lanes per row),
 /// doubling occupancy and hardware throughput for hidden sizes <= 1024.
 kernel void q4_g64_decode_gemv_accumulate_sub16(
@@ -479,37 +494,42 @@ kernel void q4_g64_decode_gemv_accumulate_sub16(
     device ushort*               residual_inout [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params         [[buffer(3)]],
     uint3                        tgp_pos        [[threadgroup_position_in_grid]],
+    uint3                        grid_dim       [[threadgroups_per_grid]],
     uint                         simd_id        [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane      [[thread_index_in_simdgroup]]
 ) {
+    const uint total_tiles = (params.N + 7u) / 8u;
+    const uint num_blocks = params.num_k_blocks;
     const uint sub_id   = simd_lane >> 4u;
     const uint sub_lane = simd_lane & 0x0Fu;
-    const uint row_idx  = tgp_pos.x * 8u + simd_id * 2u + sub_id;
-    if (row_idx >= params.N) {
-        return;
-    }
 
-    const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx  = tile_x * 8u + simd_id * 2u + sub_id;
+        if (row_idx >= params.N) {
+            continue;
+        }
 
-    float acc = 0.0f;
-    for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
+        device const BlockQ4Group64* row_blocks = weights + (row_idx * num_blocks);
 
-    // 16-lane reduction within half-simdgroup
-    acc += simd_shuffle_down(acc, 8u);
-    acc += simd_shuffle_down(acc, 4u);
-    acc += simd_shuffle_down(acc, 2u);
-    acc += simd_shuffle_down(acc, 1u);
+        float acc = 0.0f;
+        for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
 
-    if (sub_lane == 0u) {
-        float r = bf16_to_f32(residual_inout[row_idx]);
-        residual_inout[row_idx] = f32_to_bf16(acc + r);
+        // 16-lane reduction within half-simdgroup
+        acc += simd_shuffle_down(acc, 8u);
+        acc += simd_shuffle_down(acc, 4u);
+        acc += simd_shuffle_down(acc, 2u);
+        acc += simd_shuffle_down(acc, 1u);
+
+        if (sub_lane == 0u) {
+            float r = bf16_to_f32(residual_inout[row_idx]);
+            residual_inout[row_idx] = f32_to_bf16(acc + r);
+        }
     }
 }
 
-/// 2-Row Distributive M=1 Decode GEMV Kernel (64-element blocks).
+/// 2-Row Distributive M=1 Decode GEMV Kernel (64-element blocks, persistent threadgroups).
 /// Each SIMDgroup computes TWO output rows simultaneously using shared activation loads.
 /// Dispatched with 128 threads/threadgroup (4 SIMDgroups = 8 rows/threadgroup).
 kernel void q4_g64_decode_gemv_2row(
@@ -518,51 +538,56 @@ kernel void q4_g64_decode_gemv_2row(
     device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params    [[buffer(3)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
-    const uint row0 = tgp_pos.x * 8u + simd_id * 2u;
-    const uint row1 = row0 + 1u;
-    if (row0 >= params.N) {
-        return;
-    }
-
+    const uint total_tiles = (params.N + 7u) / 8u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
-    const bool has_row1 = (row1 < params.N);
-    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-
-    if (has_row1) {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_2row_block_dot_distributive(
-                row0_blocks[blk_idx],
-                row1_blocks[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc0,
-                acc1
-            );
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row0 = tile_x * 8u + simd_id * 2u;
+        const uint row1 = row0 + 1u;
+        if (row0 >= params.N) {
+            continue;
         }
-    } else {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], input_x + (blk_idx * 64u));
-        }
-    }
 
-    float res0 = simd_sum(acc0);
-    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+        device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+        const bool has_row1 = (row1 < params.N);
+        device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
 
-    if (simd_lane == 0u) {
-        output_y[row0] = f32_to_bf16(res0);
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+
         if (has_row1) {
-            output_y[row1] = f32_to_bf16(res1);
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_2row_block_dot_distributive(
+                    row0_blocks[blk_idx],
+                    row1_blocks[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0,
+                    acc1
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], input_x + (blk_idx * 64u));
+            }
+        }
+
+        float res0 = simd_sum(acc0);
+        float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+        if (simd_lane == 0u) {
+            output_y[row0] = f32_to_bf16(res0);
+            if (has_row1) {
+                output_y[row1] = f32_to_bf16(res1);
+            }
         }
     }
 }
 
-/// 2-Row Fused Decode GEMV + Residual Accumulate Kernel (M = 1).
+/// 2-Row Fused Decode GEMV + Residual Accumulate Kernel (M = 1, persistent threadgroups).
 /// Each SIMDgroup computes TWO output rows simultaneously using shared activation loads
 /// and adds directly into residual_inout in registers.
 kernel void q4_g64_decode_gemv_accumulate_2row(
@@ -571,53 +596,58 @@ kernel void q4_g64_decode_gemv_accumulate_2row(
     device ushort*               residual_inout [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params         [[buffer(3)]],
     uint3                        tgp_pos        [[threadgroup_position_in_grid]],
+    uint3                        grid_dim       [[threadgroups_per_grid]],
     uint                         simd_id        [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane      [[thread_index_in_simdgroup]]
 ) {
-    const uint row0 = tgp_pos.x * 8u + simd_id * 2u;
-    const uint row1 = row0 + 1u;
-    if (row0 >= params.N) {
-        return;
-    }
-
+    const uint total_tiles = (params.N + 7u) / 8u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
-    const bool has_row1 = (row1 < params.N);
-    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-
-    if (has_row1) {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_2row_block_dot_distributive(
-                row0_blocks[blk_idx],
-                row1_blocks[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc0,
-                acc1
-            );
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row0 = tile_x * 8u + simd_id * 2u;
+        const uint row1 = row0 + 1u;
+        if (row0 >= params.N) {
+            continue;
         }
-    } else {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], input_x + (blk_idx * 64u));
-        }
-    }
 
-    float res0 = simd_sum(acc0);
-    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+        device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+        const bool has_row1 = (row1 < params.N);
+        device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
 
-    if (simd_lane == 0u) {
-        float r0 = bf16_to_f32(residual_inout[row0]);
-        residual_inout[row0] = f32_to_bf16(res0 + r0);
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+
         if (has_row1) {
-            float r1 = bf16_to_f32(residual_inout[row1]);
-            residual_inout[row1] = f32_to_bf16(res1 + r1);
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_2row_block_dot_distributive(
+                    row0_blocks[blk_idx],
+                    row1_blocks[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0,
+                    acc1
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], input_x + (blk_idx * 64u));
+            }
+        }
+
+        float res0 = simd_sum(acc0);
+        float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+        if (simd_lane == 0u) {
+            float r0 = bf16_to_f32(residual_inout[row0]);
+            residual_inout[row0] = f32_to_bf16(res0 + r0);
+            if (has_row1) {
+                float r1 = bf16_to_f32(residual_inout[row1]);
+                residual_inout[row1] = f32_to_bf16(res1 + r1);
+            }
         }
     }
 }
 
-/// 4-Row Distributive M=1 Decode GEMV Kernel (64-element blocks).
+/// 4-Row Distributive M=1 Decode GEMV Kernel (64-element blocks, persistent threadgroups).
 /// Each SIMDgroup computes FOUR output rows simultaneously using shared activation loads.
 /// Dispatched with 128 threads/threadgroup (4 SIMDgroups = 16 rows/threadgroup).
 kernel void q4_g64_decode_gemv_4row(
@@ -626,62 +656,67 @@ kernel void q4_g64_decode_gemv_4row(
     device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params    [[buffer(3)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
-    const uint row0 = tgp_pos.x * 16u + simd_id * 4u;
-    const uint row1 = row0 + 1u;
-    const uint row2 = row0 + 2u;
-    const uint row3 = row0 + 3u;
-    if (row0 >= params.N) {
-        return;
-    }
-
+    const uint total_tiles = (params.N + 15u) / 16u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
-    const bool has_row1 = (row1 < params.N);
-    const bool has_row2 = (row2 < params.N);
-    const bool has_row3 = (row3 < params.N);
-    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
-    device const BlockQ4Group64* row2_blocks = has_row2 ? weights + (row2 * num_blocks) : row0_blocks;
-    device const BlockQ4Group64* row3_blocks = has_row3 ? weights + (row3 * num_blocks) : row0_blocks;
 
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-
-    if (has_row3) {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_4row_block_dot_distributive(
-                row0_blocks[blk_idx],
-                row1_blocks[blk_idx],
-                row2_blocks[blk_idx],
-                row3_blocks[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc0, acc1, acc2, acc3
-            );
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row0 = tile_x * 16u + simd_id * 4u;
+        const uint row1 = row0 + 1u;
+        const uint row2 = row0 + 2u;
+        const uint row3 = row0 + 3u;
+        if (row0 >= params.N) {
+            continue;
         }
-    } else {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            device const ushort* x_p = input_x + (blk_idx * 64u);
-            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], x_p);
-            if (has_row1) acc1 += q4_g64_block_dot_distributive(row1_blocks[blk_idx], x_p);
-            if (has_row2) acc2 += q4_g64_block_dot_distributive(row2_blocks[blk_idx], x_p);
+
+        device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+        const bool has_row1 = (row1 < params.N);
+        const bool has_row2 = (row2 < params.N);
+        const bool has_row3 = (row3 < params.N);
+        device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
+        device const BlockQ4Group64* row2_blocks = has_row2 ? weights + (row2 * num_blocks) : row0_blocks;
+        device const BlockQ4Group64* row3_blocks = has_row3 ? weights + (row3 * num_blocks) : row0_blocks;
+
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+        if (has_row3) {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_4row_block_dot_distributive(
+                    row0_blocks[blk_idx],
+                    row1_blocks[blk_idx],
+                    row2_blocks[blk_idx],
+                    row3_blocks[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0, acc1, acc2, acc3
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                device const ushort* x_p = input_x + (blk_idx * 64u);
+                acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], x_p);
+                if (has_row1) acc1 += q4_g64_block_dot_distributive(row1_blocks[blk_idx], x_p);
+                if (has_row2) acc2 += q4_g64_block_dot_distributive(row2_blocks[blk_idx], x_p);
+            }
         }
-    }
 
-    float res0 = simd_sum(acc0);
-    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
-    float res2 = has_row2 ? simd_sum(acc2) : 0.0f;
-    float res3 = has_row3 ? simd_sum(acc3) : 0.0f;
+        float res0 = simd_sum(acc0);
+        float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+        float res2 = has_row2 ? simd_sum(acc2) : 0.0f;
+        float res3 = has_row3 ? simd_sum(acc3) : 0.0f;
 
-    if (simd_lane == 0u) {
-        output_y[row0] = f32_to_bf16(res0);
-        if (has_row1) output_y[row1] = f32_to_bf16(res1);
-        if (has_row2) output_y[row2] = f32_to_bf16(res2);
-        if (has_row3) output_y[row3] = f32_to_bf16(res3);
+        if (simd_lane == 0u) {
+            output_y[row0] = f32_to_bf16(res0);
+            if (has_row1) output_y[row1] = f32_to_bf16(res1);
+            if (has_row2) output_y[row2] = f32_to_bf16(res2);
+            if (has_row3) output_y[row3] = f32_to_bf16(res3);
+        }
     }
 }
 
-/// 4-Row Fused Decode GEMV + Residual Accumulate Kernel (M = 1).
+/// 4-Row Fused Decode GEMV + Residual Accumulate Kernel (M = 1, persistent threadgroups).
 /// Each SIMDgroup computes FOUR output rows simultaneously using shared activation loads
 /// and adds directly into residual_inout in registers.
 kernel void q4_g64_decode_gemv_accumulate_4row(
@@ -690,67 +725,72 @@ kernel void q4_g64_decode_gemv_accumulate_4row(
     device ushort*               residual_inout [[buffer(2)]], // bf16 [1, N]
     constant GemmParams&         params         [[buffer(3)]],
     uint3                        tgp_pos        [[threadgroup_position_in_grid]],
+    uint3                        grid_dim       [[threadgroups_per_grid]],
     uint                         simd_id        [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane      [[thread_index_in_simdgroup]]
 ) {
-    const uint row0 = tgp_pos.x * 16u + simd_id * 4u;
-    const uint row1 = row0 + 1u;
-    const uint row2 = row0 + 2u;
-    const uint row3 = row0 + 3u;
-    if (row0 >= params.N) {
-        return;
-    }
-
+    const uint total_tiles = (params.N + 15u) / 16u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
-    const bool has_row1 = (row1 < params.N);
-    const bool has_row2 = (row2 < params.N);
-    const bool has_row3 = (row3 < params.N);
-    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
-    device const BlockQ4Group64* row2_blocks = has_row2 ? weights + (row2 * num_blocks) : row0_blocks;
-    device const BlockQ4Group64* row3_blocks = has_row3 ? weights + (row3 * num_blocks) : row0_blocks;
 
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row0 = tile_x * 16u + simd_id * 4u;
+        const uint row1 = row0 + 1u;
+        const uint row2 = row0 + 2u;
+        const uint row3 = row0 + 3u;
+        if (row0 >= params.N) {
+            continue;
+        }
 
-    if (has_row3) {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_4row_block_dot_distributive(
-                row0_blocks[blk_idx],
-                row1_blocks[blk_idx],
-                row2_blocks[blk_idx],
-                row3_blocks[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc0, acc1, acc2, acc3
-            );
-        }
-    } else {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            device const ushort* x_p = input_x + (blk_idx * 64u);
-            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], x_p);
-            if (has_row1) acc1 += q4_g64_block_dot_distributive(row1_blocks[blk_idx], x_p);
-            if (has_row2) acc2 += q4_g64_block_dot_distributive(row2_blocks[blk_idx], x_p);
-        }
-    }
+        device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+        const bool has_row1 = (row1 < params.N);
+        const bool has_row2 = (row2 < params.N);
+        const bool has_row3 = (row3 < params.N);
+        device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
+        device const BlockQ4Group64* row2_blocks = has_row2 ? weights + (row2 * num_blocks) : row0_blocks;
+        device const BlockQ4Group64* row3_blocks = has_row3 ? weights + (row3 * num_blocks) : row0_blocks;
 
-    float res0 = simd_sum(acc0);
-    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
-    float res2 = has_row2 ? simd_sum(acc2) : 0.0f;
-    float res3 = has_row3 ? simd_sum(acc3) : 0.0f;
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
-    if (simd_lane == 0u) {
-        float r0 = bf16_to_f32(residual_inout[row0]);
-        residual_inout[row0] = f32_to_bf16(res0 + r0);
-        if (has_row1) {
-            float r1 = bf16_to_f32(residual_inout[row1]);
-            residual_inout[row1] = f32_to_bf16(res1 + r1);
-        }
-        if (has_row2) {
-            float r2 = bf16_to_f32(residual_inout[row2]);
-            residual_inout[row2] = f32_to_bf16(res2 + r2);
-        }
         if (has_row3) {
-            float r3 = bf16_to_f32(residual_inout[row3]);
-            residual_inout[row3] = f32_to_bf16(res3 + r3);
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_4row_block_dot_distributive(
+                    row0_blocks[blk_idx],
+                    row1_blocks[blk_idx],
+                    row2_blocks[blk_idx],
+                    row3_blocks[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0, acc1, acc2, acc3
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                device const ushort* x_p = input_x + (blk_idx * 64u);
+                acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], x_p);
+                if (has_row1) acc1 += q4_g64_block_dot_distributive(row1_blocks[blk_idx], x_p);
+                if (has_row2) acc2 += q4_g64_block_dot_distributive(row2_blocks[blk_idx], x_p);
+            }
+        }
+
+        float res0 = simd_sum(acc0);
+        float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+        float res2 = has_row2 ? simd_sum(acc2) : 0.0f;
+        float res3 = has_row3 ? simd_sum(acc3) : 0.0f;
+
+        if (simd_lane == 0u) {
+            float r0 = bf16_to_f32(residual_inout[row0]);
+            residual_inout[row0] = f32_to_bf16(res0 + r0);
+            if (has_row1) {
+                float r1 = bf16_to_f32(residual_inout[row1]);
+                residual_inout[row1] = f32_to_bf16(res1 + r1);
+            }
+            if (has_row2) {
+                float r2 = bf16_to_f32(residual_inout[row2]);
+                residual_inout[row2] = f32_to_bf16(res2 + r2);
+            }
+            if (has_row3) {
+                float r3 = bf16_to_f32(residual_inout[row3]);
+                residual_inout[row3] = f32_to_bf16(res3 + r3);
+            }
         }
     }
 }
@@ -798,7 +838,7 @@ inline QkvRowMeta get_qkv_row_meta(
     return meta;
 }
 
-/// 2-Row Distributive Fused QKV Decode GEMV Kernel (M = 1).
+/// 2-Row Distributive Fused QKV Decode GEMV Kernel (M = 1, persistent threadgroups).
 /// Each SIMDgroup computes TWO output rows simultaneously using shared activation vector loads,
 /// cutting activation DRAM memory traffic and instruction overhead by 50%.
 kernel void q4_g64_decode_qkv_gemv_2row(
@@ -814,65 +854,70 @@ kernel void q4_g64_decode_qkv_gemv_2row(
     device const ushort*         v_bias    [[buffer(9)]], // bf16 [v_dim]
     constant QkvGemmParams&      params    [[buffer(10)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
     const uint total_rows = params.q_dim + params.k_dim + params.v_dim;
-    const uint row0 = tgp_pos.x * 8u + simd_id * 2u;
-    const uint row1 = row0 + 1u;
-    if (row0 >= total_rows) {
-        return;
-    }
-
-    QkvRowMeta meta0 = get_qkv_row_meta(
-        row0, params, q_weights, k_weights, v_weights,
-        q_out, k_out, v_out, q_bias, k_bias, v_bias
-    );
-    const bool has_row1 = (row1 < total_rows);
-    QkvRowMeta meta1 = has_row1 ? get_qkv_row_meta(
-        row1, params, q_weights, k_weights, v_weights,
-        q_out, k_out, v_out, q_bias, k_bias, v_bias
-    ) : meta0;
-
+    const uint total_tiles = (total_rows + 7u) / 8u;
     const uint num_blocks = params.num_k_blocks;
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
 
-    if (has_row1) {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_2row_block_dot_distributive(
-                meta0.row_blocks[blk_idx],
-                meta1.row_blocks[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc0,
-                acc1
-            );
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row0 = tile_x * 8u + simd_id * 2u;
+        const uint row1 = row0 + 1u;
+        if (row0 >= total_rows) {
+            continue;
         }
-    } else {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            acc0 += q4_g64_block_dot_distributive(meta0.row_blocks[blk_idx], input_x + (blk_idx * 64u));
-        }
-    }
 
-    float res0 = simd_sum(acc0);
-    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+        QkvRowMeta meta0 = get_qkv_row_meta(
+            row0, params, q_weights, k_weights, v_weights,
+            q_out, k_out, v_out, q_bias, k_bias, v_bias
+        );
+        const bool has_row1 = (row1 < total_rows);
+        QkvRowMeta meta1 = has_row1 ? get_qkv_row_meta(
+            row1, params, q_weights, k_weights, v_weights,
+            q_out, k_out, v_out, q_bias, k_bias, v_bias
+        ) : meta0;
 
-    if (simd_lane == 0u) {
-        if (meta0.bias_ptr != nullptr) {
-            res0 += bf16_to_f32(*meta0.bias_ptr);
-        }
-        meta0.out_ptr[meta0.out_idx] = f32_to_bf16(res0);
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
 
         if (has_row1) {
-            if (meta1.bias_ptr != nullptr) {
-                res1 += bf16_to_f32(*meta1.bias_ptr);
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_2row_block_dot_distributive(
+                    meta0.row_blocks[blk_idx],
+                    meta1.row_blocks[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0,
+                    acc1
+                );
             }
-            meta1.out_ptr[meta1.out_idx] = f32_to_bf16(res1);
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                acc0 += q4_g64_block_dot_distributive(meta0.row_blocks[blk_idx], input_x + (blk_idx * 64u));
+            }
+        }
+
+        float res0 = simd_sum(acc0);
+        float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+        if (simd_lane == 0u) {
+            if (meta0.bias_ptr != nullptr) {
+                res0 += bf16_to_f32(*meta0.bias_ptr);
+            }
+            meta0.out_ptr[meta0.out_idx] = f32_to_bf16(res0);
+
+            if (has_row1) {
+                if (meta1.bias_ptr != nullptr) {
+                    res1 += bf16_to_f32(*meta1.bias_ptr);
+                }
+                meta1.out_ptr[meta1.out_idx] = f32_to_bf16(res1);
+            }
         }
     }
 }
 
-/// Fused QKV Decode GEMV Kernel (M=1, 32 lanes per row).
+/// Fused QKV Decode GEMV Kernel (M=1, 32 lanes per row, persistent threadgroups).
 /// Projects input_x into Q, K, and V buffers in a SINGLE compute dispatch,
 /// directly incorporating optional learned QKV bias in registers before unified memory store.
 kernel void q4_g64_decode_qkv_gemv(
@@ -888,61 +933,66 @@ kernel void q4_g64_decode_qkv_gemv(
     device const ushort*         v_bias    [[buffer(9)]], // bf16 [v_dim]
     constant QkvGemmParams&      params    [[buffer(10)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
     const uint total_rows = params.q_dim + params.k_dim + params.v_dim;
-    const uint row_idx = tgp_pos.x * 4u + simd_id;
-    if (row_idx >= total_rows) {
-        return;
-    }
-
-    device const BlockQ4Group64* row_blocks;
-    device ushort* out_ptr;
-    uint out_idx;
-    device const ushort* bias_ptr = nullptr;
-
-    if (row_idx < params.q_dim) {
-        row_blocks = q_weights + (row_idx * params.num_k_blocks);
-        out_ptr = q_out;
-        out_idx = row_idx;
-        if (params.has_bias != 0u) {
-            bias_ptr = q_bias + row_idx;
-        }
-    } else if (row_idx < params.q_dim + params.k_dim) {
-        uint k_idx = row_idx - params.q_dim;
-        row_blocks = k_weights + (k_idx * params.num_k_blocks);
-        out_ptr = k_out;
-        out_idx = k_idx;
-        if (params.has_bias != 0u) {
-            bias_ptr = k_bias + k_idx;
-        }
-    } else {
-        uint v_idx = row_idx - (params.q_dim + params.k_dim);
-        row_blocks = v_weights + (v_idx * params.num_k_blocks);
-        out_ptr = v_out;
-        out_idx = v_idx;
-        if (params.has_bias != 0u) {
-            bias_ptr = v_bias + v_idx;
-        }
-    }
-
+    const uint total_tiles = (total_rows + 3u) / 4u;
     const uint num_blocks = params.num_k_blocks;
-    float acc = 0.0f;
-    for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
 
-    float row_result = simd_sum(acc);
-    if (simd_lane == 0u) {
-        if (bias_ptr != nullptr) {
-            row_result += bf16_to_f32(*bias_ptr);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= total_rows) {
+            continue;
         }
-        out_ptr[out_idx] = f32_to_bf16(row_result);
+
+        device const BlockQ4Group64* row_blocks;
+        device ushort* out_ptr;
+        uint out_idx;
+        device const ushort* bias_ptr = nullptr;
+
+        if (row_idx < params.q_dim) {
+            row_blocks = q_weights + (row_idx * params.num_k_blocks);
+            out_ptr = q_out;
+            out_idx = row_idx;
+            if (params.has_bias != 0u) {
+                bias_ptr = q_bias + row_idx;
+            }
+        } else if (row_idx < params.q_dim + params.k_dim) {
+            uint k_idx = row_idx - params.q_dim;
+            row_blocks = k_weights + (k_idx * params.num_k_blocks);
+            out_ptr = k_out;
+            out_idx = k_idx;
+            if (params.has_bias != 0u) {
+                bias_ptr = k_bias + k_idx;
+            }
+        } else {
+            uint v_idx = row_idx - (params.q_dim + params.k_dim);
+            row_blocks = v_weights + (v_idx * params.num_k_blocks);
+            out_ptr = v_out;
+            out_idx = v_idx;
+            if (params.has_bias != 0u) {
+                bias_ptr = v_bias + v_idx;
+            }
+        }
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            if (bias_ptr != nullptr) {
+                row_result += bf16_to_f32(*bias_ptr);
+            }
+            out_ptr[out_idx] = f32_to_bf16(row_result);
+        }
     }
 }
 
-/// Multi-Row Fused QKV Decode GEMV Kernel (num_k_blocks <= 16).
+/// Multi-Row Fused QKV Decode GEMV Kernel (num_k_blocks <= 16, persistent threadgroups).
 /// Each SIMD group computes 2 rows simultaneously (16 threads per row).
 /// Grid: total_rows.div_ceil(8) threadgroups of 128 threads.
 kernel void q4_g64_decode_qkv_gemv_sub16(
@@ -958,67 +1008,72 @@ kernel void q4_g64_decode_qkv_gemv_sub16(
     device const ushort*         v_bias    [[buffer(9)]], // bf16 [v_dim]
     constant QkvGemmParams&      params    [[buffer(10)]],
     uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
     uint                         simd_id   [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
     const uint total_rows = params.q_dim + params.k_dim + params.v_dim;
+    const uint total_tiles = (total_rows + 7u) / 8u;
     const uint sub_group = simd_lane / 16u;
     const uint sub_lane  = simd_lane % 16u;
-    const uint row_idx   = tgp_pos.x * 8u + simd_id * 2u + sub_group;
-    if (row_idx >= total_rows) {
-        return;
-    }
-
-    device const BlockQ4Group64* row_blocks;
-    device ushort* out_ptr;
-    uint out_idx;
-    device const ushort* bias_ptr = nullptr;
-
-    if (row_idx < params.q_dim) {
-        row_blocks = q_weights + (row_idx * params.num_k_blocks);
-        out_ptr = q_out;
-        out_idx = row_idx;
-        if (params.has_bias != 0u) {
-            bias_ptr = q_bias + row_idx;
-        }
-    } else if (row_idx < params.q_dim + params.k_dim) {
-        uint k_idx = row_idx - params.q_dim;
-        row_blocks = k_weights + (k_idx * params.num_k_blocks);
-        out_ptr = k_out;
-        out_idx = k_idx;
-        if (params.has_bias != 0u) {
-            bias_ptr = k_bias + k_idx;
-        }
-    } else {
-        uint v_idx = row_idx - (params.q_dim + params.k_dim);
-        row_blocks = v_weights + (v_idx * params.num_k_blocks);
-        out_ptr = v_out;
-        out_idx = v_idx;
-        if (params.has_bias != 0u) {
-            bias_ptr = v_bias + v_idx;
-        }
-    }
-
     const uint num_blocks = params.num_k_blocks;
-    float acc = 0.0f;
-    for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
 
-    acc += simd_shuffle_down(acc, 8u);
-    acc += simd_shuffle_down(acc, 4u);
-    acc += simd_shuffle_down(acc, 2u);
-    acc += simd_shuffle_down(acc, 1u);
-
-    if (sub_lane == 0u) {
-        if (bias_ptr != nullptr) {
-            acc += bf16_to_f32(*bias_ptr);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 8u + simd_id * 2u + sub_group;
+        if (row_idx >= total_rows) {
+            continue;
         }
-        out_ptr[out_idx] = f32_to_bf16(acc);
+
+        device const BlockQ4Group64* row_blocks;
+        device ushort* out_ptr;
+        uint out_idx;
+        device const ushort* bias_ptr = nullptr;
+
+        if (row_idx < params.q_dim) {
+            row_blocks = q_weights + (row_idx * params.num_k_blocks);
+            out_ptr = q_out;
+            out_idx = row_idx;
+            if (params.has_bias != 0u) {
+                bias_ptr = q_bias + row_idx;
+            }
+        } else if (row_idx < params.q_dim + params.k_dim) {
+            uint k_idx = row_idx - params.q_dim;
+            row_blocks = k_weights + (k_idx * params.num_k_blocks);
+            out_ptr = k_out;
+            out_idx = k_idx;
+            if (params.has_bias != 0u) {
+                bias_ptr = k_bias + k_idx;
+            }
+        } else {
+            uint v_idx = row_idx - (params.q_dim + params.k_dim);
+            row_blocks = v_weights + (v_idx * params.num_k_blocks);
+            out_ptr = v_out;
+            out_idx = v_idx;
+            if (params.has_bias != 0u) {
+                bias_ptr = v_bias + v_idx;
+            }
+        }
+
+        float acc = 0.0f;
+        for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        acc += simd_shuffle_down(acc, 8u);
+        acc += simd_shuffle_down(acc, 4u);
+        acc += simd_shuffle_down(acc, 2u);
+        acc += simd_shuffle_down(acc, 1u);
+
+        if (sub_lane == 0u) {
+            if (bias_ptr != nullptr) {
+                acc += bf16_to_f32(*bias_ptr);
+            }
+            out_ptr[out_idx] = f32_to_bf16(acc);
+        }
     }
 }
 
-/// Fused Gate+Up Decode GEMV Kernel (M = 1, 32 lanes per row).
+/// Fused Gate+Up Decode GEMV Kernel (M = 1, 32 lanes per row, persistent threadgroups).
 kernel void q4_g64_decode_gate_up_gemv(
     device const BlockQ4Group64* gate_weights [[buffer(0)]],
     device const BlockQ4Group64* up_weights   [[buffer(1)]],
@@ -1027,43 +1082,48 @@ kernel void q4_g64_decode_gate_up_gemv(
     device ushort*               up_out       [[buffer(4)]], // bf16 [1, intermediate_size]
     constant GateUpGemmParams&   params       [[buffer(5)]],
     uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint3                        grid_dim     [[threadgroups_per_grid]],
     uint                         simd_id      [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane    [[thread_index_in_simdgroup]]
 ) {
     const uint total_rows = params.intermediate_size * 2u;
-    const uint row_idx = tgp_pos.x * 4u + simd_id;
-    if (row_idx >= total_rows) {
-        return;
-    }
-
-    device const BlockQ4Group64* row_blocks;
-    device ushort* out_ptr;
-    uint out_idx;
-
-    if (row_idx < params.intermediate_size) {
-        row_blocks = gate_weights + (row_idx * params.num_k_blocks);
-        out_ptr = gate_out;
-        out_idx = row_idx;
-    } else {
-        uint u_idx = row_idx - params.intermediate_size;
-        row_blocks = up_weights + (u_idx * params.num_k_blocks);
-        out_ptr = up_out;
-        out_idx = u_idx;
-    }
-
+    const uint total_tiles = (total_rows + 3u) / 4u;
     const uint num_blocks = params.num_k_blocks;
-    float acc = 0.0f;
-    for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-        acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
-    }
 
-    float row_result = simd_sum(acc);
-    if (simd_lane == 0u) {
-        out_ptr[out_idx] = f32_to_bf16(row_result);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= total_rows) {
+            continue;
+        }
+
+        device const BlockQ4Group64* row_blocks;
+        device ushort* out_ptr;
+        uint out_idx;
+
+        if (row_idx < params.intermediate_size) {
+            row_blocks = gate_weights + (row_idx * params.num_k_blocks);
+            out_ptr = gate_out;
+            out_idx = row_idx;
+        } else {
+            uint u_idx = row_idx - params.intermediate_size;
+            row_blocks = up_weights + (u_idx * params.num_k_blocks);
+            out_ptr = up_out;
+            out_idx = u_idx;
+        }
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            out_ptr[out_idx] = f32_to_bf16(row_result);
+        }
     }
 }
 
-/// Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 32 lanes per row).
+/// Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 32 lanes per row, persistent threadgroups).
 /// Evaluates gate and up projections concurrently in registers and applies the chosen
 /// activation (SwiGLU / GeGLU / ReLU) directly before storing to unified memory.
 /// Eliminates intermediate DRAM writes and reads for gate and up buffers.
@@ -1074,48 +1134,53 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv(
     device ushort*               mlp_out      [[buffer(3)]], // bf16 [1, intermediate_size]
     constant GateUpSwigluGemmParams& params   [[buffer(4)]],
     uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint3                        grid_dim     [[threadgroups_per_grid]],
     uint                         simd_id      [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane    [[thread_index_in_simdgroup]]
 ) {
-    const uint row_idx = tgp_pos.x * 4u + simd_id;
-    if (row_idx >= params.intermediate_size) {
-        return;
-    }
-
+    const uint total_tiles = (params.intermediate_size + 3u) / 4u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* gate_row = gate_weights + (row_idx * num_blocks);
-    device const BlockQ4Group64* up_row   = up_weights + (row_idx * num_blocks);
 
-    float acc_gate = 0.0f;
-    float acc_up   = 0.0f;
-    for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-        q4_g64_2row_block_dot_distributive(
-            gate_row[blk_idx],
-            up_row[blk_idx],
-            input_x + (blk_idx * 64u),
-            acc_gate,
-            acc_up
-        );
-    }
-
-    float g = simd_sum(acc_gate);
-    float u = simd_sum(acc_up);
-    if (simd_lane == 0u) {
-        float act_g = 0.0f;
-        if (params.activation_variant == 0u) {
-            act_g = g / (1.0f + exp(-g));
-        } else if (params.activation_variant == 1u) {
-            constexpr float SQRT_2_OVER_PI = 0.7978845608f;
-            float cubic = fma(0.044715f * g, g * g, g);
-            act_g = 0.5f * g * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
-        } else {
-            act_g = max(g, 0.0f);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= params.intermediate_size) {
+            continue;
         }
-        mlp_out[row_idx] = f32_to_bf16(act_g * u);
+
+        device const BlockQ4Group64* gate_row = gate_weights + (row_idx * num_blocks);
+        device const BlockQ4Group64* up_row   = up_weights + (row_idx * num_blocks);
+
+        float acc_gate = 0.0f;
+        float acc_up   = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_2row_block_dot_distributive(
+                gate_row[blk_idx],
+                up_row[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc_gate,
+                acc_up
+            );
+        }
+
+        float g = simd_sum(acc_gate);
+        float u = simd_sum(acc_up);
+        if (simd_lane == 0u) {
+            float act_g = 0.0f;
+            if (params.activation_variant == 0u) {
+                act_g = g / (1.0f + exp(-g));
+            } else if (params.activation_variant == 1u) {
+                constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+                float cubic = fma(0.044715f * g, g * g, g);
+                act_g = 0.5f * g * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+            } else {
+                act_g = max(g, 0.0f);
+            }
+            mlp_out[row_idx] = f32_to_bf16(act_g * u);
+        }
     }
 }
 
-/// 2-Channel Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 4 rows per SIMDgroup).
+/// 2-Channel Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 4 rows per SIMDgroup, persistent threadgroups).
 /// Concurrently computes Gate and Up projections for TWO intermediate channels in registers
 /// using 4-row distributive dot product, cutting activation DRAM bandwidth by 75%.
 /// Eliminates intermediate DRAM writes and reads for both gate and up channels.
@@ -1126,84 +1191,89 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv_2chan(
     device ushort*               mlp_out      [[buffer(3)]], // bf16 [1, intermediate_size]
     constant GateUpSwigluGemmParams& params   [[buffer(4)]],
     uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint3                        grid_dim     [[threadgroups_per_grid]],
     uint                         simd_id      [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane    [[thread_index_in_simdgroup]]
 ) {
-    const uint chan0 = tgp_pos.x * 8u + simd_id * 2u;
-    const uint chan1 = chan0 + 1u;
-    if (chan0 >= params.intermediate_size) {
-        return;
-    }
-
+    const uint total_tiles = (params.intermediate_size + 7u) / 8u;
     const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* gate_row0 = gate_weights + (chan0 * num_blocks);
-    device const BlockQ4Group64* up_row0   = up_weights   + (chan0 * num_blocks);
-    const bool has_chan1 = (chan1 < params.intermediate_size);
-    device const BlockQ4Group64* gate_row1 = has_chan1 ? gate_weights + (chan1 * num_blocks) : gate_row0;
-    device const BlockQ4Group64* up_row1   = has_chan1 ? up_weights   + (chan1 * num_blocks) : up_row0;
 
-    float acc_gate0 = 0.0f, acc_up0 = 0.0f;
-    float acc_gate1 = 0.0f, acc_up1 = 0.0f;
-
-    if (has_chan1) {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_4row_block_dot_distributive(
-                gate_row0[blk_idx],
-                up_row0[blk_idx],
-                gate_row1[blk_idx],
-                up_row1[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc_gate0, acc_up0, acc_gate1, acc_up1
-            );
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint chan0 = tile_x * 8u + simd_id * 2u;
+        const uint chan1 = chan0 + 1u;
+        if (chan0 >= params.intermediate_size) {
+            continue;
         }
-    } else {
-        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
-            q4_g64_2row_block_dot_distributive(
-                gate_row0[blk_idx],
-                up_row0[blk_idx],
-                input_x + (blk_idx * 64u),
-                acc_gate0, acc_up0
-            );
-        }
-    }
 
-    float g0 = simd_sum(acc_gate0);
-    float u0 = simd_sum(acc_up0);
-    float g1 = has_chan1 ? simd_sum(acc_gate1) : 0.0f;
-    float u1 = has_chan1 ? simd_sum(acc_up1) : 0.0f;
+        device const BlockQ4Group64* gate_row0 = gate_weights + (chan0 * num_blocks);
+        device const BlockQ4Group64* up_row0   = up_weights   + (chan0 * num_blocks);
+        const bool has_chan1 = (chan1 < params.intermediate_size);
+        device const BlockQ4Group64* gate_row1 = has_chan1 ? gate_weights + (chan1 * num_blocks) : gate_row0;
+        device const BlockQ4Group64* up_row1   = has_chan1 ? up_weights   + (chan1 * num_blocks) : up_row0;
 
-    if (simd_lane == 0u) {
-        // Channel 0 activation
-        float act_g0 = 0.0f;
-        if (params.activation_variant == 0u) {
-            act_g0 = g0 / (1.0f + exp(-g0));
-        } else if (params.activation_variant == 1u) {
-            constexpr float SQRT_2_OVER_PI = 0.7978845608f;
-            float cubic = fma(0.044715f * g0, g0 * g0, g0);
-            act_g0 = 0.5f * g0 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
-        } else {
-            act_g0 = max(g0, 0.0f);
-        }
-        mlp_out[chan0] = f32_to_bf16(act_g0 * u0);
+        float acc_gate0 = 0.0f, acc_up0 = 0.0f;
+        float acc_gate1 = 0.0f, acc_up1 = 0.0f;
 
-        // Channel 1 activation
         if (has_chan1) {
-            float act_g1 = 0.0f;
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_4row_block_dot_distributive(
+                    gate_row0[blk_idx],
+                    up_row0[blk_idx],
+                    gate_row1[blk_idx],
+                    up_row1[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc_gate0, acc_up0, acc_gate1, acc_up1
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_g64_2row_block_dot_distributive(
+                    gate_row0[blk_idx],
+                    up_row0[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc_gate0, acc_up0
+                );
+            }
+        }
+
+        float g0 = simd_sum(acc_gate0);
+        float u0 = simd_sum(acc_up0);
+        float g1 = has_chan1 ? simd_sum(acc_gate1) : 0.0f;
+        float u1 = has_chan1 ? simd_sum(acc_up1) : 0.0f;
+
+        if (simd_lane == 0u) {
+            // Channel 0 activation
+            float act_g0 = 0.0f;
             if (params.activation_variant == 0u) {
-                act_g1 = g1 / (1.0f + exp(-g1));
+                act_g0 = g0 / (1.0f + exp(-g0));
             } else if (params.activation_variant == 1u) {
                 constexpr float SQRT_2_OVER_PI = 0.7978845608f;
-                float cubic = fma(0.044715f * g1, g1 * g1, g1);
-                act_g1 = 0.5f * g1 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+                float cubic = fma(0.044715f * g0, g0 * g0, g0);
+                act_g0 = 0.5f * g0 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
             } else {
-                act_g1 = max(g1, 0.0f);
+                act_g0 = max(g0, 0.0f);
             }
-            mlp_out[chan1] = f32_to_bf16(act_g1 * u1);
+            mlp_out[chan0] = f32_to_bf16(act_g0 * u0);
+
+            // Channel 1 activation
+            if (has_chan1) {
+                float act_g1 = 0.0f;
+                if (params.activation_variant == 0u) {
+                    act_g1 = g1 / (1.0f + exp(-g1));
+                } else if (params.activation_variant == 1u) {
+                    constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+                    float cubic = fma(0.044715f * g1, g1 * g1, g1);
+                    act_g1 = 0.5f * g1 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+                } else {
+                    act_g1 = max(g1, 0.0f);
+                }
+                mlp_out[chan1] = f32_to_bf16(act_g1 * u1);
+            }
         }
     }
 }
 
-/// 16-Lane Sub-Warp Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, num_k_blocks <= 16).
+/// 16-Lane Sub-Warp Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, num_k_blocks <= 16, persistent threadgroups).
 /// Each SIMDgroup of 32 lanes computes TWO intermediate channels concurrently (16 lanes per channel).
 kernel void q4_g64_decode_gate_up_swiglu_gemv_sub16(
     device const BlockQ4Group64* gate_weights [[buffer(0)]],
@@ -1212,56 +1282,61 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv_sub16(
     device ushort*               mlp_out      [[buffer(3)]], // bf16 [1, intermediate_size]
     constant GateUpSwigluGemmParams& params   [[buffer(4)]],
     uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint3                        grid_dim     [[threadgroups_per_grid]],
     uint                         simd_id      [[simdgroup_index_in_threadgroup]],
     uint                         simd_lane    [[thread_index_in_simdgroup]]
 ) {
+    const uint total_tiles = (params.intermediate_size + 7u) / 8u;
+    const uint num_blocks = params.num_k_blocks;
     const uint sub_group = simd_lane / 16u; // 0 or 1
     const uint sub_lane  = simd_lane % 16u; // 0..15
-    const uint row_idx   = tgp_pos.x * 8u + simd_id * 2u + sub_group;
-    if (row_idx >= params.intermediate_size) {
-        return;
-    }
 
-    const uint num_blocks = params.num_k_blocks;
-    device const BlockQ4Group64* gate_row = gate_weights + (row_idx * num_blocks);
-    device const BlockQ4Group64* up_row   = up_weights + (row_idx * num_blocks);
-
-    float acc_gate = 0.0f;
-    float acc_up   = 0.0f;
-    for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
-        q4_g64_2row_block_dot_distributive(
-            gate_row[blk_idx],
-            up_row[blk_idx],
-            input_x + (blk_idx * 64u),
-            acc_gate,
-            acc_up
-        );
-    }
-
-    acc_gate += simd_shuffle_down(acc_gate, 8u);
-    acc_gate += simd_shuffle_down(acc_gate, 4u);
-    acc_gate += simd_shuffle_down(acc_gate, 2u);
-    acc_gate += simd_shuffle_down(acc_gate, 1u);
-
-    acc_up += simd_shuffle_down(acc_up, 8u);
-    acc_up += simd_shuffle_down(acc_up, 4u);
-    acc_up += simd_shuffle_down(acc_up, 2u);
-    acc_up += simd_shuffle_down(acc_up, 1u);
-
-    if (sub_lane == 0u) {
-        float g = acc_gate;
-        float u = acc_up;
-        float act_g = 0.0f;
-        if (params.activation_variant == 0u) {
-            act_g = g / (1.0f + exp(-g));
-        } else if (params.activation_variant == 1u) {
-            constexpr float SQRT_2_OVER_PI = 0.7978845608f;
-            float cubic = fma(0.044715f * g, g * g, g);
-            act_g = 0.5f * g * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
-        } else {
-            act_g = max(g, 0.0f);
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx   = tile_x * 8u + simd_id * 2u + sub_group;
+        if (row_idx >= params.intermediate_size) {
+            continue;
         }
-        mlp_out[row_idx] = f32_to_bf16(act_g * u);
+
+        device const BlockQ4Group64* gate_row = gate_weights + (row_idx * num_blocks);
+        device const BlockQ4Group64* up_row   = up_weights + (row_idx * num_blocks);
+
+        float acc_gate = 0.0f;
+        float acc_up   = 0.0f;
+        for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
+            q4_g64_2row_block_dot_distributive(
+                gate_row[blk_idx],
+                up_row[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc_gate,
+                acc_up
+            );
+        }
+
+        acc_gate += simd_shuffle_down(acc_gate, 8u);
+        acc_gate += simd_shuffle_down(acc_gate, 4u);
+        acc_gate += simd_shuffle_down(acc_gate, 2u);
+        acc_gate += simd_shuffle_down(acc_gate, 1u);
+
+        acc_up += simd_shuffle_down(acc_up, 8u);
+        acc_up += simd_shuffle_down(acc_up, 4u);
+        acc_up += simd_shuffle_down(acc_up, 2u);
+        acc_up += simd_shuffle_down(acc_up, 1u);
+
+        if (sub_lane == 0u) {
+            float g = acc_gate;
+            float u = acc_up;
+            float act_g = 0.0f;
+            if (params.activation_variant == 0u) {
+                act_g = g / (1.0f + exp(-g));
+            } else if (params.activation_variant == 1u) {
+                constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+                float cubic = fma(0.044715f * g, g * g, g);
+                act_g = 0.5f * g * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+            } else {
+                act_g = max(g, 0.0f);
+            }
+            mlp_out[row_idx] = f32_to_bf16(act_g * u);
+        }
     }
 }
 

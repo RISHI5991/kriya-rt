@@ -172,6 +172,65 @@ kernel void rms_norm_bf16(
 }
 
 // ============================================================================
+// 3b. Fused Residual Add + SIMD-Group Cooperative RMSNorm (Item 9)
+// ============================================================================
+// Fuses residual addition (x = residual + proj) and RMSNorm into a single kernel dispatch.
+// Eliminates 1 full DRAM read of the hidden state and 1 kernel dispatch per norm layer.
+kernel void fused_residual_add_rms_norm_bf16(
+    device ushort*                 residual_inout  [[buffer(0)]], // [num_tokens, hidden_size]
+    device const ushort*           proj_in         [[buffer(1)]], // [num_tokens, hidden_size]
+    device const ushort*           norm_weight     [[buffer(2)]], // [hidden_size]
+    device ushort*                 output_norm     [[buffer(3)]], // [num_tokens, hidden_size]
+    constant RmsNormParams&        params          [[buffer(4)]],
+    uint                           token_idx       [[threadgroup_position_in_grid]],
+    uint                           tid             [[thread_index_in_threadgroup]],
+    uint                           simd_id         [[simdgroup_index_in_threadgroup]],
+    uint                           simd_lane       [[thread_index_in_simdgroup]]
+) {
+    if (token_idx >= params.num_tokens) {
+        return;
+    }
+
+    threadgroup float simd_partial_sums[8];
+    const uint row_base = token_idx * params.hidden_size;
+
+    float thread_sum_sq = 0.0f;
+    for (uint d = tid; d < params.hidden_size; d += 256u) {
+        float r = bf16_to_f32(residual_inout[row_base + d]);
+        float p = bf16_to_f32(proj_in[row_base + d]);
+        ushort x_bf16 = f32_to_bf16(r + p);
+        residual_inout[row_base + d] = x_bf16;
+        float x = bf16_to_f32(x_bf16);
+        thread_sum_sq = fma(x, x, thread_sum_sq);
+    }
+
+    float simd_total = simd_sum(thread_sum_sq);
+    if (simd_lane == 0u) {
+        simd_partial_sums[simd_id] = simd_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total_sq = 0.0f;
+    if (simd_id == 0u) {
+        float v = (simd_lane < 8u) ? simd_partial_sums[simd_lane] : 0.0f;
+        total_sq = simd_sum(v);
+        if (simd_lane == 0u) {
+            simd_partial_sums[0] = rsqrt((total_sq / float(params.hidden_size)) + params.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms_scale = simd_partial_sums[0];
+    const float w_offset  = (params.zero_centered_offset != 0u) ? 1.0f : 0.0f;
+
+    for (uint d = tid; d < params.hidden_size; d += 256u) {
+        float x = bf16_to_f32(residual_inout[row_base + d]);
+        float w = bf16_to_f32(norm_weight[d]) + w_offset;
+        output_norm[row_base + d] = f32_to_bf16(x * rms_scale * w);
+    }
+}
+
+// ============================================================================
 // 4. Fused Gated MLP Activation (SwiGLU / GeGLU / ReLU)
 // ============================================================================
 
