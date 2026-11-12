@@ -2888,3 +2888,99 @@ fn test_double_buffered_layer_streaming_matches_pinned() {
     // Active slots must be a subset of {0, 1, 2} and length is strictly 2
     assert_eq!(active.len(), 2);
 }
+
+#[test]
+fn test_gpu_native_draft_tree_and_speculative_decode_end_to_end() {
+    let Some(_device) = require_metal_device() else {
+        return;
+    };
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let desc = miniature_dense_gqa_descriptor();
+    write_complete_miniature_checkpoint(tmp_dir.path());
+
+    let mut executor = kriya_backend_metal::encoder::MetalExecutor::new(
+        &desc,
+        workspace_kernels_dir(),
+        Some(tmp_dir.path()),
+        16,
+        16,
+    )
+    .expect("Executor initialization must succeed");
+
+    assert!(!executor.has_eagle_gpu_draft());
+
+    let h = desc.hidden_size as usize;
+    let vocab = desc.vocab_size as usize;
+    let fc_fuse_weights: Vec<f32> = (0..h * (2 * h))
+        .map(|idx| ((idx % 31) as f32 - 15.0) * 0.01)
+        .collect();
+    let decoder_weights: Vec<f32> = (0..h * h)
+        .map(|idx| ((idx % 23) as f32 - 11.0) * 0.01)
+        .collect();
+
+    executor
+        .load_eagle_draft_weights(&fc_fuse_weights, &decoder_weights)
+        .expect("Loading EAGLE draft weights must succeed");
+    assert!(executor.has_eagle_gpu_draft());
+
+    // 1. Test single-step GPU drafting
+    let root_token_id = 5u32;
+    let prev_feature: Vec<f32> = (0..h).map(|idx| ((idx % 19) as f32) * 0.05).collect();
+
+    let (next_feat, top_tokens, top_probs) =
+        block_on(executor.gpu_draft_step(root_token_id, &prev_feature, 4))
+            .expect("gpu_draft_step must succeed");
+
+    assert_eq!(next_feat.len(), h);
+    assert_eq!(top_tokens.len(), 4);
+    assert_eq!(top_probs.len(), 4);
+    for prob in &top_probs {
+        assert!(*prob >= 0.0 && *prob <= 1.0);
+    }
+
+    // 2. Test multi-pass draft tree building on GPU
+    let topology = kriya_speculate::eagle_medusa::DraftTreeTopology::canonical_10_token_tree();
+    let tree = block_on(executor.build_draft_tree_gpu(root_token_id, &prev_feature, &topology))
+        .expect("build_draft_tree_gpu must succeed");
+
+    assert_eq!(tree.nodes.len(), 11); // root (depth 0) + 10 draft tokens
+    assert_eq!(tree.tree_attention_mask.len(), 11 * 11);
+    assert_eq!(tree.nodes[0].token_id, root_token_id);
+    for node in &tree.nodes {
+        assert_eq!(node.predicted_feature.len(), h);
+    }
+
+    // 3. Test full speculative decode verification on GPU
+    let mut kv_mgr = kriya_kv::bsr_paged::PagedKvCacheManager::new(64, 32, 16);
+    kv_mgr.allocate_sequence(1, &[10, 20, 30]).unwrap();
+    let plan = kv_mgr.build_schedule_plan(&[1], 16).unwrap();
+
+    let mut draft_engine = kriya_speculate::eagle_medusa::EagleDraftEngine::new_gpu_backed(
+        h,
+        vocab,
+        fc_fuse_weights,
+        decoder_weights,
+    )
+    .unwrap();
+    let mut rng = kriya_speculate::eagle_medusa::DeterministicRng::new(12345);
+
+    let res = block_on(executor.speculative_decode(
+        &desc,
+        &plan,
+        &mut draft_engine,
+        root_token_id,
+        &prev_feature,
+        &topology,
+        &mut rng,
+    ))
+    .expect("speculative_decode must succeed");
+
+    assert!(res.is_some());
+    let (accepted_tokens, accepted_nodes) = res.unwrap();
+    assert!(
+        !accepted_tokens.is_empty(),
+        "At least primary token must be accepted"
+    );
+    assert_eq!(accepted_tokens.len(), accepted_nodes.len());
+}
