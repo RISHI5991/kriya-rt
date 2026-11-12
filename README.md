@@ -3,7 +3,7 @@
 <div align="center">
 
 [![CI](https://github.com/RISHI5991/kriya-rt/actions/workflows/ci.yml/badge.svg)](https://github.com/RISHI5991/kriya-rt/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/Release-v0.1.0-emerald.svg)](https://github.com/RISHI5991/kriya-rt/releases)
+[![Release](https://img.shields.io/badge/Release-v0.2.0-emerald.svg)](https://github.com/RISHI5991/kriya-rt/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon%20(M1--M4)-black.svg)](#hardware-requirements)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B%20(Edition%202024)-orange.svg)](https://www.rust-lang.org/)
@@ -147,7 +147,7 @@ KriyaRT automatically detects MLX `.weight` + `.scales` + `.biases` triplets and
 
 ### Option A: Install via Homebrew
 
-*(Note: Homebrew formula is tracked at `packaging/homebrew/kriya.rb`. Public tap configuration `RISHI5991/tap` is being provisioned alongside v0.1.0 release artifacts).*
+*(Note: Homebrew formula is tracked at `packaging/homebrew/kriya.rb`. Public tap configuration `RISHI5991/tap` is being provisioned alongside v0.2.0 release artifacts).*
 
 ```bash
 # Add tap and install precompiled release binary
@@ -163,9 +163,9 @@ Precompiled Apple Silicon release binaries (`aarch64-apple-darwin` with SHA-256 
 
 ```bash
 # Download and unpack
-curl -L -O https://github.com/RISHI5991/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz
-tar -xvf kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz
-cd kriya-rt-v0.1.0-aarch64-apple-darwin/bin
+curl -L -O https://github.com/RISHI5991/kriya-rt/releases/download/v0.2.0/kriya-rt-v0.2.0-aarch64-apple-darwin.tar.gz
+tar -xvf kriya-rt-v0.2.0-aarch64-apple-darwin.tar.gz
+cd kriya-rt-v0.2.0-aarch64-apple-darwin/bin
 
 ./kriya-server --help
 ```

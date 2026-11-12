@@ -1,13 +1,13 @@
 class Kriya < Formula
   desc "Ultra-high-throughput native Metal inference engine for frontier LLMs on Apple Silicon"
   homepage "https://github.com/RISHI5991/kriya-rt"
-  version "0.1.0"
+  version "0.2.0"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/RISHI5991/kriya-rt/releases/download/v0.1.0/kriya-rt-v0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "c7dd9e6cb2d6fef90bd07d2e5d8523f65efdcc26c5e5aca9240c22173611d76e"
+      url "https://github.com/RISHI5991/kriya-rt/releases/download/v0.2.0/kriya-rt-v0.2.0-aarch64-apple-darwin.tar.gz"
+      sha256 "d7eb80a495ed63d57ea4867e43c513399c57617bd8bd092db30bd2ecc51fb5c5"
     end
   end
 
