@@ -140,6 +140,15 @@ pub struct RoutedExpertGemvParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub struct EagleParams {
+    pub hidden_dim: u32,
+    pub vocab_size: u32,
+    pub top_k: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct MoeCombineParams {
     pub num_tokens: u32,
     pub hidden_size: u32,
@@ -1328,6 +1337,19 @@ pub struct MetalExecutor {
     /// Ping-pong scratch toggle for double-buffered CPU/GPU overlap.
     /// Iteration N encodes into scratch[idx], iteration N+1 encodes into scratch[idx^1].
     pub scratch_ping_pong_idx: u32,
+    pub hidden_size: usize,
+    pub vocab_size: usize,
+    /// GPU-native EAGLE speculative draft head buffers:
+    pub eagle_fc_fuse_buf: Option<Buffer>,
+    pub eagle_decoder_buf: Option<Buffer>,
+    pub eagle_prev_feat_buf: Buffer,
+    pub eagle_tok_emb_bf16_buf: Buffer,
+    pub eagle_reduced_buf: Buffer,
+    pub eagle_next_feat_f32_buf: Buffer,
+    pub eagle_next_feat_bf16_buf: Buffer,
+    pub eagle_topk_tokens_buf: Buffer,
+    pub eagle_topk_probs_buf: Buffer,
+    pub eagle_draft_logits_buf: Buffer,
 }
 
 impl MetalExecutor {
@@ -1592,6 +1614,18 @@ impl MetalExecutor {
             attn_out_buf_pong: alloc(max_batch_toks * max_q_dim * 2),
             proj_out_buf_ping: alloc(max_batch_toks * h * 2),
             proj_out_buf_pong: alloc(max_batch_toks * h * 2),
+            hidden_size: h,
+            vocab_size: vocab_capped,
+            eagle_fc_fuse_buf: None,
+            eagle_decoder_buf: None,
+            eagle_prev_feat_buf: alloc(h * 4),
+            eagle_tok_emb_bf16_buf: alloc(h * 2),
+            eagle_reduced_buf: alloc(h * 4),
+            eagle_next_feat_f32_buf: alloc(h * 4),
+            eagle_next_feat_bf16_buf: alloc(h * 2),
+            eagle_topk_tokens_buf: alloc(16 * 4),
+            eagle_topk_probs_buf: alloc(16 * 4),
+            eagle_draft_logits_buf: alloc((vocab_capped * 2).max(1024)),
         })
     }
 
@@ -2968,6 +3002,325 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Loads EAGLE draft head weights (`fc_fuse_weights` and `decoder_layer_weights`) into GPU buffers.
+    pub fn load_eagle_draft_weights(
+        &mut self,
+        fc_fuse_weights: &[f32],
+        decoder_layer_weights: &[f32],
+    ) -> Result<(), MetalError> {
+        let h = self.hidden_size;
+        let expected_fc = h * (2 * h);
+        if fc_fuse_weights.len() != expected_fc {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "EAGLE fc_fuse_weights len mismatch: expected {expected_fc}, got {}",
+                fc_fuse_weights.len()
+            )));
+        }
+        let expected_dec = h * h;
+        if decoder_layer_weights.len() != expected_dec {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "EAGLE decoder_layer_weights len mismatch: expected {expected_dec}, got {}",
+                decoder_layer_weights.len()
+            )));
+        }
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        let fc_buf = self.device.new_buffer_with_data(
+            fc_fuse_weights.as_ptr() as *const _,
+            (fc_fuse_weights.len() * 4) as u64,
+            shared,
+        );
+        let dec_buf = self.device.new_buffer_with_data(
+            decoder_layer_weights.as_ptr() as *const _,
+            (decoder_layer_weights.len() * 4) as u64,
+            shared,
+        );
+
+        self.eagle_fc_fuse_buf = Some(fc_buf);
+        self.eagle_decoder_buf = Some(dec_buf);
+        Ok(())
+    }
+
+    /// Returns `true` if GPU-native EAGLE drafting is ready to execute.
+    pub fn has_eagle_gpu_draft(&self) -> bool {
+        self.eagle_fc_fuse_buf.is_some() && self.eagle_decoder_buf.is_some()
+    }
+
+    /// Executes one GPU-native EAGLE draft step:
+    /// 1. Look up token embedding on GPU (`embedding_lookup_q4_g64`)
+    /// 2. Reduces dimensionality with `eagle_fc_fuse`
+    /// 3. Computes delta with `eagle_decoder_layer` and adds residual
+    /// 4. Projects through frozen target LM Head on GPU (`encode_q4_linear`)
+    /// 5. Extracts top-K tokens and exact probabilities on GPU (`eagle_topk_and_probs`)
+    pub async fn gpu_draft_step(
+        &mut self,
+        token_id: u32,
+        prev_feature: &[f32],
+        top_k: usize,
+    ) -> Result<(Vec<f32>, Vec<u32>, Vec<f32>), MetalError> {
+        let h = self.hidden_size;
+        let vocab = self.vocab_size;
+        let k_capped = top_k.clamp(1, 16) as u32;
+
+        if prev_feature.len() != h {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "Dimension mismatch: expected {h}, actual {}",
+                prev_feature.len()
+            )));
+        }
+        let fc_buf = self.eagle_fc_fuse_buf.clone().ok_or_else(|| {
+            MetalError::UnsupportedProductionConfiguration(
+                "EAGLE fc_fuse buffer not initialized".into(),
+            )
+        })?;
+        let dec_buf = self.eagle_decoder_buf.clone().ok_or_else(|| {
+            MetalError::UnsupportedProductionConfiguration(
+                "EAGLE decoder buffer not initialized".into(),
+            )
+        })?;
+
+        // 1. Copy previous feature to GPU scratch buffer & set token
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                prev_feature.as_ptr(),
+                self.eagle_prev_feat_buf.contents() as *mut f32,
+                h,
+            );
+            *(self.input_tokens_buf.contents() as *mut u32) = token_id;
+        }
+
+        let cmd_buf = self.command_queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+
+        // 2. Embedding lookup for advanced token
+        {
+            let pso = self
+                .pipeline_cache
+                .get_or_compile("embedding_lookup_q4_g64")?;
+            let embed_params = EmbedLookupParams {
+                num_tokens: 1,
+                hidden_size: h as u32,
+                num_k_blocks: (h / 64) as u32,
+            };
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.weights.embed_tokens), 0);
+            enc.set_buffer(1, Some(&self.input_tokens_buf), 0);
+            enc.set_buffer(2, Some(&self.eagle_tok_emb_bf16_buf), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<EmbedLookupParams>() as u64,
+                &embed_params as *const _ as *const _,
+            );
+            let pairs_per_tok = (h / 2).div_ceil(64);
+            enc.dispatch_thread_groups(
+                MTLSize::new(pairs_per_tok as u64, 1, 1),
+                MTLSize::new(64, 1, 1),
+            );
+        }
+
+        let eagle_params = EagleParams {
+            hidden_dim: h as u32,
+            vocab_size: vocab as u32,
+            top_k: k_capped,
+            _pad: 0,
+        };
+
+        // 3. FC Fuse: [tok_emb_bf16, prev_feat] -> reduced
+        {
+            let pso = self.pipeline_cache.get_or_compile("eagle_fc_fuse")?;
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.eagle_tok_emb_bf16_buf), 0);
+            enc.set_buffer(1, Some(&self.eagle_prev_feat_buf), 0);
+            enc.set_buffer(2, Some(&fc_buf), 0);
+            enc.set_buffer(3, Some(&self.eagle_reduced_buf), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<EagleParams>() as u64,
+                &eagle_params as *const _ as *const _,
+            );
+            let tgs = (h as u64).div_ceil(64);
+            enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(64, 1, 1));
+        }
+
+        // 4. Decoder Layer: reduced -> next_feature (f32 and bf16)
+        {
+            let pso = self.pipeline_cache.get_or_compile("eagle_decoder_layer")?;
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.eagle_reduced_buf), 0);
+            enc.set_buffer(1, Some(&dec_buf), 0);
+            enc.set_buffer(2, Some(&self.eagle_next_feat_f32_buf), 0);
+            enc.set_buffer(3, Some(&self.eagle_next_feat_bf16_buf), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<EagleParams>() as u64,
+                &eagle_params as *const _ as *const _,
+            );
+            let tgs = (h as u64).div_ceil(64);
+            enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(64, 1, 1));
+        }
+
+        // 5. LM Head Projection: next_feature_bf16 -> eagle_draft_logits_buf (BF16)
+        let lm_head_buf = self.weights.lm_head.clone();
+        Self::encode_q4_linear(
+            &mut self.pipeline_cache,
+            enc,
+            &lm_head_buf,
+            &self.eagle_next_feat_bf16_buf,
+            0,
+            &self.eagle_draft_logits_buf,
+            1,
+            vocab as u32,
+            h as u32,
+        )?;
+
+        // 6. GPU Top-K Token Extraction and Exact Probability Calculation
+        {
+            let pso = self.pipeline_cache.get_or_compile("eagle_topk_and_probs")?;
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.eagle_draft_logits_buf), 0);
+            enc.set_buffer(1, Some(&self.eagle_topk_tokens_buf), 0);
+            enc.set_buffer(2, Some(&self.eagle_topk_probs_buf), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<EagleParams>() as u64,
+                &eagle_params as *const _ as *const _,
+            );
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+
+        enc.end_encoding();
+        cmd_buf.commit();
+        self.wait_for_gpu(cmd_buf).await?;
+
+        // 7. Read back results
+        let next_feat = unsafe {
+            let ptr = self.eagle_next_feat_f32_buf.contents() as *const f32;
+            std::slice::from_raw_parts(ptr, h).to_vec()
+        };
+        let top_tokens = unsafe {
+            let ptr = self.eagle_topk_tokens_buf.contents() as *const u32;
+            std::slice::from_raw_parts(ptr, k_capped as usize).to_vec()
+        };
+        let top_probs = unsafe {
+            let ptr = self.eagle_topk_probs_buf.contents() as *const f32;
+            std::slice::from_raw_parts(ptr, k_capped as usize).to_vec()
+        };
+
+        Ok((next_feat, top_tokens, top_probs))
+    }
+
+    /// Builds a tree-structured draft on GPU across `m` forward passes according to `topology`.
+    pub async fn build_draft_tree_gpu(
+        &mut self,
+        root_token_id: u32,
+        root_feature: &[f32],
+        topology: &kriya_speculate::eagle_medusa::DraftTreeTopology,
+    ) -> Result<kriya_speculate::eagle_medusa::DraftTree, MetalError> {
+        let root_branches = topology
+            .level_branching
+            .first()
+            .and_then(|lvl| lvl.first())
+            .copied()
+            .unwrap_or(0);
+
+        let (root_pred_feat, root_top_tokens, root_top_probs) = self
+            .gpu_draft_step(root_token_id, root_feature, root_branches.max(1))
+            .await?;
+
+        let mut root_draft_probs = vec![0.0f32; self.vocab_size];
+        for (&tok, &prob) in root_top_tokens.iter().zip(&root_top_probs) {
+            if (tok as usize) < root_draft_probs.len() {
+                root_draft_probs[tok as usize] = prob;
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(topology.total_draft_tokens + 1);
+        nodes.push(kriya_speculate::eagle_medusa::DraftTreeNode {
+            node_id: 0,
+            parent_id: None,
+            depth: 0,
+            token_id: root_token_id,
+            predicted_feature: root_pred_feat,
+            draft_probs: root_draft_probs,
+            children: Vec::new(),
+        });
+
+        let mut candidate_pools: Vec<Vec<(u32, f32)>> = Vec::new();
+        let root_pool: Vec<(u32, f32)> = root_top_tokens.into_iter().zip(root_top_probs).collect();
+        candidate_pools.push(root_pool);
+
+        let mut current_level_indices = vec![0usize];
+
+        for pass_idx in 0..topology.depth {
+            let branching_spec = topology.level_branching.get(pass_idx).ok_or_else(|| {
+                MetalError::InvalidExecutionInput(format!(
+                    "Missing branching spec at pass {pass_idx}"
+                ))
+            })?;
+
+            let mut next_level_indices = Vec::new();
+
+            for (pos_in_level, &parent_node_idx) in current_level_indices.iter().enumerate() {
+                let num_branches = branching_spec.get(pos_in_level).copied().unwrap_or(0);
+                if num_branches == 0 {
+                    continue;
+                }
+
+                let parent_feat = nodes[parent_node_idx].predicted_feature.clone();
+                let parent_candidates = candidate_pools[parent_node_idx].clone();
+
+                for (tok_id, _tok_prob) in parent_candidates.into_iter().take(num_branches) {
+                    let child_id = nodes.len();
+                    let next_pass = pass_idx + 1;
+                    let next_pos = next_level_indices.len();
+                    let child_branches = topology
+                        .level_branching
+                        .get(next_pass)
+                        .and_then(|spec| spec.get(next_pos))
+                        .copied()
+                        .unwrap_or(0)
+                        .max(1);
+
+                    let (child_feat, child_top_tokens, child_top_probs) = self
+                        .gpu_draft_step(tok_id, &parent_feat, child_branches)
+                        .await?;
+
+                    let mut child_probs = vec![0.0f32; self.vocab_size];
+                    for (&ctok, &cprob) in child_top_tokens.iter().zip(&child_top_probs) {
+                        if (ctok as usize) < child_probs.len() {
+                            child_probs[ctok as usize] = cprob;
+                        }
+                    }
+
+                    nodes[parent_node_idx].children.push(child_id);
+                    nodes.push(kriya_speculate::eagle_medusa::DraftTreeNode {
+                        node_id: child_id,
+                        parent_id: Some(parent_node_idx),
+                        depth: pass_idx + 1,
+                        token_id: tok_id,
+                        predicted_feature: child_feat,
+                        draft_probs: child_probs,
+                        children: Vec::new(),
+                    });
+
+                    let child_pool: Vec<(u32, f32)> =
+                        child_top_tokens.into_iter().zip(child_top_probs).collect();
+                    candidate_pools.push(child_pool);
+                    next_level_indices.push(child_id);
+                }
+            }
+
+            current_level_indices = next_level_indices;
+        }
+
+        let tree_attention_mask =
+            kriya_speculate::eagle_medusa::DraftTree::compute_tree_attention_mask(&nodes);
+        Ok(kriya_speculate::eagle_medusa::DraftTree {
+            nodes,
+            tree_attention_mask,
+        })
+    }
+
     /// Executes one EAGLE speculative decode iteration:
     /// 1. Builds a draft tree from the current token and hidden feature
     /// 2. Verifies the tree against the target model in a single GPU pass
@@ -2987,10 +3340,20 @@ impl MetalExecutor {
         topology: &kriya_speculate::eagle_medusa::DraftTreeTopology,
         rng: &mut kriya_speculate::eagle_medusa::DeterministicRng,
     ) -> Result<Option<(Vec<u32>, Vec<u32>)>, MetalError> {
-        // Build the draft tree on CPU
-        let tree = match draft_engine.build_draft_tree(root_token_id, root_feature, topology) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
+        // Build the draft tree (GPU-accelerated when draft weights are loaded)
+        let tree = if self.has_eagle_gpu_draft() {
+            match self
+                .build_draft_tree_gpu(root_token_id, root_feature, topology)
+                .await
+            {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            match draft_engine.build_draft_tree(root_token_id, root_feature, topology) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            }
         };
 
         let num_nodes = tree.nodes.len();

@@ -362,3 +362,390 @@ kernel void gpu_token_sampler(
         sampled_token_out[0] = final_idx;
     }
 }
+
+// ============================================================================
+// 6. GPU-Native EAGLE Speculative Drafting & Top-K Extraction
+// ============================================================================
+
+struct EagleParams {
+    uint hidden_dim;
+    uint vocab_size;
+    uint top_k;
+    uint _pad;
+};
+
+// 6a. EAGLE FC Fuse Layer (reduces fused [tok_emb, prev_feature] from 2*H to H)
+kernel void eagle_fc_fuse(
+    device const ushort*        tok_emb_bf16    [[buffer(0)]],
+    device const float*         prev_feature    [[buffer(1)]],
+    device const float*         fc_fuse_w       [[buffer(2)]],
+    device float*               reduced_out     [[buffer(3)]],
+    constant EagleParams&       params          [[buffer(4)]],
+    uint                        h               [[thread_position_in_grid]]
+) {
+    if (h >= params.hidden_dim) {
+        return;
+    }
+    const uint H = params.hidden_dim;
+    device const float* row_w = fc_fuse_w + h * (2u * H);
+
+    const uint H4 = (H / 4u) * 4u;
+    float acc0 = 0.0f;
+    for (uint j = 0; j < H4; j += 4u) {
+        float4 w = *((device const float4*)(row_w + j));
+        float4 x = float4(
+            bf16_to_f32(tok_emb_bf16[j]),
+            bf16_to_f32(tok_emb_bf16[j + 1u]),
+            bf16_to_f32(tok_emb_bf16[j + 2u]),
+            bf16_to_f32(tok_emb_bf16[j + 3u])
+        );
+        acc0 += dot(w, x);
+    }
+    for (uint j = H4; j < H; ++j) {
+        acc0 += row_w[j] * bf16_to_f32(tok_emb_bf16[j]);
+    }
+
+    device const float* row_w2 = row_w + H;
+    float acc1 = 0.0f;
+    for (uint j = 0; j < H4; j += 4u) {
+        float4 w = *((device const float4*)(row_w2 + j));
+        float4 x = *((device const float4*)(prev_feature + j));
+        acc1 += dot(w, x);
+    }
+    for (uint j = H4; j < H; ++j) {
+        acc1 += row_w2[j] * prev_feature[j];
+    }
+
+    reduced_out[h] = acc0 + acc1;
+}
+
+// 6b. EAGLE FC Fuse with FP32 token embeddings (for testing & unquantized embeddings)
+kernel void eagle_fc_fuse_f32(
+    device const float*         tok_emb_f32     [[buffer(0)]],
+    device const float*         prev_feature    [[buffer(1)]],
+    device const float*         fc_fuse_w       [[buffer(2)]],
+    device float*               reduced_out     [[buffer(3)]],
+    constant EagleParams&       params          [[buffer(4)]],
+    uint                        h               [[thread_position_in_grid]]
+) {
+    if (h >= params.hidden_dim) {
+        return;
+    }
+    const uint H = params.hidden_dim;
+    device const float* row_w = fc_fuse_w + h * (2u * H);
+
+    const uint H4 = (H / 4u) * 4u;
+    float acc0 = 0.0f;
+    for (uint j = 0; j < H4; j += 4u) {
+        float4 w = *((device const float4*)(row_w + j));
+        float4 x = *((device const float4*)(tok_emb_f32 + j));
+        acc0 += dot(w, x);
+    }
+    for (uint j = H4; j < H; ++j) {
+        acc0 += row_w[j] * tok_emb_f32[j];
+    }
+
+    device const float* row_w2 = row_w + H;
+    float acc1 = 0.0f;
+    for (uint j = 0; j < H4; j += 4u) {
+        float4 w = *((device const float4*)(row_w2 + j));
+        float4 x = *((device const float4*)(prev_feature + j));
+        acc1 += dot(w, x);
+    }
+    for (uint j = H4; j < H; ++j) {
+        acc1 += row_w2[j] * prev_feature[j];
+    }
+
+    reduced_out[h] = acc0 + acc1;
+}
+
+// 6c. EAGLE Decoder Layer (predicts next feature delta and adds residual)
+kernel void eagle_decoder_layer(
+    device const float*         reduced_in        [[buffer(0)]],
+    device const float*         decoder_w         [[buffer(1)]],
+    device float*               next_feature_f32  [[buffer(2)]],
+    device ushort*              next_feature_bf16 [[buffer(3)]],
+    constant EagleParams&       params            [[buffer(4)]],
+    uint                        h                 [[thread_position_in_grid]]
+) {
+    if (h >= params.hidden_dim) {
+        return;
+    }
+    const uint H = params.hidden_dim;
+    device const float* row_w = decoder_w + h * H;
+
+    const uint H4 = (H / 4u) * 4u;
+    float acc = 0.0f;
+    for (uint j = 0; j < H4; j += 4u) {
+        float4 w = *((device const float4*)(row_w + j));
+        float4 x = *((device const float4*)(reduced_in + j));
+        acc += dot(w, x);
+    }
+    for (uint j = H4; j < H; ++j) {
+        acc += row_w[j] * reduced_in[j];
+    }
+
+    float out_val = reduced_in[h] + acc;
+    next_feature_f32[h] = out_val;
+    next_feature_bf16[h] = f32_to_bf16(out_val);
+}
+
+// 6d. GPU Top-K Token Extraction and Exact Probability Calculation (BF16 logits)
+kernel void eagle_topk_and_probs(
+    device const ushort*        logits_bf16       [[buffer(0)]],
+    device uint*                out_tokens        [[buffer(1)]],
+    device float*               out_probs         [[buffer(2)]],
+    constant EagleParams&       params            [[buffer(3)]],
+    uint                        tid               [[thread_index_in_threadgroup]],
+    uint                        simd_id           [[simdgroup_index_in_threadgroup]],
+    uint                        simd_lane         [[thread_index_in_simdgroup]]
+) {
+    threadgroup float shared_max[8];
+    float local_max = -INFINITY;
+    for (uint v = tid; v < params.vocab_size; v += 256u) {
+        float l = bf16_to_f32(logits_bf16[v]);
+        if (!isnan(l) && !isinf(l)) {
+            local_max = max(local_max, l);
+        }
+    }
+    for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+        local_max = max(local_max, simd_shuffle_down(local_max, offset));
+    }
+    if (simd_lane == 0u) {
+        shared_max[simd_id] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float g_max;
+    if (tid == 0u) {
+        float gm = shared_max[0];
+        for (uint s = 1u; s < 8u; ++s) {
+            gm = max(gm, shared_max[s]);
+        }
+        g_max = gm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float global_max = g_max;
+
+    threadgroup float shared_sum[8];
+    float local_sum = 0.0f;
+    for (uint v = tid; v < params.vocab_size; v += 256u) {
+        float l = bf16_to_f32(logits_bf16[v]);
+        if (!isnan(l) && !isinf(l)) {
+            local_sum += exp(l - global_max);
+        }
+    }
+    for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+        local_sum += simd_shuffle_down(local_sum, offset);
+    }
+    if (simd_lane == 0u) {
+        shared_sum[simd_id] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float g_sum_exp;
+    if (tid == 0u) {
+        float gs = shared_sum[0];
+        for (uint s = 1u; s < 8u; ++s) {
+            gs += shared_sum[s];
+        }
+        g_sum_exp = max(gs, 1e-12f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sum_exp = g_sum_exp;
+
+    threadgroup uint  chosen_tokens[16];
+    threadgroup float chosen_logits[16];
+    threadgroup uint  shared_best_idx[8];
+    const uint k_limit = min(params.top_k, 16u);
+
+    for (uint k = 0u; k < k_limit; ++k) {
+        float best_val = -INFINITY;
+        uint  best_idx = 0u;
+
+        for (uint v = tid; v < params.vocab_size; v += 256u) {
+            float l = bf16_to_f32(logits_bf16[v]);
+            if (isnan(l) || isinf(l)) {
+                continue;
+            }
+
+            bool already_chosen = false;
+            for (uint prev = 0u; prev < k; ++prev) {
+                if (v == chosen_tokens[prev]) {
+                    already_chosen = true;
+                    break;
+                }
+            }
+            if (!already_chosen && (l > best_val || (l == best_val && v < best_idx))) {
+                best_val = l;
+                best_idx = v;
+            }
+        }
+
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            float other_val = simd_shuffle_down(best_val, offset);
+            uint  other_idx = simd_shuffle_down(best_idx, offset);
+            if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+
+        if (simd_lane == 0u) {
+            shared_max[simd_id] = best_val;
+            shared_best_idx[simd_id] = best_idx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0u) {
+            float top_val = shared_max[0];
+            uint  top_idx = shared_best_idx[0];
+            for (uint s = 1u; s < 8u; ++s) {
+                if (shared_max[s] > top_val || (shared_max[s] == top_val && shared_best_idx[s] < top_idx)) {
+                    top_val = shared_max[s];
+                    top_idx = shared_best_idx[s];
+                }
+            }
+            chosen_tokens[k] = top_idx;
+            chosen_logits[k] = top_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        for (uint k = 0u; k < k_limit; ++k) {
+            out_tokens[k] = chosen_tokens[k];
+            out_probs[k] = exp(chosen_logits[k] - global_max) / sum_exp;
+        }
+    }
+}
+
+// 6e. GPU Top-K Token Extraction and Exact Probability Calculation (FP32 logits)
+kernel void eagle_topk_and_probs_f32(
+    device const float*         logits_f32        [[buffer(0)]],
+    device uint*                out_tokens        [[buffer(1)]],
+    device float*               out_probs         [[buffer(2)]],
+    constant EagleParams&       params            [[buffer(3)]],
+    uint                        tid               [[thread_index_in_threadgroup]],
+    uint                        simd_id           [[simdgroup_index_in_threadgroup]],
+    uint                        simd_lane         [[thread_index_in_simdgroup]]
+) {
+    threadgroup float shared_max[8];
+    float local_max = -INFINITY;
+    for (uint v = tid; v < params.vocab_size; v += 256u) {
+        float l = logits_f32[v];
+        if (!isnan(l) && !isinf(l)) {
+            local_max = max(local_max, l);
+        }
+    }
+    for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+        local_max = max(local_max, simd_shuffle_down(local_max, offset));
+    }
+    if (simd_lane == 0u) {
+        shared_max[simd_id] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float g_max;
+    if (tid == 0u) {
+        float gm = shared_max[0];
+        for (uint s = 1u; s < 8u; ++s) {
+            gm = max(gm, shared_max[s]);
+        }
+        g_max = gm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float global_max = g_max;
+
+    threadgroup float shared_sum[8];
+    float local_sum = 0.0f;
+    for (uint v = tid; v < params.vocab_size; v += 256u) {
+        float l = logits_f32[v];
+        if (!isnan(l) && !isinf(l)) {
+            local_sum += exp(l - global_max);
+        }
+    }
+    for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+        local_sum += simd_shuffle_down(local_sum, offset);
+    }
+    if (simd_lane == 0u) {
+        shared_sum[simd_id] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float g_sum_exp;
+    if (tid == 0u) {
+        float gs = shared_sum[0];
+        for (uint s = 1u; s < 8u; ++s) {
+            gs += shared_sum[s];
+        }
+        g_sum_exp = max(gs, 1e-12f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sum_exp = g_sum_exp;
+
+    threadgroup uint  chosen_tokens[16];
+    threadgroup float chosen_logits[16];
+    threadgroup uint  shared_best_idx[8];
+    const uint k_limit = min(params.top_k, 16u);
+
+    for (uint k = 0u; k < k_limit; ++k) {
+        float best_val = -INFINITY;
+        uint  best_idx = 0u;
+
+        for (uint v = tid; v < params.vocab_size; v += 256u) {
+            float l = logits_f32[v];
+            if (isnan(l) || isinf(l)) {
+                continue;
+            }
+
+            bool already_chosen = false;
+            for (uint prev = 0u; prev < k; ++prev) {
+                if (v == chosen_tokens[prev]) {
+                    already_chosen = true;
+                    break;
+                }
+            }
+            if (!already_chosen && (l > best_val || (l == best_val && v < best_idx))) {
+                best_val = l;
+                best_idx = v;
+            }
+        }
+
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            float other_val = simd_shuffle_down(best_val, offset);
+            uint  other_idx = simd_shuffle_down(best_idx, offset);
+            if (other_val > best_val || (other_val == best_val && other_idx < best_idx)) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+
+        if (simd_lane == 0u) {
+            shared_max[simd_id] = best_val;
+            shared_best_idx[simd_id] = best_idx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0u) {
+            float top_val = shared_max[0];
+            uint  top_idx = shared_best_idx[0];
+            for (uint s = 1u; s < 8u; ++s) {
+                if (shared_max[s] > top_val || (shared_max[s] == top_val && shared_best_idx[s] < top_idx)) {
+                    top_val = shared_max[s];
+                    top_idx = shared_best_idx[s];
+                }
+            }
+            chosen_tokens[k] = top_idx;
+            chosen_logits[k] = top_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        for (uint k = 0u; k < k_limit; ++k) {
+            out_tokens[k] = chosen_tokens[k];
+            out_probs[k] = exp(chosen_logits[k] - global_max) / sum_exp;
+        }
+    }
+}

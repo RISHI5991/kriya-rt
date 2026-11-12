@@ -246,6 +246,49 @@ impl EagleDraftEngine {
         })
     }
 
+    /// Constructs an EAGLE draft engine for GPU-native execution.
+    /// Does NOT store massive target embedding and target LM head weights in CPU heap,
+    /// saving up to 2.5 GB of CPU host memory.
+    pub fn new_gpu_backed(
+        hidden_dim: usize,
+        vocab_size: usize,
+        fc_fuse_weights: Vec<f32>,
+        decoder_layer_weights: Vec<f32>,
+    ) -> Result<Self, SpeculateError> {
+        if hidden_dim == 0 || vocab_size == 0 {
+            return Err(SpeculateError::InvalidTreeConfig(
+                "hidden_dim and vocab_size must both be non-zero".into(),
+            ));
+        }
+        let fc_expected = hidden_dim * (2 * hidden_dim);
+        if fc_fuse_weights.len() != fc_expected {
+            return Err(SpeculateError::DimensionMismatch {
+                expected: fc_expected,
+                actual: fc_fuse_weights.len(),
+            });
+        }
+        let dec_expected = hidden_dim * hidden_dim;
+        if decoder_layer_weights.len() != dec_expected {
+            return Err(SpeculateError::DimensionMismatch {
+                expected: dec_expected,
+                actual: decoder_layer_weights.len(),
+            });
+        }
+        Ok(Self {
+            hidden_dim,
+            vocab_size,
+            target_embedding_weights: Vec::new(),
+            target_lm_head_weights: Vec::new(),
+            fc_fuse_weights,
+            decoder_layer_weights,
+        })
+    }
+
+    /// Returns `true` if this draft engine operates without CPU-resident LM head weights.
+    pub fn is_gpu_backed(&self) -> bool {
+        self.target_lm_head_weights.is_empty()
+    }
+
     /// Predicts the next feature `\hat{f}_{i+1}` and next-token probability distribution `\hat{p}_{i+2}`
     /// from an advanced token `t_{i+1}` and previous feature `f_i`.
     pub fn forward_step(
@@ -253,6 +296,12 @@ impl EagleDraftEngine {
         advanced_token_id: u32,
         prev_feature: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>), SpeculateError> {
+        if self.target_embedding_weights.is_empty() {
+            return Err(SpeculateError::InvalidTreeConfig(
+                "CPU forward_step is unavailable on GPU-backed EagleDraftEngine (use GPU drafting pipeline)".into(),
+            ));
+        }
+
         if prev_feature.len() != self.hidden_dim {
             return Err(SpeculateError::DimensionMismatch {
                 expected: self.hidden_dim,
@@ -297,6 +346,10 @@ impl EagleDraftEngine {
     /// Projects a feature vector through the frozen target LM Head and applies Softmax.
     /// Unrolled 4-way to allow LLVM auto-vectorization into ARM NEON fmla.4s SIMD on Apple Silicon.
     pub fn compute_lm_head_probs(&self, feature: &[f32]) -> Vec<f32> {
+        if self.target_lm_head_weights.is_empty() {
+            return vec![0.0f32; self.vocab_size];
+        }
+
         let mut logits = vec![0.0f32; self.vocab_size];
         let h_dim = self.hidden_dim;
         for (v, logit) in logits.iter_mut().enumerate() {
@@ -424,8 +477,12 @@ impl EagleDraftEngine {
 
             for &child_id in &node.children {
                 let candidate_tok = tree.nodes[child_id].token_id as usize;
-                let q_x = p_draft[candidate_tok].max(1e-12);
-                let p_x = residual_p[candidate_tok];
+                let q_x = p_draft
+                    .get(candidate_tok)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(1e-12);
+                let p_x = residual_p.get(candidate_tok).copied().unwrap_or(0.0);
 
                 let accept_prob = (p_x / q_x).min(1.0);
                 if rng.next_f32() < accept_prob {
@@ -436,8 +493,9 @@ impl EagleDraftEngine {
                     break;
                 } else {
                     // Adjust residual distribution after rejecting candidate_tok
-                    for v in 0..self.vocab_size {
-                        residual_p[v] = (residual_p[v] - p_draft[v]).max(0.0);
+                    for (v, res_val) in residual_p.iter_mut().enumerate().take(self.vocab_size) {
+                        let draft_p = p_draft.get(v).copied().unwrap_or(0.0);
+                        *res_val = (*res_val - draft_p).max(0.0);
                     }
                     let sum_res: f32 = residual_p.iter().sum();
                     if sum_res > 1e-12 {

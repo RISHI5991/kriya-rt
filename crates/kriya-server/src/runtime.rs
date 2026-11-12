@@ -81,7 +81,7 @@ impl EngineRuntime {
         checkpoint_dir: &Path,
         draft_weights_path: Option<&Path>,
     ) -> Result<Self, String> {
-        let executor =
+        let mut executor =
             MetalExecutor::new_production(&descriptor, shader_dir, checkpoint_dir, 512, 16)
                 .map_err(|err| format!("unable to initialize the Metal executor: {err}"))?;
         let tokenizer = Arc::new(
@@ -99,8 +99,12 @@ impl EngineRuntime {
             kv_mgr,
         );
 
-        let draft_engine =
-            Self::build_draft_engine(&descriptor, &executor, checkpoint_dir, draft_weights_path);
+        let draft_engine = Self::build_draft_engine(
+            &descriptor,
+            &mut executor,
+            checkpoint_dir,
+            draft_weights_path,
+        );
 
         Ok(Self {
             descriptor,
@@ -117,7 +121,7 @@ impl EngineRuntime {
     /// Missing, malformed, and incompatible artifacts leave speculation disabled.
     fn build_draft_engine(
         descriptor: &ModelArchDescriptor,
-        executor: &MetalExecutor,
+        executor: &mut MetalExecutor,
         checkpoint_dir: &Path,
         explicit_draft_path: Option<&Path>,
     ) -> Option<EagleDraftEngine> {
@@ -202,22 +206,9 @@ impl EngineRuntime {
             );
         }
 
-        let embedding = executor.get_embedding_weights_f32().ok()?;
-        let lm_head = executor.get_lm_head_weights_f32().ok()?;
-
-        if embedding.len() != vocab * h || lm_head.len() != vocab * h {
-            return None;
-        }
-
-        let mut engine = EagleDraftEngine::new(
-            h,
-            vocab,
-            embedding,
-            lm_head,
-            vec![0.0; h * (2 * h)],
-            vec![0.0; h * h],
-        )
-        .ok()?;
+        let mut engine =
+            EagleDraftEngine::new_gpu_backed(h, vocab, vec![0.0; h * (2 * h)], vec![0.0; h * h])
+                .ok()?;
         if let Err(err) = engine.load_weights(&draft_weights) {
             eprintln!(
                 "KriyaRT: speculative decoding disabled; invalid trained draft head {}: {err}",
@@ -225,6 +216,16 @@ impl EngineRuntime {
             );
             return None;
         }
+
+        if let Err(err) = executor
+            .load_eagle_draft_weights(&engine.fc_fuse_weights, &engine.decoder_layer_weights)
+        {
+            eprintln!(
+                "KriyaRT: speculative decoding disabled; failed to load draft head weights to GPU: {err}"
+            );
+            return None;
+        }
+        println!("KriyaRT: GPU-native EAGLE speculative draft head loaded successfully");
         Some(engine)
     }
 
