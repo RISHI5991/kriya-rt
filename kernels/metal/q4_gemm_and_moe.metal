@@ -1787,12 +1787,12 @@ kernel void q4_g64_routed_moe_gemv(
 }
 
 // ============================================================================
-// 7. Adaptive Multi-Tile Dispatch: TGP_M = 64 Long Context Prefill Kernels (M >= 64)
+// 7. Adaptive Multi-Tile Dispatch: TGP_M = 64 Long Context Prefill Kernels (M >= 64, TGP_N = 32)
 // ============================================================================
-// 1. 64x16 output tile per threadgroup (4x weight reuse in registers across 4 accumulators)
-// 2. 14 KB threadgroup SRAM: 2 concurrent threadgroups per Apple GPU core for 100% latency hiding
-// 3. 128-bit vectorized activation loading (uint4 pairs)
-// 4. Cuts DRAM weight bandwidth by 75% vs TGP_M = 16
+// 1. 64x32 output tile per threadgroup (2x2 outer product tile per SIMDgroup with 4x operand reuse)
+// 2. 20.5 KB threadgroup SRAM: strictly <= 32 KB GPU hardware limit on all Apple Silicon
+// 3. 256 threads (8 SIMDgroups) with 128-bit vectorized activation loading (uint4 pairs)
+// 4. Halves dispatched threadgroups and DRAM activation re-reads vs TGP_N = 16
 
 kernel void q4_g64_batched_simdgroup_gemm_m64(
     device const BlockQ4Group64* weights   [[buffer(0)]],
@@ -1804,59 +1804,57 @@ kernel void q4_g64_batched_simdgroup_gemm_m64(
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint TGP_M  = 64u;
-    constexpr uint TGP_N  = 16u;
+    constexpr uint TGP_N  = 32u;
     constexpr uint TILE_K = 64u;
     constexpr uint STRIDE_K = 68u; // Bank padding: 68 * 2 = 136 bytes eliminates 32-way L1 bank conflict
 
     threadgroup half  x_tile[TGP_M][STRIDE_K];  // [64, 68] = 8.5 KB
-    threadgroup half  w_tile[TILE_K][TGP_N];  // [64, 16] = 2 KB
-    threadgroup float out_tile[TGP_M][TGP_N]; // [64, 16] = 4 KB
+    threadgroup half  w_tile[TILE_K][TGP_N];    // [64, 32] = 4.0 KB
+    threadgroup float out_tile[TGP_M][TGP_N];   // [64, 32] = 8.0 KB
 
     const uint global_m_base = tgp_id.y * TGP_M;
     const uint global_n_base = tgp_id.x * TGP_N;
     const uint linear_tid = simd_id * 32u + simd_lane;
 
-    // 4 SIMDgroups map to 2x2 grid of 32x8 output tiles
-    const uint m_sub = (simd_id / 2u) * 32u;
-    const uint n_sub = (simd_id % 2u) * 8u;
+    // 8 SIMDgroups map to a 4x2 grid of 16x16 output tiles:
+    // simd_id / 2: 0, 1, 2, 3 -> m_sub: 0, 16, 32, 48
+    // simd_id % 2: 0, 1       -> n_sub: 0, 16
+    const uint m_sub = (simd_id / 2u) * 16u;
+    const uint n_sub = (simd_id % 2u) * 16u;
 
-    simdgroup_matrix<float, 8, 8> acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint blk_idx = 0; blk_idx < params.num_k_blocks; ++blk_idx) {
         const uint k_base = blk_idx * TILE_K;
 
-        // Cooperatively load X tile [64, 64] using all 128 threads (32 elements per thread)
-        const uint tm_base = linear_tid >> 1u;        // 0..63
-        const uint tk_base = (linear_tid & 1u) * 32u; // 0, 32
+        // Cooperatively load X tile [64, 64] using all 256 threads (16 elements per thread)
+        const uint tm_base = linear_tid >> 2u;        // 0..63
+        const uint tk_base = (linear_tid & 3u) * 16u; // 0, 16, 32, 48
         const uint gm = global_m_base + tm_base;
         const uint gk_base = k_base + tk_base;
 
-        if (gm < params.M && gk_base + 31u < params.K) {
+        if (gm < params.M && gk_base + 15u < params.K) {
+            uint4 x_raw0 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + gk_base);
+            uint4 x_raw1 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + gk_base + 8u);
             #pragma unroll
-            for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-                uint k_offset = tk_base + half_idx * 16u;
-                uint4 x_raw0 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + k_base + k_offset);
-                uint4 x_raw1 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + k_base + k_offset + 8u);
-                #pragma unroll
-                for (uint w = 0u; w < 4u; ++w) {
-                    uint pair0 = (w == 0u) ? x_raw0.x : ((w == 1u) ? x_raw0.y : ((w == 2u) ? x_raw0.z : x_raw0.w));
-                    uint pair1 = (w == 0u) ? x_raw1.x : ((w == 1u) ? x_raw1.y : ((w == 2u) ? x_raw1.z : x_raw1.w));
-                    float f0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
-                    float f1 = as_type<float>(pair0 & 0xFFFF0000u);
-                    float f2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
-                    float f3 = as_type<float>(pair1 & 0xFFFF0000u);
-                    x_tile[tm_base][k_offset + w * 2u]          = half(f0);
-                    x_tile[tm_base][k_offset + w * 2u + 1u]     = half(f1);
-                    x_tile[tm_base][k_offset + 8u + w * 2u]     = half(f2);
-                    x_tile[tm_base][k_offset + 8u + w * 2u + 1u] = half(f3);
-                }
+            for (uint w = 0u; w < 4u; ++w) {
+                uint pair0 = (w == 0u) ? x_raw0.x : ((w == 1u) ? x_raw0.y : ((w == 2u) ? x_raw0.z : x_raw0.w));
+                uint pair1 = (w == 0u) ? x_raw1.x : ((w == 1u) ? x_raw1.y : ((w == 2u) ? x_raw1.z : x_raw1.w));
+                float f0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
+                float f1 = as_type<float>(pair0 & 0xFFFF0000u);
+                float f2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
+                float f3 = as_type<float>(pair1 & 0xFFFF0000u);
+                x_tile[tm_base][tk_base + w * 2u]          = half(f0);
+                x_tile[tm_base][tk_base + w * 2u + 1u]     = half(f1);
+                x_tile[tm_base][tk_base + 8u + w * 2u]     = half(f2);
+                x_tile[tm_base][tk_base + 8u + w * 2u + 1u] = half(f3);
             }
         } else {
             #pragma unroll
-            for (uint i = 0u; i < 32u; ++i) {
+            for (uint i = 0u; i < 16u; ++i) {
                 uint gk = gk_base + i;
                 x_tile[tm_base][tk_base + i] = (gm < params.M && gk < params.K)
                     ? half(bf16_to_f32(input_x[gm * params.K + gk]))
@@ -1864,8 +1862,8 @@ kernel void q4_g64_batched_simdgroup_gemm_m64(
             }
         }
 
-        // Cooperatively load and dequantize W tile [64, 16] using all 128 threads (8 elements per thread)
-        const uint col_n = linear_tid >> 3u;      // 0..15
+        // Cooperatively load and dequantize W tile [64, 32] using all 256 threads (8 elements per thread)
+        const uint col_n = linear_tid >> 3u;      // 0..31
         const uint sub_k = linear_tid & 7u;       // 0..7
         const uint gn    = global_n_base + col_n;
 
@@ -1897,36 +1895,33 @@ kernel void q4_g64_batched_simdgroup_gemm_m64(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Hardware matrix multiply-accumulate with 4x weight reuse across acc0, acc1, acc2, acc3
+        // Hardware matrix multiply-accumulate across 16x16 output tile per SIMDgroup:
+        // Reuses each activation matrix twice and each weight matrix twice.
         #pragma unroll
         for (uint k_step = 0; k_step < 8; ++k_step) {
-            simdgroup_matrix<half, 8, 8> b_mat;
-            simdgroup_load(b_mat, &w_tile[k_step * 8u][n_sub], TGP_N);
+            simdgroup_matrix<half, 8, 8> b_mat0;
+            simdgroup_matrix<half, 8, 8> b_mat1;
+            simdgroup_load(b_mat0, &w_tile[k_step * 8u][n_sub], TGP_N);
+            simdgroup_load(b_mat1, &w_tile[k_step * 8u][n_sub + 8u], TGP_N);
 
             simdgroup_matrix<half, 8, 8> a_mat0;
-            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc0, a_mat0, b_mat, acc0);
-
             simdgroup_matrix<half, 8, 8> a_mat1;
+            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
             simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc1, a_mat1, b_mat, acc1);
 
-            simdgroup_matrix<half, 8, 8> a_mat2;
-            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc2, a_mat2, b_mat, acc2);
-
-            simdgroup_matrix<half, 8, 8> a_mat3;
-            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc3, a_mat3, b_mat, acc3);
+            simdgroup_multiply_accumulate(acc00, a_mat0, b_mat0, acc00);
+            simdgroup_multiply_accumulate(acc01, a_mat0, b_mat1, acc01);
+            simdgroup_multiply_accumulate(acc10, a_mat1, b_mat0, acc10);
+            simdgroup_multiply_accumulate(acc11, a_mat1, b_mat1, acc11);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    simdgroup_store(acc0, &out_tile[m_sub][n_sub], TGP_N);
-    simdgroup_store(acc1, &out_tile[m_sub + 8u][n_sub], TGP_N);
-    simdgroup_store(acc2, &out_tile[m_sub + 16u][n_sub], TGP_N);
-    simdgroup_store(acc3, &out_tile[m_sub + 24u][n_sub], TGP_N);
+    simdgroup_store(acc00, &out_tile[m_sub][n_sub], TGP_N);
+    simdgroup_store(acc01, &out_tile[m_sub][n_sub + 8u], TGP_N);
+    simdgroup_store(acc10, &out_tile[m_sub + 8u][n_sub], TGP_N);
+    simdgroup_store(acc11, &out_tile[m_sub + 8u][n_sub + 8u], TGP_N);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     #pragma unroll
@@ -1961,7 +1956,7 @@ kernel void q4_g64_batched_simdgroup_qkv_gemm_m64(
     uint                         simd_lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint TGP_M  = 64u;
-    constexpr uint TGP_N  = 16u;
+    constexpr uint TGP_N  = 32u;
     constexpr uint TILE_K = 64u;
     constexpr uint STRIDE_K = 68u; // Bank padding: 68 * 2 = 136 bytes eliminates 32-way L1 bank conflict
 
@@ -1974,45 +1969,41 @@ kernel void q4_g64_batched_simdgroup_qkv_gemm_m64(
     const uint global_n_base = tgp_id.x * TGP_N;
     const uint linear_tid = simd_id * 32u + simd_lane;
 
-    const uint m_sub = (simd_id / 2u) * 32u;
-    const uint n_sub = (simd_id % 2u) * 8u;
+    const uint m_sub = (simd_id / 2u) * 16u;
+    const uint n_sub = (simd_id % 2u) * 16u;
 
-    simdgroup_matrix<float, 8, 8> acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint blk_idx = 0; blk_idx < params.num_k_blocks; ++blk_idx) {
         const uint k_base = blk_idx * TILE_K;
 
-        const uint tm_base = linear_tid >> 1u;
-        const uint tk_base = (linear_tid & 1u) * 32u;
+        const uint tm_base = linear_tid >> 2u;
+        const uint tk_base = (linear_tid & 3u) * 16u;
         const uint gm = global_m_base + tm_base;
         const uint gk_base = k_base + tk_base;
 
-        if (gm < params.M && gk_base + 31u < params.K) {
+        if (gm < params.M && gk_base + 15u < params.K) {
+            uint4 x_raw0 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + gk_base);
+            uint4 x_raw1 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + gk_base + 8u);
             #pragma unroll
-            for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-                uint k_offset = tk_base + half_idx * 16u;
-                uint4 x_raw0 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + k_base + k_offset);
-                uint4 x_raw1 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + k_base + k_offset + 8u);
-                #pragma unroll
-                for (uint w = 0u; w < 4u; ++w) {
-                    uint pair0 = (w == 0u) ? x_raw0.x : ((w == 1u) ? x_raw0.y : ((w == 2u) ? x_raw0.z : x_raw0.w));
-                    uint pair1 = (w == 0u) ? x_raw1.x : ((w == 1u) ? x_raw1.y : ((w == 2u) ? x_raw1.z : x_raw1.w));
-                    float f0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
-                    float f1 = as_type<float>(pair0 & 0xFFFF0000u);
-                    float f2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
-                    float f3 = as_type<float>(pair1 & 0xFFFF0000u);
-                    x_tile[tm_base][k_offset + w * 2u]          = half(f0);
-                    x_tile[tm_base][k_offset + w * 2u + 1u]     = half(f1);
-                    x_tile[tm_base][k_offset + 8u + w * 2u]     = half(f2);
-                    x_tile[tm_base][k_offset + 8u + w * 2u + 1u] = half(f3);
-                }
+            for (uint w = 0u; w < 4u; ++w) {
+                uint pair0 = (w == 0u) ? x_raw0.x : ((w == 1u) ? x_raw0.y : ((w == 2u) ? x_raw0.z : x_raw0.w));
+                uint pair1 = (w == 0u) ? x_raw1.x : ((w == 1u) ? x_raw1.y : ((w == 2u) ? x_raw1.z : x_raw1.w));
+                float f0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
+                float f1 = as_type<float>(pair0 & 0xFFFF0000u);
+                float f2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
+                float f3 = as_type<float>(pair1 & 0xFFFF0000u);
+                x_tile[tm_base][tk_base + w * 2u]          = half(f0);
+                x_tile[tm_base][tk_base + w * 2u + 1u]     = half(f1);
+                x_tile[tm_base][tk_base + 8u + w * 2u]     = half(f2);
+                x_tile[tm_base][tk_base + 8u + w * 2u + 1u] = half(f3);
             }
         } else {
             #pragma unroll
-            for (uint i = 0u; i < 32u; ++i) {
+            for (uint i = 0u; i < 16u; ++i) {
                 uint gk = gk_base + i;
                 x_tile[tm_base][tk_base + i] = (gm < params.M && gk < params.K)
                     ? half(bf16_to_f32(input_x[gm * params.K + gk]))
@@ -2068,33 +2059,29 @@ kernel void q4_g64_batched_simdgroup_qkv_gemm_m64(
 
         #pragma unroll
         for (uint k_step = 0; k_step < 8; ++k_step) {
-            simdgroup_matrix<half, 8, 8> b_mat;
-            simdgroup_load(b_mat, &w_tile[k_step * 8u][n_sub], TGP_N);
+            simdgroup_matrix<half, 8, 8> b_mat0;
+            simdgroup_matrix<half, 8, 8> b_mat1;
+            simdgroup_load(b_mat0, &w_tile[k_step * 8u][n_sub], TGP_N);
+            simdgroup_load(b_mat1, &w_tile[k_step * 8u][n_sub + 8u], TGP_N);
 
             simdgroup_matrix<half, 8, 8> a_mat0;
-            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc0, a_mat0, b_mat, acc0);
-
             simdgroup_matrix<half, 8, 8> a_mat1;
+            simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
             simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc1, a_mat1, b_mat, acc1);
 
-            simdgroup_matrix<half, 8, 8> a_mat2;
-            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc2, a_mat2, b_mat, acc2);
-
-            simdgroup_matrix<half, 8, 8> a_mat3;
-            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc3, a_mat3, b_mat, acc3);
+            simdgroup_multiply_accumulate(acc00, a_mat0, b_mat0, acc00);
+            simdgroup_multiply_accumulate(acc01, a_mat0, b_mat1, acc01);
+            simdgroup_multiply_accumulate(acc10, a_mat1, b_mat0, acc10);
+            simdgroup_multiply_accumulate(acc11, a_mat1, b_mat1, acc11);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    simdgroup_store(acc0, &out_tile[m_sub][n_sub], TGP_N);
-    simdgroup_store(acc1, &out_tile[m_sub + 8u][n_sub], TGP_N);
-    simdgroup_store(acc2, &out_tile[m_sub + 16u][n_sub], TGP_N);
-    simdgroup_store(acc3, &out_tile[m_sub + 24u][n_sub], TGP_N);
+    simdgroup_store(acc00, &out_tile[m_sub][n_sub], TGP_N);
+    simdgroup_store(acc01, &out_tile[m_sub][n_sub + 8u], TGP_N);
+    simdgroup_store(acc10, &out_tile[m_sub + 8u][n_sub], TGP_N);
+    simdgroup_store(acc11, &out_tile[m_sub + 8u][n_sub + 8u], TGP_N);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     #pragma unroll
@@ -2123,9 +2110,6 @@ kernel void q4_g64_batched_simdgroup_qkv_gemm_m64(
     }
 }
 
-
-
-
 kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
     device const BlockQ4Group64*     gate_weights [[buffer(0)]],
     device const BlockQ4Group64*     up_weights   [[buffer(1)]],
@@ -2137,64 +2121,69 @@ kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
     uint                             simd_lane    [[thread_index_in_simdgroup]]
 ) {
     constexpr uint TGP_M  = 64u;
-    constexpr uint TGP_N  = 16u;
+    constexpr uint TGP_N  = 32u;
     constexpr uint TILE_K = 64u;
     constexpr uint STRIDE_K = 68u; // Bank padding: 68 * 2 = 136 bytes eliminates 32-way L1 bank conflict
 
-    threadgroup half  x_tile[TGP_M][STRIDE_K];       // [64, 68] = 8.5 KB
-    threadgroup half  w_gate_tile[TILE_K][TGP_N];  // [64, 16] = 2 KB
-    threadgroup half  w_up_tile[TILE_K][TGP_N];    // [64, 16] = 2 KB
-    threadgroup float gate_out_tile[TGP_M][TGP_N]; // [64, 16] = 4 KB
-    threadgroup float up_out_tile[TGP_M][TGP_N];   // [64, 16] = 4 KB
+    // Memory-efficient SRAM layout keeping total threadgroup memory at 24.5 KB (strictly <= 32 KB):
+    // After the K-block loop finishes, the gate and up weight tiles are no longer needed,
+    // so up_out_tile safely aliases the weight tile memory.
+    union WeightsOrUpOut {
+        struct {
+            half gate[TILE_K][TGP_N]; // [64, 32] = 4.0 KB
+            half up[TILE_K][TGP_N];   // [64, 32] = 4.0 KB
+        } w;
+        float up_out[TGP_M][TGP_N];   // [64, 32] = 8.0 KB
+    };
+
+    threadgroup half             x_tile[TGP_M][STRIDE_K];  // [64, 68] = 8.5 KB
+    threadgroup float            gate_out_tile[TGP_M][TGP_N]; // [64, 32] = 8.0 KB
+    threadgroup WeightsOrUpOut   w_or_up;                     // 8.0 KB
 
     const uint global_m_base = tgp_id.y * TGP_M;
     const uint global_n_base = tgp_id.x * TGP_N;
     const uint linear_tid = simd_id * 32u + simd_lane;
 
-    const uint m_sub = (simd_id / 2u) * 32u;
-    const uint n_sub = (simd_id % 2u) * 8u;
+    const uint m_sub = (simd_id / 2u) * 16u;
+    const uint n_sub = (simd_id % 2u) * 16u;
 
-    simdgroup_matrix<float, 8, 8> acc_gate0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc_gate1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc_gate2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc_gate3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_gate00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_gate01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_gate10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_gate11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-    simdgroup_matrix<float, 8, 8> acc_up0   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc_up1   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc_up2   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> acc_up3   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_up00   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_up01   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_up10   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> acc_up11   = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint blk_idx = 0; blk_idx < params.num_k_blocks; ++blk_idx) {
         const uint k_base = blk_idx * TILE_K;
 
-        const uint tm_base = linear_tid >> 1u;
-        const uint tk_base = (linear_tid & 1u) * 32u;
+        const uint tm_base = linear_tid >> 2u;
+        const uint tk_base = (linear_tid & 3u) * 16u;
         const uint gm = global_m_base + tm_base;
         const uint gk_base = k_base + tk_base;
 
-        if (gm < params.M && gk_base + 31u < params.K) {
+        if (gm < params.M && gk_base + 15u < params.K) {
+            uint4 x_raw0 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + gk_base);
+            uint4 x_raw1 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + gk_base + 8u);
             #pragma unroll
-            for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-                uint k_offset = tk_base + half_idx * 16u;
-                uint4 x_raw0 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + k_base + k_offset);
-                uint4 x_raw1 = *reinterpret_cast<device const uint4*>(input_x + gm * params.K + k_base + k_offset + 8u);
-                #pragma unroll
-                for (uint w = 0u; w < 4u; ++w) {
-                    uint pair0 = (w == 0u) ? x_raw0.x : ((w == 1u) ? x_raw0.y : ((w == 2u) ? x_raw0.z : x_raw0.w));
-                    uint pair1 = (w == 0u) ? x_raw1.x : ((w == 1u) ? x_raw1.y : ((w == 2u) ? x_raw1.z : x_raw1.w));
-                    float f0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
-                    float f1 = as_type<float>(pair0 & 0xFFFF0000u);
-                    float f2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
-                    float f3 = as_type<float>(pair1 & 0xFFFF0000u);
-                    x_tile[tm_base][k_offset + w * 2u]          = half(f0);
-                    x_tile[tm_base][k_offset + w * 2u + 1u]     = half(f1);
-                    x_tile[tm_base][k_offset + 8u + w * 2u]     = half(f2);
-                    x_tile[tm_base][k_offset + 8u + w * 2u + 1u] = half(f3);
-                }
+            for (uint w = 0u; w < 4u; ++w) {
+                uint pair0 = (w == 0u) ? x_raw0.x : ((w == 1u) ? x_raw0.y : ((w == 2u) ? x_raw0.z : x_raw0.w));
+                uint pair1 = (w == 0u) ? x_raw1.x : ((w == 1u) ? x_raw1.y : ((w == 2u) ? x_raw1.z : x_raw1.w));
+                float f0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
+                float f1 = as_type<float>(pair0 & 0xFFFF0000u);
+                float f2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
+                float f3 = as_type<float>(pair1 & 0xFFFF0000u);
+                x_tile[tm_base][tk_base + w * 2u]          = half(f0);
+                x_tile[tm_base][tk_base + w * 2u + 1u]     = half(f1);
+                x_tile[tm_base][tk_base + 8u + w * 2u]     = half(f2);
+                x_tile[tm_base][tk_base + 8u + w * 2u + 1u] = half(f3);
             }
         } else {
             #pragma unroll
-            for (uint i = 0u; i < 32u; ++i) {
+            for (uint i = 0u; i < 16u; ++i) {
                 uint gk = gk_base + i;
                 x_tile[tm_base][tk_base + i] = (gm < params.M && gk < params.K)
                     ? half(bf16_to_f32(input_x[gm * params.K + gk]))
@@ -2232,17 +2221,17 @@ kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
                 float uw1 = fma(float(u_packed >> 4u),   u_scale, u_bias);
 
                 uint k0 = (byte_start + b) * 2u;
-                w_gate_tile[k0][col_n]      = half(gw0);
-                w_gate_tile[k0 + 1u][col_n] = half(gw1);
-                w_up_tile[k0][col_n]        = half(uw0);
-                w_up_tile[k0 + 1u][col_n]   = half(uw1);
+                w_or_up.w.gate[k0][col_n]      = half(gw0);
+                w_or_up.w.gate[k0 + 1u][col_n] = half(gw1);
+                w_or_up.w.up[k0][col_n]        = half(uw0);
+                w_or_up.w.up[k0 + 1u][col_n]   = half(uw1);
             }
         } else {
             uint k_start = sub_k * 8u;
             #pragma unroll
             for (uint i = 0u; i < 8u; ++i) {
-                w_gate_tile[k_start + i][col_n] = 0.0h;
-                w_up_tile[k_start + i][col_n]   = 0.0h;
+                w_or_up.w.gate[k_start + i][col_n] = 0.0h;
+                w_or_up.w.up[k_start + i][col_n]   = 0.0h;
             }
         }
 
@@ -2250,44 +2239,41 @@ kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
 
         #pragma unroll
         for (uint k_step = 0; k_step < 8; ++k_step) {
-            simdgroup_matrix<half, 8, 8> b_gate;
-            simdgroup_matrix<half, 8, 8> b_up;
-            simdgroup_load(b_gate, &w_gate_tile[k_step * 8u][n_sub], TGP_N);
-            simdgroup_load(b_up,   &w_up_tile[k_step * 8u][n_sub],   TGP_N);
+            simdgroup_matrix<half, 8, 8> b_gate0, b_gate1;
+            simdgroup_matrix<half, 8, 8> b_up0, b_up1;
+            simdgroup_load(b_gate0, &w_or_up.w.gate[k_step * 8u][n_sub], TGP_N);
+            simdgroup_load(b_gate1, &w_or_up.w.gate[k_step * 8u][n_sub + 8u], TGP_N);
+            simdgroup_load(b_up0,   &w_or_up.w.up[k_step * 8u][n_sub],   TGP_N);
+            simdgroup_load(b_up1,   &w_or_up.w.up[k_step * 8u][n_sub + 8u],   TGP_N);
 
-            simdgroup_matrix<half, 8, 8> a_mat0;
+            simdgroup_matrix<half, 8, 8> a_mat0, a_mat1;
             simdgroup_load(a_mat0, &x_tile[m_sub][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc_gate0, a_mat0, b_gate, acc_gate0);
-            simdgroup_multiply_accumulate(acc_up0,   a_mat0, b_up,   acc_up0);
-
-            simdgroup_matrix<half, 8, 8> a_mat1;
             simdgroup_load(a_mat1, &x_tile[m_sub + 8u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc_gate1, a_mat1, b_gate, acc_gate1);
-            simdgroup_multiply_accumulate(acc_up1,   a_mat1, b_up,   acc_up1);
 
-            simdgroup_matrix<half, 8, 8> a_mat2;
-            simdgroup_load(a_mat2, &x_tile[m_sub + 16u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc_gate2, a_mat2, b_gate, acc_gate2);
-            simdgroup_multiply_accumulate(acc_up2,   a_mat2, b_up,   acc_up2);
+            simdgroup_multiply_accumulate(acc_gate00, a_mat0, b_gate0, acc_gate00);
+            simdgroup_multiply_accumulate(acc_gate01, a_mat0, b_gate1, acc_gate01);
+            simdgroup_multiply_accumulate(acc_gate10, a_mat1, b_gate0, acc_gate10);
+            simdgroup_multiply_accumulate(acc_gate11, a_mat1, b_gate1, acc_gate11);
 
-            simdgroup_matrix<half, 8, 8> a_mat3;
-            simdgroup_load(a_mat3, &x_tile[m_sub + 24u][k_step * 8u], STRIDE_K);
-            simdgroup_multiply_accumulate(acc_gate3, a_mat3, b_gate, acc_gate3);
-            simdgroup_multiply_accumulate(acc_up3,   a_mat3, b_up,   acc_up3);
+            simdgroup_multiply_accumulate(acc_up00,   a_mat0, b_up0,   acc_up00);
+            simdgroup_multiply_accumulate(acc_up01,   a_mat0, b_up1,   acc_up01);
+            simdgroup_multiply_accumulate(acc_up10,   a_mat1, b_up0,   acc_up10);
+            simdgroup_multiply_accumulate(acc_up11,   a_mat1, b_up1,   acc_up11);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    simdgroup_store(acc_gate0, &gate_out_tile[m_sub][n_sub], TGP_N);
-    simdgroup_store(acc_gate1, &gate_out_tile[m_sub + 8u][n_sub], TGP_N);
-    simdgroup_store(acc_gate2, &gate_out_tile[m_sub + 16u][n_sub], TGP_N);
-    simdgroup_store(acc_gate3, &gate_out_tile[m_sub + 24u][n_sub], TGP_N);
+    // Weight tiles are completely consumed; safe to store into gate_out_tile and aliased up_out
+    simdgroup_store(acc_gate00, &gate_out_tile[m_sub][n_sub], TGP_N);
+    simdgroup_store(acc_gate01, &gate_out_tile[m_sub][n_sub + 8u], TGP_N);
+    simdgroup_store(acc_gate10, &gate_out_tile[m_sub + 8u][n_sub], TGP_N);
+    simdgroup_store(acc_gate11, &gate_out_tile[m_sub + 8u][n_sub + 8u], TGP_N);
 
-    simdgroup_store(acc_up0,   &up_out_tile[m_sub][n_sub],   TGP_N);
-    simdgroup_store(acc_up1,   &up_out_tile[m_sub + 8u][n_sub],   TGP_N);
-    simdgroup_store(acc_up2,   &up_out_tile[m_sub + 16u][n_sub],   TGP_N);
-    simdgroup_store(acc_up3,   &up_out_tile[m_sub + 24u][n_sub],   TGP_N);
+    simdgroup_store(acc_up00,   &w_or_up.up_out[m_sub][n_sub],   TGP_N);
+    simdgroup_store(acc_up01,   &w_or_up.up_out[m_sub][n_sub + 8u],   TGP_N);
+    simdgroup_store(acc_up10,   &w_or_up.up_out[m_sub + 8u][n_sub],   TGP_N);
+    simdgroup_store(acc_up11,   &w_or_up.up_out[m_sub + 8u][n_sub + 8u],   TGP_N);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     #pragma unroll
@@ -2300,7 +2286,7 @@ kernel void q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64(
             uint gn = global_n_base + tn;
             if (gm < params.M && gn < params.intermediate_size) {
                 float g = gate_out_tile[tm][tn];
-                float u = up_out_tile[tm][tn];
+                float u = w_or_up.up_out[tm][tn];
                 float act_g = 0.0f;
                 if (params.activation_variant == 0u) {
                     act_g = g / (1.0f + exp(-g));

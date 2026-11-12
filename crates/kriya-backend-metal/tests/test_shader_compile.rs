@@ -1588,3 +1588,289 @@ fn test_zero_copy_weight_buffer_mapping() {
     };
     assert_eq!(gpu_proj_slice, proj_view.data);
 }
+
+#[test]
+fn test_batched_gemm_m64_n32_matches_cpu_reference() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let m = 64usize;
+    let n = 64usize;
+    let k = 128usize;
+
+    let weights: Vec<f32> = (0..n * k)
+        .map(|idx| (((idx % 23) as f32) - 11.0) * 0.05)
+        .collect();
+    let q4_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&weights).unwrap();
+    let dequant_w = kriya_core::quantizer::dequantize_q4_group64_to_f32(&q4_blocks);
+
+    let input_f32: Vec<f32> = (0..m * k)
+        .map(|idx| (((idx % 19) as f32) - 9.0) * 0.04)
+        .collect();
+    let input_bf16: Vec<u16> = input_f32
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+    let input_unquant: Vec<f32> = input_bf16
+        .iter()
+        .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+        .collect();
+
+    let mut expected_y = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for inner in 0..k {
+                sum += input_unquant[row * k + inner] * dequant_w[col * k + inner];
+            }
+            expected_y[row * n + col] = sum;
+        }
+    }
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let weight_bytes = q4_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>();
+    let weight_buf =
+        device.new_buffer_with_data(q4_blocks.as_ptr() as *const _, weight_bytes as u64, shared);
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let out_buf = device.new_buffer((m * n * std::mem::size_of::<u16>()) as u64, shared);
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let params = kriya_backend_metal::encoder::GemmParams {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        num_k_blocks: (k / 64) as u32,
+    };
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(
+        &pipelines
+            .get_or_compile("q4_g64_batched_simdgroup_gemm_m64")
+            .unwrap(),
+    );
+    encoder.set_buffer(0, Some(&weight_buf), 0);
+    encoder.set_buffer(1, Some(&input_buf), 0);
+    encoder.set_buffer(2, Some(&out_buf), 0);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let out_slice = unsafe { std::slice::from_raw_parts(out_buf.contents() as *const u16, m * n) };
+    for (idx, (gpu_bits, &cpu)) in out_slice.iter().zip(&expected_y).enumerate() {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!(
+            (gpu - cpu).abs() < 0.05,
+            "Mismatch at elem {idx} (row {}, col {}): GPU={gpu}, CPU={cpu}",
+            idx / n,
+            idx % n
+        );
+    }
+}
+
+#[test]
+fn test_tiled_mma_prefill_attention_matches_cpu_reference() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let num_tokens = 16usize;
+    let num_q_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 64usize;
+    let block_size_tokens = 16usize;
+
+    let q_f32: Vec<f32> = (0..num_tokens * num_q_heads * head_dim)
+        .map(|idx| (((idx % 17) as f32) - 8.0) * 0.05)
+        .collect();
+    let q_bf16: Vec<u16> = q_f32
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+    let q_unquant: Vec<f32> = q_bf16
+        .iter()
+        .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+        .collect();
+
+    let k_f32: Vec<f32> = (0..block_size_tokens * num_kv_heads * head_dim)
+        .map(|idx| (((idx % 13) as f32) - 6.0) * 0.06)
+        .collect();
+    let k_bf16: Vec<u16> = k_f32
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+    let k_unquant: Vec<f32> = k_bf16
+        .iter()
+        .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+        .collect();
+
+    let v_f32: Vec<f32> = (0..block_size_tokens * num_kv_heads * head_dim)
+        .map(|idx| (((idx % 11) as f32) - 5.0) * 0.07)
+        .collect();
+    let v_bf16: Vec<u16> = v_f32
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+    let v_unquant: Vec<f32> = v_bf16
+        .iter()
+        .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+        .collect();
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut expected_out = vec![0.0f32; num_tokens * num_q_heads * head_dim];
+    for t in 0..num_tokens {
+        for qh in 0..num_q_heads {
+            let kh = qh / (num_q_heads / num_kv_heads);
+            let q_vec = &q_unquant
+                [(t * num_q_heads + qh) * head_dim..(t * num_q_heads + qh + 1) * head_dim];
+
+            let mut scores = Vec::with_capacity(t + 1);
+            for j in 0..=t {
+                let k_vec = &k_unquant
+                    [(j * num_kv_heads + kh) * head_dim..(j * num_kv_heads + kh + 1) * head_dim];
+                let dot: f32 = q_vec.iter().zip(k_vec).map(|(q, k)| q * k).sum();
+                scores.push(dot * sm_scale);
+            }
+
+            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for j in 0..=t {
+                    let v_val = v_unquant[(j * num_kv_heads + kh) * head_dim + d];
+                    acc += probs[j] * v_val;
+                }
+                expected_out[(t * num_q_heads + qh) * head_dim + d] = acc;
+            }
+        }
+    }
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let q_buf = device.new_buffer_with_data(
+        q_bf16.as_ptr() as *const _,
+        (q_bf16.len() * 2) as u64,
+        shared,
+    );
+    let k_buf = device.new_buffer_with_data(
+        k_bf16.as_ptr() as *const _,
+        (k_bf16.len() * 2) as u64,
+        shared,
+    );
+    let v_buf = device.new_buffer_with_data(
+        v_bf16.as_ptr() as *const _,
+        (v_bf16.len() * 2) as u64,
+        shared,
+    );
+
+    let page_indptr: Vec<i32> = (0..=num_tokens).map(|i| i as i32).collect();
+    let page_indices: Vec<i32> = vec![0i32; num_tokens];
+    let last_page_len: Vec<i32> = (0..num_tokens).map(|i| (i + 1) as i32).collect();
+
+    let indptr_buf = device.new_buffer_with_data(
+        page_indptr.as_ptr() as *const _,
+        (page_indptr.len() * 4) as u64,
+        shared,
+    );
+    let indices_buf = device.new_buffer_with_data(
+        page_indices.as_ptr() as *const _,
+        (page_indices.len() * 4) as u64,
+        shared,
+    );
+    let last_len_buf = device.new_buffer_with_data(
+        last_page_len.as_ptr() as *const _,
+        (last_page_len.len() * 4) as u64,
+        shared,
+    );
+    let dummy_cta = device.new_buffer(16, shared);
+    let dummy_split = device.new_buffer(4, shared);
+    let final_out_buf = device.new_buffer((expected_out.len() * 2) as u64, shared);
+    let dummy_partial = device.new_buffer(4, shared);
+    let dummy_lse = device.new_buffer(4, shared);
+
+    let params = kriya_backend_metal::encoder::BsrGqaParams {
+        num_q_heads: num_q_heads as u32,
+        num_kv_heads: num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        block_size_tokens: block_size_tokens as u32,
+        max_split_k_tiles: 16,
+        max_query_tokens: num_tokens as u32,
+        sm_scale,
+        logit_softcap: 0.0,
+    };
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(
+        &pipelines
+            .get_or_compile("bsr_paged_gqa_tiled_mma_prefill")
+            .unwrap(),
+    );
+    encoder.set_buffer(0, Some(&q_buf), 0);
+    encoder.set_buffer(1, Some(&k_buf), 0);
+    encoder.set_buffer(2, Some(&v_buf), 0);
+    encoder.set_buffer(3, Some(&indptr_buf), 0);
+    encoder.set_buffer(4, Some(&indices_buf), 0);
+    encoder.set_buffer(5, Some(&last_len_buf), 0);
+    encoder.set_buffer(6, Some(&dummy_cta), 0);
+    encoder.set_buffer(7, Some(&dummy_split), 0);
+    encoder.set_buffer(8, Some(&final_out_buf), 0);
+    encoder.set_buffer(9, Some(&dummy_partial), 0);
+    encoder.set_buffer(10, Some(&dummy_lse), 0);
+    encoder.set_bytes(
+        11,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tokens.div_ceil(16) as u64, num_q_heads as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let out_slice = unsafe {
+        std::slice::from_raw_parts(final_out_buf.contents() as *const u16, expected_out.len())
+    };
+    for (idx, (gpu_bits, &cpu)) in out_slice.iter().zip(&expected_out).enumerate() {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!(
+            (gpu - cpu).abs() < 0.05,
+            "Mismatch at token {}, head {}, dim {}: GPU={gpu}, CPU={cpu}",
+            idx / (num_q_heads * head_dim),
+            (idx / head_dim) % num_q_heads,
+            idx % head_dim
+        );
+    }
+}

@@ -1414,6 +1414,7 @@ impl MetalExecutor {
             "bsr_paged_gqa_decode_stage1",
             "bsr_paged_gqa_prefill_stage1",
             "bsr_paged_gqa_prefill_stage1_bq8",
+            "bsr_paged_gqa_tiled_mma_prefill",
             "bsr_paged_gqa_split_k_reduce",
             "bsr_paged_gqa_tree_verify",
             "gated_deltanet_recurrent_step",
@@ -1859,8 +1860,8 @@ impl MetalExecutor {
         } else if m >= 64 {
             (
                 "q4_g64_batched_simdgroup_gemm_m64",
-                MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1),
-                MTLSize::new(128, 1, 1),
+                MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(256, 1, 1),
             )
         } else {
             (
@@ -1975,8 +1976,8 @@ impl MetalExecutor {
         } else if m >= 64 {
             (
                 "q4_g64_batched_simdgroup_qkv_gemm_m64",
-                MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1),
-                MTLSize::new(128, 1, 1),
+                MTLSize::new(total_n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(256, 1, 1),
             )
         } else {
             (
@@ -2053,11 +2054,11 @@ impl MetalExecutor {
                 &params as *const _ as *const _,
             );
             let grid = MTLSize::new(
-                intermediate_size.div_ceil(16) as u64,
+                intermediate_size.div_ceil(32) as u64,
                 m.div_ceil(64) as u64,
                 1,
             );
-            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+            encoder.dispatch_thread_groups(grid, MTLSize::new(256, 1, 1));
         } else if m == 1 {
             let num_k_blocks = k.div_ceil(64);
             let params = GateUpSwigluGemmParams {
@@ -3222,14 +3223,29 @@ impl MetalExecutor {
                         MTLSize::new(32, 1, 1),
                     );
 
-                    // Attention: Vectorized Block-Query Prefill (bq8) for num_tokens >= 8,
-                    // otherwise scalar parallel causal dispatch.
-                    // Handles full head dimensions (64, 128, 256) with online softmax in SRAM.
-                    let use_bq8 = num_tokens >= 8;
-                    let kernel_name = if use_bq8 {
-                        "bsr_paged_gqa_prefill_stage1_bq8"
+                    // Attention: Tiled Tensor Prefill Attention with `simdgroup_matrix` MMA (Item 4)
+                    // for num_tokens >= 16 and head_dim <= 128 (hardware 8x8 tensor cores).
+                    // Otherwise falls back to vectorized block-query prefill (bq8) for num_tokens >= 8,
+                    // or scalar parallel causal dispatch.
+                    let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
+                    let (kernel_name, grid, threads) = if num_tokens >= 16 && head_dim <= 128 {
+                        (
+                            "bsr_paged_gqa_tiled_mma_prefill",
+                            MTLSize::new(num_tokens.div_ceil(16) as u64, num_q_heads as u64, 1),
+                            MTLSize::new(32, 1, 1),
+                        )
+                    } else if num_tokens >= 8 {
+                        (
+                            "bsr_paged_gqa_prefill_stage1_bq8",
+                            MTLSize::new(num_tokens.div_ceil(8) as u64, num_kv_heads as u64, 1),
+                            MTLSize::new(32 * gqa_ratio, 1, 1),
+                        )
                     } else {
-                        "bsr_paged_gqa_prefill_stage1"
+                        (
+                            "bsr_paged_gqa_prefill_stage1",
+                            MTLSize::new(num_tokens.div_ceil(4) as u64, num_kv_heads as u64, 1),
+                            MTLSize::new(32 * gqa_ratio, 1, 1),
+                        )
                     };
                     let gqa_pso = self.pipeline_cache.get_or_compile(kernel_name)?;
                     let gqa_params = BsrGqaParams {
@@ -3260,13 +3276,7 @@ impl MetalExecutor {
                         std::mem::size_of::<BsrGqaParams>() as u64,
                         &gqa_params as *const _ as *const _,
                     );
-                    let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
-                    let query_tokens_per_tile = if use_bq8 { 8 } else { 4 };
-                    let num_tiles = num_tokens.div_ceil(query_tokens_per_tile) as u64;
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_tiles, num_kv_heads as u64, 1),
-                        MTLSize::new(32 * gqa_ratio, 1, 1),
-                    );
+                    enc.dispatch_thread_groups(grid, threads);
 
                     // Note: Split-K for prefill (contexts > threshold blocks) is not
                     // yet implemented in the parallel prefill kernel. For typical

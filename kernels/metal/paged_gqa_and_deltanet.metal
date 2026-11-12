@@ -7,6 +7,7 @@
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 
 using namespace metal;
 
@@ -1145,18 +1146,273 @@ kernel void bsr_paged_gqa_prefill_stage1_bq8(
 
 
 // ============================================================================
-// 3c. FlashAttention 2D Block-Tiled Causal Prefill Attention
+// 3c. FlashAttention 2D Block-Tiled Causal Prefill Attention with simdgroup_matrix MMA
 // ============================================================================
 
-/// True FlashAttention prefill: 2D block-tiled with Q/K/V tiles in threadgroup SRAM
-/// and online softmax. Each threadgroup computes a 16x16 output tile per query token,
-/// loading K/V tiles once and reusing across all query positions in the tile.
+/// Tiled Tensor Prefill Attention with `simdgroup_matrix` MMA (Item 4).
+/// Uses hardware 8x8 matrix multiply-accumulate (AMX/MMA) for both S = Q x K^T
+/// and O += P x V across 16 query tokens (B_r = 16) and 16 physical key tokens (B_c = 16).
 ///
-/// Grid: tgp_id.x = query tile index (16 tokens per tile), tgp_id.y = KV head index
-/// Threadgroup: 16x16 threads, each computes one output element
-///
-/// For each KV block:
-///   1. Load Q tile [16, D] and K/V tile [16, D] into threadgroup SRAM
+/// Threadgroup size: 32 threads (1 SIMDgroup per query head).
+/// SRAM: 22.1 KB total threadgroup memory (strictly <= 32 KB GPU hardware limit).
+/// Dispatched when num_tokens >= 16 in forward_prefill_batch.
+kernel void bsr_paged_gqa_tiled_mma_prefill(
+    device const ushort*           q_in            [[buffer(0)]], // [M, num_q_heads, head_dim]
+    device const ushort*           kv_cache_k      [[buffer(1)]], // [num_blocks, block_sz, num_kv_heads, head_dim]
+    device const ushort*           kv_cache_v      [[buffer(2)]], // [num_blocks, block_sz, num_kv_heads, head_dim]
+    device const int*              page_indptr     [[buffer(3)]], // [M + 1] cumulative block indices
+    device const int*              page_indices    [[buffer(4)]], // [total_blocks]
+    device const int*              last_page_len   [[buffer(5)]], // [M] valid tokens in last page per position
+    device const CtaWorkTile*      cta_tiles       [[buffer(6)]], // [num_cta_tiles] split-K work tiles
+    device const uint*             tile_split_idx  [[buffer(7)]], // [num_cta_tiles]
+    device ushort*                 final_out       [[buffer(8)]], // [M, num_q_heads, head_dim]
+    device float*                  partial_out     [[buffer(9)]], // [M, num_q_heads, max_split_k, head_dim]
+    device float*                  partial_lse     [[buffer(10)]],// [M, num_q_heads, max_split_k]
+    constant BsrGqaParams&         params          [[buffer(11)]],
+    uint3                          tgp_id          [[threadgroup_position_in_grid]],
+    uint                           simd_id         [[simdgroup_index_in_threadgroup]],
+    uint                           lane_id         [[thread_index_in_simdgroup]]
+) {
+    const uint q_tile     = tgp_id.x; // Query tile index (16 tokens per tile)
+    const uint q_base_pos = q_tile * 16u;
+    const uint q_head     = tgp_id.y; // Query head index
+    const uint tid        = lane_id;
+
+    if (q_head >= params.num_q_heads || q_base_pos >= params.max_query_tokens) {
+        return;
+    }
+
+    const uint gqa_ratio = params.num_q_heads / params.num_kv_heads;
+    const uint kv_head   = q_head / gqa_ratio;
+    const uint D         = params.head_dim;
+    const uint d_steps   = D / 8u; // 8 for D=64, 16 for D=128
+
+    // Threadgroup SRAM layout (strictly 22.1 KB <= 32 KB limit)
+    threadgroup half  s_q[16][128];        // [16, D] query tile
+    threadgroup half  s_k_trans[128][16];  // [D, 16] transposed key tile for contiguous 16-stride MMA loads
+    threadgroup half  s_v[16][128];        // [16, D] value tile
+    threadgroup float s_s[16][16];         // [16, 16] Q x K^T raw scores
+    threadgroup half  s_p[16][16];         // [16, 16] causal online softmax probabilities
+    threadgroup float s_o[16][128];        // [16, D] unnormalized attention output accumulator
+    threadgroup float temp_o[16][8];       // [16, 8] MMA output buffer
+    threadgroup float s_alpha[16];         // [16] per-row rescale factors
+
+    uint q_pos[16];
+    bool q_valid[16];
+    uint q_max_pos = q_base_pos;
+    #pragma unroll
+    for (uint i = 0u; i < 16u; ++i) {
+        q_pos[i] = q_base_pos + i;
+        q_valid[i] = (q_pos[i] < params.max_query_tokens);
+        if (q_valid[i]) {
+            q_max_pos = q_pos[i];
+        }
+    }
+
+    const int req_page_start = page_indptr[q_max_pos];
+    const int req_page_end   = page_indptr[q_max_pos + 1];
+    const uint total_req_blocks = uint(max(req_page_end - req_page_start, 0));
+
+    // Clear output accumulator s_o
+    for (uint e = 0u; e < 64u; ++e) {
+        uint elem = tid * 64u + e;
+        if (elem < 16u * D) {
+            s_o[elem / D][elem % D] = 0.0f;
+        }
+    }
+
+    float m_i[16];
+    float l_i[16];
+    #pragma unroll
+    for (uint i = 0u; i < 16u; ++i) {
+        m_i[i] = -INFINITY;
+        l_i[i] = 0.0f;
+    }
+
+    // Load Q tile into SRAM once (stays resident for all KV blocks)
+    for (uint e = 0u; e < 64u; ++e) {
+        uint elem = tid * 64u + e;
+        if (elem < 16u * D) {
+            uint row = elem / D;
+            uint d   = elem % D;
+            if (q_valid[row]) {
+                uint qi_base = (q_pos[row] * params.num_q_heads + q_head) * D;
+                s_q[row][d] = half(bf16_to_f32(q_in[qi_base + d]));
+            } else {
+                s_q[row][d] = 0.0h;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Iterate over physical KV blocks
+    for (uint log_blk = 0u; log_blk < total_req_blocks; ++log_blk) {
+        const uint k_base_pos = log_blk * params.block_size_tokens;
+        if (k_base_pos > q_max_pos) {
+            break; // Causal prune: all remaining blocks are in the future for this query tile
+        }
+
+        const uint phys_blk = uint(page_indices[req_page_start + int(log_blk)]);
+        const uint blk_base = ((phys_blk * params.block_size_tokens) * params.num_kv_heads + kv_head) * D;
+        const uint tok_stride = params.num_kv_heads * D;
+
+        // Cooperatively load K into s_k_trans [D, 16] and V into s_v [16, D]
+        for (uint e = 0u; e < 64u; ++e) {
+            uint elem = tid * 64u + e;
+            if (elem < 16u * D) {
+                uint tok = elem / D;
+                uint d   = elem % D;
+                uint dram_off = blk_base + tok * tok_stride + d;
+                s_k_trans[d][tok] = half(bf16_to_f32(kv_cache_k[dram_off]));
+                s_v[tok][d]       = half(bf16_to_f32(kv_cache_v[dram_off]));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Hardware MMA for S = Q x K^T (16x16 tile using four 8x8 matrix accumulators)
+        simdgroup_matrix<float, 8, 8> s_00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> s_01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> s_10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> s_11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+        #pragma unroll
+        for (uint ds = 0u; ds < d_steps; ++ds) {
+            simdgroup_matrix<half, 8, 8> q0, q1;
+            simdgroup_matrix<half, 8, 8> kt0, kt1;
+            simdgroup_load(q0,  &s_q[0][ds * 8u], 128u);
+            simdgroup_load(q1,  &s_q[8u][ds * 8u], 128u);
+            simdgroup_load(kt0, &s_k_trans[ds * 8u][0], 16u);
+            simdgroup_load(kt1, &s_k_trans[ds * 8u][8u], 16u);
+
+            simdgroup_multiply_accumulate(s_00, q0, kt0, s_00);
+            simdgroup_multiply_accumulate(s_01, q0, kt1, s_01);
+            simdgroup_multiply_accumulate(s_10, q1, kt0, s_10);
+            simdgroup_multiply_accumulate(s_11, q1, kt1, s_11);
+        }
+
+        simdgroup_store(s_00, &s_s[0][0], 16u);
+        simdgroup_store(s_01, &s_s[0][8u], 16u);
+        simdgroup_store(s_10, &s_s[8u][0], 16u);
+        simdgroup_store(s_11, &s_s[8u][8u], 16u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Numerically stable online softmax and causal masking
+        if (tid < 16u) {
+            const uint r = tid;
+            if (q_valid[r]) {
+                float row_m = -INFINITY;
+                float scores[16];
+                #pragma unroll
+                for (uint c = 0u; c < 16u; ++c) {
+                    uint key_seq_pos = k_base_pos + c;
+                    if (key_seq_pos <= q_pos[r]) {
+                        float sc = s_s[r][c] * params.sm_scale;
+                        if (params.logit_softcap > 0.0f) {
+                            sc = safe_tanh(sc / params.logit_softcap) * params.logit_softcap;
+                        }
+                        scores[c] = sc;
+                        row_m = max(row_m, sc);
+                    } else {
+                        scores[c] = -INFINITY;
+                    }
+                }
+
+                if (row_m > -INFINITY) {
+                    float m_new = max(m_i[r], row_m);
+                    float alpha = (m_i[r] == -INFINITY) ? 0.0f : exp(clamp(m_i[r] - m_new, -80.0f, 0.0f));
+                    m_i[r] = m_new;
+                    s_alpha[r] = alpha;
+                    l_i[r] *= alpha;
+
+                    #pragma unroll
+                    for (uint c = 0u; c < 16u; ++c) {
+                        uint key_seq_pos = k_base_pos + c;
+                        if (key_seq_pos <= q_pos[r]) {
+                            float p = exp(clamp(scores[c] - m_new, -80.0f, 0.0f));
+                            l_i[r] += p;
+                            s_p[r][c] = half(p);
+                        } else {
+                            s_p[r][c] = 0.0h;
+                        }
+                    }
+                } else {
+                    s_alpha[r] = 1.0f;
+                    #pragma unroll
+                    for (uint c = 0u; c < 16u; ++c) {
+                        s_p[r][c] = 0.0h;
+                    }
+                }
+            } else {
+                s_alpha[r] = 0.0f;
+                #pragma unroll
+                for (uint c = 0u; c < 16u; ++c) {
+                    s_p[r][c] = 0.0h;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Scale previous output accumulator s_o by alpha
+        for (uint e = 0u; e < 64u; ++e) {
+            uint elem = tid * 64u + e;
+            if (elem < 16u * D) {
+                uint r = elem / D;
+                uint d = elem % D;
+                s_o[r][d] *= s_alpha[r];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Hardware MMA for O += P x V
+        simdgroup_matrix<half, 8, 8> p00, p01, p10, p11;
+        simdgroup_load(p00, &s_p[0][0], 16u);
+        simdgroup_load(p01, &s_p[0][8u], 16u);
+        simdgroup_load(p10, &s_p[8u][0], 16u);
+        simdgroup_load(p11, &s_p[8u][8u], 16u);
+
+        #pragma unroll
+        for (uint ds = 0u; ds < d_steps; ++ds) {
+            simdgroup_matrix<half, 8, 8> v0, v1;
+            simdgroup_load(v0, &s_v[0][ds * 8u], 128u);
+            simdgroup_load(v1, &s_v[8u][ds * 8u], 128u);
+
+            simdgroup_matrix<float, 8, 8> o0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> o1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+            simdgroup_multiply_accumulate(o0, p00, v0, o0);
+            simdgroup_multiply_accumulate(o0, p01, v1, o0);
+            simdgroup_multiply_accumulate(o1, p10, v0, o1);
+            simdgroup_multiply_accumulate(o1, p11, v1, o1);
+
+            simdgroup_store(o0, &temp_o[0][0], 8u);
+            simdgroup_store(o1, &temp_o[8u][0], 8u);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint e = 0u; e < 4u; ++e) {
+                uint elem = tid * 4u + e;
+                uint r = elem / 8u;
+                uint c = elem % 8u;
+                s_o[r][ds * 8u + c] += temp_o[r][c];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Normalize final output: O_i = s_o_i / l_i
+    for (uint e = 0u; e < 64u; ++e) {
+        uint elem = tid * 64u + e;
+        if (elem < 16u * D) {
+            uint r = elem / D;
+            uint d = elem % D;
+            if (q_valid[r]) {
+                const float inv_l = 1.0f / max(l_i[r], 1e-12f);
+                const uint out_off = (q_pos[r] * params.num_q_heads + q_head) * D + d;
+                final_out[out_off] = f32_to_bf16(s_o[r][d] * inv_l);
+            }
+        }
+    }
+}
 // ============================================================================
 // 4. Split-K Log-Sum-Exp (LSE) Tree Reduction Kernel (>=32K Context)
 // ============================================================================
