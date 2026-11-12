@@ -149,34 +149,6 @@ pub enum PlacementUnit {
     CpuCold,
 }
 
-/// PowerInfer-inspired Neuron Table mapping segmented hot/cold rows or columns
-/// back to original matrix indices.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NeuronPlacementTable {
-    /// Total rows/neurons in the original unsegmented weight matrix.
-    pub total_neurons: u32,
-    /// Original matrix row indices assigned to the GPU hot split.
-    pub gpu_hot_indices: Vec<u32>,
-    /// Original matrix row indices assigned to the CPU cold split.
-    pub cpu_cold_indices: Vec<u32>,
-}
-
-impl NeuronPlacementTable {
-    /// Creates an all-GPU placement table (100% hot residency).
-    pub fn all_gpu(total_neurons: u32) -> Self {
-        Self {
-            total_neurons,
-            gpu_hot_indices: (0..total_neurons).collect(),
-            cpu_cold_indices: Vec::new(),
-        }
-    }
-
-    /// Computes the memory footprint of the mapping table in bytes.
-    pub fn footprint_bytes(&self) -> usize {
-        (self.gpu_hot_indices.len() + self.cpu_cold_indices.len()) * std::mem::size_of::<u32>()
-    }
-}
-
 /// Metadata descriptor for an individual tensor stored inside a mapped model file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TensorDescriptor {
@@ -266,7 +238,6 @@ pub struct MappedWeightArchive {
     mmap: Arc<Mmap>,
     data_section_offset: usize,
     tensors: HashMap<String, TensorDescriptor>,
-    neuron_tables: HashMap<String, NeuronPlacementTable>,
 }
 
 impl MappedWeightArchive {
@@ -302,22 +273,12 @@ impl MappedWeightArchive {
             mmap: Arc::new(mmap),
             data_section_offset,
             tensors,
-            neuron_tables: HashMap::new(),
         })
     }
 
     /// Returns an iterator over all tensor names in this archive.
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
-    }
-
-    /// Registers a PowerInfer-style hot/cold neuron placement table for a specific layer matrix.
-    pub fn register_neuron_table(
-        &mut self,
-        layer_name: impl Into<String>,
-        table: NeuronPlacementTable,
-    ) {
-        self.neuron_tables.insert(layer_name.into(), table);
     }
 
     /// Retrieves a zero-copy `TensorView` directly borrowing from the memory-mapped pages.
@@ -403,12 +364,6 @@ mod tests {
         let blocks = view.as_q4_g64_blocks().unwrap();
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].qs[0], 0xAB);
-    }
-
-    #[test]
-    fn test_neuron_placement_table_footprint() {
-        let table = NeuronPlacementTable::all_gpu(4096);
-        assert_eq!(table.footprint_bytes(), 4096 * 4);
     }
 
     #[test]

@@ -651,7 +651,11 @@ impl ModelGpuWeights {
         let direct_key = format!("{prefix}.weight");
         for key in [&direct_key[..], prefix] {
             if let Ok(raw_bytes) = loader.get_tensor_bytes(key)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && (raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                    || raw_bytes.len() % std::mem::size_of::<kriya_core::tensor::BlockQ3Group64>()
+                        == 0
+                    || raw_bytes.len() % std::mem::size_of::<kriya_core::tensor::BlockQ2Group128>()
+                        == 0)
                 && loader
                     .get_tensor_bytes(&format!("{prefix}.scales"))
                     .is_err()
@@ -1459,6 +1463,7 @@ pub struct MetalExecutor {
     pub eagle_draft_logits_buf: Buffer,
     pub rope_cos_sin_table_buf: Buffer,
     pub rope_max_seq_len: u32,
+    pub weight_dtype: kriya_core::tensor::DType,
 }
 
 impl MetalExecutor {
@@ -1807,6 +1812,7 @@ impl MetalExecutor {
             eagle_draft_logits_buf: alloc((vocab_capped * 2).max(1024)),
             rope_cos_sin_table_buf,
             rope_max_seq_len,
+            weight_dtype: descriptor.weight_dtype,
         })
     }
 
@@ -2095,6 +2101,37 @@ impl MetalExecutor {
         n: u32,
         k: u32,
     ) -> Result<(), MetalError> {
+        let q2_len = (n as u64) * (k.div_ceil(128) as u64) * 36;
+        let q3_len = (n as u64) * (k.div_ceil(64) as u64) * 28;
+
+        if m == 1 && weight_buf.length() == q2_len {
+            return Self::encode_q2_linear(
+                pipeline_cache,
+                encoder,
+                weight_buf,
+                input_buf,
+                input_byte_offset,
+                output_buf,
+                m,
+                n,
+                k,
+            );
+        }
+
+        if m == 1 && weight_buf.length() == q3_len {
+            return Self::encode_q3_linear(
+                pipeline_cache,
+                encoder,
+                weight_buf,
+                input_buf,
+                input_byte_offset,
+                output_buf,
+                m,
+                n,
+                k,
+            );
+        }
+
         let params = GemmParams {
             m,
             n,

@@ -1961,9 +1961,10 @@ kernel void moe_router_topk_and_histogram(
     }
 }
 
-/// Stage 2 of GPU-resident MoE routing:
-/// Computes exclusive prefix scan over `expert_counts` to produce `expert_offsets`
-/// and writes the contiguous `scatter_token_indices` array for Grouped Expert GEMM.
+/// Stage 2 of GPU-resident MoE routing (Tier 6 Item 15 Parallel Prefix Scan):
+/// Computes parallel exclusive prefix scan over `expert_counts` using hardware
+/// `simd_prefix_exclusive_sum` and `simd_sum` across 32-lane SIMDgroups in threadgroup SRAM,
+/// reducing 256 serial scalar iterations to just 8 SIMD cycles (32x speedup).
 kernel void moe_router_prefix_scan_and_scatter(
     device const uint*        expert_counts        [[buffer(0)]], // [num_total_experts]
     device uint*              expert_offsets       [[buffer(1)]], // [num_total_experts + 1]
@@ -1971,25 +1972,43 @@ kernel void moe_router_prefix_scan_and_scatter(
     device const uint*        token_expert_slot    [[buffer(3)]], // [num_tokens * num_active_experts]
     device uint*              scatter_token_map    [[buffer(4)]], // [num_tokens * num_active_experts]
     constant MoeRouteParams&  params               [[buffer(5)]],
-    uint                      tid                  [[thread_position_in_grid]]
+    uint                      tid                  [[thread_position_in_grid]],
+    uint                      tgp_id               [[threadgroup_position_in_grid]],
+    uint                      simd_id              [[simdgroup_index_in_threadgroup]],
+    uint                      simd_lane            [[thread_index_in_simdgroup]]
 ) {
-    // Thread 0 performs fast sequential prefix scan over 256 experts in L1 cache
-    if (tid == 0u) {
-        uint running_offset = 0u;
-        for (uint e = 0; e < params.num_total_experts; ++e) {
-            expert_offsets[e] = running_offset;
-            running_offset += expert_counts[e];
+    threadgroup uint tg_offsets[257];
+
+    if (simd_id == 0u) {
+        uint running_base = 0u;
+        for (uint chunk = 0; chunk < params.num_total_experts; chunk += 32u) {
+            uint e = chunk + simd_lane;
+            uint val = (e < params.num_total_experts) ? expert_counts[e] : 0u;
+            uint off = simd_prefix_exclusive_sum(val) + running_base;
+            if (e < params.num_total_experts) {
+                tg_offsets[e] = off;
+                if (tgp_id == 0u) {
+                    expert_offsets[e] = off;
+                }
+            }
+            uint chunk_sum = simd_sum(val);
+            running_base += chunk_sum;
         }
-        expert_offsets[params.num_total_experts] = running_offset;
+        if (simd_lane == 0u) {
+            tg_offsets[params.num_total_experts] = running_base;
+            if (tgp_id == 0u) {
+                expert_offsets[params.num_total_experts] = running_base;
+            }
+        }
     }
 
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint total_assignments = params.num_tokens * params.num_active_experts;
     if (tid < total_assignments) {
         uint exp_id = selected_experts[tid];
         uint intra_slot = token_expert_slot[tid];
-        uint dst_idx = expert_offsets[exp_id] + intra_slot;
+        uint dst_idx = tg_offsets[exp_id] + intra_slot;
         scatter_token_map[dst_idx] = tid;
     }
 }

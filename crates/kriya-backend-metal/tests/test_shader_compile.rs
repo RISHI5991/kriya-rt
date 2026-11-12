@@ -2984,3 +2984,134 @@ fn test_gpu_native_draft_tree_and_speculative_decode_end_to_end() {
     );
     assert_eq!(accepted_tokens.len(), accepted_nodes.len());
 }
+
+#[test]
+fn test_moe_router_parallel_simd_prefix_scan_and_scatter() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+    let queue = device.new_command_queue();
+    let mut cache = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let pso = cache
+        .get_or_compile("moe_router_prefix_scan_and_scatter")
+        .expect("Kernel must compile cleanly");
+
+    // Test across small (8), medium (64), and large (256) total expert counts
+    for &num_total_experts in &[8u32, 64u32, 256u32] {
+        let num_tokens = 8u32;
+        let num_active_experts = 4u32;
+        let total_assignments = (num_tokens * num_active_experts) as usize;
+
+        // Initialize pseudo-random expert counts and assignments
+        let mut expert_counts = vec![0u32; num_total_experts as usize];
+        let mut selected_experts = vec![0u32; total_assignments];
+        let mut token_expert_slot = vec![0u32; total_assignments];
+
+        for tok in 0..num_tokens {
+            for k in 0..num_active_experts {
+                let idx = (tok * num_active_experts + k) as usize;
+                let exp = (tok * 7 + k * 13 + 3) % num_total_experts;
+                selected_experts[idx] = exp;
+                token_expert_slot[idx] = expert_counts[exp as usize];
+                expert_counts[exp as usize] += 1;
+            }
+        }
+
+        // Ground-truth CPU prefix scan
+        let mut expected_offsets = vec![0u32; (num_total_experts + 1) as usize];
+        let mut running = 0u32;
+        for e in 0..num_total_experts as usize {
+            expected_offsets[e] = running;
+            running += expert_counts[e];
+        }
+        expected_offsets[num_total_experts as usize] = running;
+
+        // Ground-truth CPU scatter map
+        let mut expected_scatter = vec![0u32; total_assignments];
+        for (i, (&exp, &slot)) in selected_experts.iter().zip(&token_expert_slot).enumerate() {
+            let dst = (expected_offsets[exp as usize] + slot) as usize;
+            expected_scatter[dst] = i as u32;
+        }
+
+        // Metal GPU buffers
+        let shared = metal::MTLResourceOptions::StorageModeShared;
+        let expert_counts_buf = device.new_buffer_with_data(
+            expert_counts.as_ptr() as *const _,
+            (expert_counts.len() * std::mem::size_of::<u32>()) as u64,
+            shared,
+        );
+        let expert_offsets_buf = device.new_buffer(
+            ((num_total_experts + 1) as usize * std::mem::size_of::<u32>()) as u64,
+            shared,
+        );
+        let selected_experts_buf = device.new_buffer_with_data(
+            selected_experts.as_ptr() as *const _,
+            (selected_experts.len() * std::mem::size_of::<u32>()) as u64,
+            shared,
+        );
+        let token_slot_buf = device.new_buffer_with_data(
+            token_expert_slot.as_ptr() as *const _,
+            (token_expert_slot.len() * std::mem::size_of::<u32>()) as u64,
+            shared,
+        );
+        let scatter_map_buf = device.new_buffer(
+            (total_assignments * std::mem::size_of::<u32>()) as u64,
+            shared,
+        );
+
+        let params = kriya_backend_metal::encoder::MoeRouteParams {
+            num_tokens,
+            num_total_experts,
+            num_active_experts,
+            normalize_weights: 1,
+        };
+
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        enc.set_buffer(0, Some(&expert_counts_buf), 0);
+        enc.set_buffer(1, Some(&expert_offsets_buf), 0);
+        enc.set_buffer(2, Some(&selected_experts_buf), 0);
+        enc.set_buffer(3, Some(&token_slot_buf), 0);
+        enc.set_buffer(4, Some(&scatter_map_buf), 0);
+        enc.set_bytes(
+            5,
+            std::mem::size_of::<kriya_backend_metal::encoder::MoeRouteParams>() as u64,
+            &params as *const _ as *const _,
+        );
+
+        let grid = metal::MTLSize::new((total_assignments as u64).div_ceil(64).max(1), 1, 1);
+        let threads = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, threads);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Readback and assert exact parity
+        let gpu_offsets = unsafe {
+            std::slice::from_raw_parts(
+                expert_offsets_buf.contents() as *const u32,
+                (num_total_experts + 1) as usize,
+            )
+        };
+        assert_eq!(
+            gpu_offsets,
+            &expected_offsets[..],
+            "MoE prefix scan offsets mismatch for num_total_experts={num_total_experts}"
+        );
+
+        let gpu_scatter = unsafe {
+            std::slice::from_raw_parts(scatter_map_buf.contents() as *const u32, total_assignments)
+        };
+        assert_eq!(
+            gpu_scatter,
+            &expected_scatter[..],
+            "MoE scatter map mismatch for num_total_experts={num_total_experts}"
+        );
+    }
+}
