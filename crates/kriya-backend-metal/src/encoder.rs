@@ -21,6 +21,7 @@ use kriya_kv::bsr_paged::{CtaWorkTile, FlashInferSchedulePlan};
 use metal::*;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Maximum layers per command buffer chunk to avoid macOS command-buffer
@@ -253,6 +254,7 @@ pub struct ModelGpuWeights {
     pub layers: Vec<LayerGpuBuffers>,
     pub final_norm: Buffer,
     pub lm_head: Buffer,
+    pub _loader: Option<Arc<ShardedCheckpointLoader>>,
 }
 
 impl ModelGpuWeights {
@@ -598,6 +600,32 @@ impl ModelGpuWeights {
         }
     }
 
+    /// Binds weight data into a Metal buffer using zero-copy page mapping when the memory
+    /// pointer is 16 KB virtual-memory page-aligned, eliminating unified memory copies.
+    /// Gracefully falls back to `new_buffer_with_data` when unaligned.
+    #[inline]
+    fn bind_buffer_zero_copy_or_copy(
+        device: &Device,
+        raw_bytes: &[u8],
+        shared: MTLResourceOptions,
+    ) -> Buffer {
+        let ptr = raw_bytes.as_ptr() as usize;
+        if ptr % 16384 == 0 && !raw_bytes.is_empty() {
+            device.new_buffer_with_bytes_no_copy(
+                raw_bytes.as_ptr() as *const _,
+                raw_bytes.len() as u64,
+                shared,
+                None,
+            )
+        } else {
+            device.new_buffer_with_data(
+                raw_bytes.as_ptr() as *const _,
+                raw_bytes.len() as u64,
+                shared,
+            )
+        }
+    }
+
     fn bind_q4_buffer(
         loader: &ShardedCheckpointLoader,
         device: &Device,
@@ -613,10 +641,8 @@ impl ModelGpuWeights {
                     .get_tensor_bytes(&format!("{prefix}.scales"))
                     .is_err()
             {
-                return Ok(Some(device.new_buffer_with_data(
-                    raw_bytes.as_ptr() as *const _,
-                    raw_bytes.len() as u64,
-                    shared,
+                return Ok(Some(Self::bind_buffer_zero_copy_or_copy(
+                    device, raw_bytes, shared,
                 )));
             }
         }
@@ -634,10 +660,9 @@ impl ModelGpuWeights {
                         )));
                     }
                 }
-                Ok(Some(device.new_buffer_with_data(
-                    blocks.as_ptr() as *const _,
-                    (blocks.len() * std::mem::size_of::<BlockQ4Group64>()) as u64,
-                    shared,
+                let bytes = bytemuck::cast_slice(&blocks);
+                Ok(Some(Self::bind_buffer_zero_copy_or_copy(
+                    device, bytes, shared,
                 )))
             }
             Err(err) => {
@@ -679,12 +704,18 @@ impl ModelGpuWeights {
                 view.descriptor.shape
             )));
         }
-        let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
-        Ok(Some(device.new_buffer_with_data(
-            bf16_bytes.as_ptr() as *const _,
-            bf16_bytes.len() as u64,
-            shared,
-        )))
+        if view.descriptor.dtype == DType::BF16 {
+            Ok(Some(Self::bind_buffer_zero_copy_or_copy(
+                device, view.data, shared,
+            )))
+        } else {
+            let bf16_bytes = Self::tensor_view_to_bf16_bytes(&view)?;
+            Ok(Some(Self::bind_buffer_zero_copy_or_copy(
+                device,
+                &bf16_bytes,
+                shared,
+            )))
+        }
     }
 
     /// Strictly loads real `.safetensors` / MLX 4-bit weights from a local checkpoint directory
@@ -698,7 +729,7 @@ impl ModelGpuWeights {
         // Enforce single production validation boundary: strict loading always validates first
         Self::validate_production_checkpoint(desc, checkpoint_dir.as_ref())?;
 
-        let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
+        let loader = Arc::new(ShardedCheckpointLoader::open_directory(checkpoint_dir)?);
         let shared = MTLResourceOptions::StorageModeShared;
         let h = desc.hidden_size as usize;
         let vocab = desc.vocab_size as usize;
@@ -840,6 +871,7 @@ impl ModelGpuWeights {
             layers,
             final_norm,
             lm_head,
+            _loader: Some(loader),
         })
     }
 
@@ -850,8 +882,9 @@ impl ModelGpuWeights {
         desc: &ModelArchDescriptor,
         checkpoint_dir: P,
     ) -> Result<Self, MetalError> {
-        let loader = ShardedCheckpointLoader::open_directory(checkpoint_dir)?;
+        let loader = Arc::new(ShardedCheckpointLoader::open_directory(checkpoint_dir)?);
         let mut weights = Self::allocate_for_descriptor(device, desc);
+        weights._loader = Some(loader.clone());
 
         let try_bind_q4 = |prefix: &str| -> Option<Buffer> {
             Self::bind_q4_buffer(&loader, device, prefix, None)
@@ -1117,6 +1150,7 @@ impl ModelGpuWeights {
             layers,
             final_norm,
             lm_head,
+            _loader: None,
         }
     }
 }
@@ -1353,14 +1387,18 @@ impl MetalExecutor {
             "rms_norm_bf16",
             "q4_g64_decode_gemv",
             "q4_g64_decode_gemv_2row",
+            "q4_g64_decode_gemv_4row",
             "q4_g64_decode_gemv_sub16",
             "q4_g64_decode_gemv_accumulate",
             "q4_g64_decode_gemv_accumulate_2row",
+            "q4_g64_decode_gemv_accumulate_4row",
             "q4_g64_decode_gemv_accumulate_sub16",
             "q4_g64_decode_qkv_gemv",
+            "q4_g64_decode_qkv_gemv_2row",
             "q4_g64_decode_qkv_gemv_sub16",
             "q4_g64_decode_gate_up_gemv",
             "q4_g64_decode_gate_up_swiglu_gemv",
+            "q4_g64_decode_gate_up_swiglu_gemv_2chan",
             "q4_g64_decode_gate_up_swiglu_gemv_sub16",
             "q4_g64_prefill_gemm",
             "q4_g64_prefill_qkv_gemm",
@@ -1808,6 +1846,8 @@ impl MetalExecutor {
         let (kernel_name, grid, threads) = if m == 1 {
             let (name, divisor) = if params.num_k_blocks <= 16 {
                 ("q4_g64_decode_gemv_sub16", 8u32)
+            } else if n >= 16 {
+                ("q4_g64_decode_gemv_4row", 16u32)
             } else {
                 ("q4_g64_decode_gemv_2row", 8u32)
             };
@@ -1865,6 +1905,8 @@ impl MetalExecutor {
 
         let (kernel_name, tgp_divisor) = if num_k_blocks <= 16 {
             ("q4_g64_decode_gemv_accumulate_sub16", 8u32)
+        } else if n >= 16 {
+            ("q4_g64_decode_gemv_accumulate_4row", 16u32)
         } else {
             ("q4_g64_decode_gemv_accumulate_2row", 8u32)
         };
@@ -1923,7 +1965,7 @@ impl MetalExecutor {
             let (name, divisor) = if params.num_k_blocks <= 16 {
                 ("q4_g64_decode_qkv_gemv_sub16", 8u32)
             } else {
-                ("q4_g64_decode_qkv_gemv", 4u32)
+                ("q4_g64_decode_qkv_gemv_2row", 8u32)
             };
             (
                 name,
@@ -2031,7 +2073,7 @@ impl MetalExecutor {
             let (kernel_name, tgp_divisor) = if num_k_blocks <= 16 {
                 ("q4_g64_decode_gate_up_swiglu_gemv_sub16", 8u32)
             } else {
-                ("q4_g64_decode_gate_up_swiglu_gemv", 4u32)
+                ("q4_g64_decode_gate_up_swiglu_gemv_2chan", 8u32)
             };
             let pso = pipeline_cache.get_or_compile(kernel_name)?;
             encoder.set_compute_pipeline_state(&pso);

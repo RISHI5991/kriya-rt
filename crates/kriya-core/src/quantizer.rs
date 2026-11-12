@@ -341,7 +341,14 @@ pub enum SavedTensorPayload {
     Q4Group64(Vec<BlockQ4Group64>),
 }
 
+/// Virtual memory page size on Apple Silicon unified memory architecture (16 KB).
+const VIRTUAL_PAGE_SIZE: usize = 16384;
+
 /// Writes a mixed-precision archive where 1D norms are stored as `"BF16"` and 2D weights as `"Q4_G64"`.
+///
+/// Both the JSON header and individual tensor payloads are aligned to 16 KB virtual-memory page
+/// boundaries (`VIRTUAL_PAGE_SIZE`), enabling zero-copy Metal GPU unified memory mapping via
+/// `device.new_buffer_with_bytes_no_copy()` without heap copying or memory duplication.
 pub fn write_mixed_safetensors<P: AsRef<Path>>(
     output_path: P,
     tensors: &[(String, Vec<usize>, SavedTensorPayload)],
@@ -357,35 +364,76 @@ pub fn write_mixed_safetensors<P: AsRef<Path>>(
                 blocks.len() * std::mem::size_of::<BlockQ4Group64>(),
             ),
         };
+        // Page-align start of each tensor so GPU buffers can map zero-copy
+        let aligned_start = if current_offset % VIRTUAL_PAGE_SIZE != 0 {
+            current_offset.next_multiple_of(VIRTUAL_PAGE_SIZE)
+        } else {
+            current_offset
+        };
+        let aligned_end = aligned_start + byte_len;
         header_map.insert(
             name.clone(),
             serde_json::json!({
                 "dtype": dtype_str,
                 "shape": shape,
-                "data_offsets": [current_offset, current_offset + byte_len]
+                "data_offsets": [aligned_start, aligned_end]
             }),
         );
-        current_offset += byte_len;
+        current_offset = aligned_end;
     }
 
-    let header_bytes =
+    let mut header_bytes =
         serde_json::to_vec(&header_map).map_err(|e| TensorError::InvalidMetadata(e.to_string()))?;
+
+    // safetensors binary format has:
+    // - 8 bytes: header length (u64 little-endian)
+    // - header_len bytes: JSON header string
+    // - Data section starting at byte (8 + header_len)
+    // Pad JSON header with trailing ASCII spaces so (8 + header_len) is a multiple of 16 KB.
+    let raw_total = 8 + header_bytes.len();
+    let target_total = raw_total.next_multiple_of(VIRTUAL_PAGE_SIZE);
+    let pad_len = target_total - raw_total;
+    header_bytes.resize(header_bytes.len() + pad_len, b' ');
+
     let header_len = header_bytes.len() as u64;
+    debug_assert_eq!((8 + header_len) as usize % VIRTUAL_PAGE_SIZE, 0);
 
     let file = File::create(output_path)?;
     let mut writer = BufWriter::new(file);
     writer.write_all(&header_len.to_le_bytes())?;
     writer.write_all(&header_bytes)?;
 
+    let mut written_offset = 0usize;
     for (_, _, payload) in tensors {
-        match payload {
+        let (byte_slice, byte_len) = match payload {
             SavedTensorPayload::Bf16(vals) => {
-                writer.write_all(bytemuck::cast_slice(vals))?;
+                (bytemuck::cast_slice(vals.as_slice()), vals.len() * 2)
             }
-            SavedTensorPayload::Q4Group64(blocks) => {
-                writer.write_all(bytemuck::cast_slice(blocks))?;
+            SavedTensorPayload::Q4Group64(blocks) => (
+                bytemuck::cast_slice(blocks.as_slice()),
+                blocks.len() * std::mem::size_of::<BlockQ4Group64>(),
+            ),
+        };
+
+        let target_start = if written_offset % VIRTUAL_PAGE_SIZE != 0 {
+            written_offset.next_multiple_of(VIRTUAL_PAGE_SIZE)
+        } else {
+            written_offset
+        };
+        if target_start > written_offset {
+            let pad = target_start - written_offset;
+            static ZEROS: [u8; VIRTUAL_PAGE_SIZE] = [0u8; VIRTUAL_PAGE_SIZE];
+            let mut remaining = pad;
+            while remaining > 0 {
+                let chunk = remaining.min(VIRTUAL_PAGE_SIZE);
+                writer.write_all(&ZEROS[..chunk])?;
+                remaining -= chunk;
             }
+            written_offset = target_start;
         }
+
+        writer.write_all(byte_slice)?;
+        written_offset += byte_len;
     }
     writer.flush()?;
     Ok(())
@@ -458,6 +506,18 @@ mod tests {
             .unwrap();
         assert_eq!(proj_view.descriptor.dtype, DType::Q4Group64);
         assert_eq!(proj_view.data.len(), 36);
+
+        // Verify 16 KB page-aligned data pointers for zero-copy Metal GPU mapping
+        assert_eq!(
+            (norm_view.data.as_ptr() as usize) % VIRTUAL_PAGE_SIZE,
+            0,
+            "norm_view data pointer must be 16 KB page-aligned"
+        );
+        assert_eq!(
+            (proj_view.data.as_ptr() as usize) % VIRTUAL_PAGE_SIZE,
+            0,
+            "proj_view data pointer must be 16 KB page-aligned"
+        );
     }
 
     #[test]

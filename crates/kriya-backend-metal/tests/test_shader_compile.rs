@@ -841,6 +841,200 @@ fn test_q4_decode_gate_up_swiglu_matches_cpu_reference_on_metal() {
 }
 
 #[test]
+fn test_q4_decode_gemv_4row_matches_cpu_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let rows = 19usize; // non-multiple of 16 to test boundary clipping
+    let cols = 128usize; // 2 blocks
+    let source_weights: Vec<f32> = (0..rows * cols)
+        .map(|idx| ((idx % 41) as f32 - 20.0) * 0.03125)
+        .collect();
+    let blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&source_weights).unwrap();
+    let dequantized = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
+    let input: Vec<f32> = (0..cols)
+        .map(|idx| ((idx % 13) as f32 - 6.0) * 0.125)
+        .collect();
+    let input_bf16: Vec<u16> = input
+        .iter()
+        .map(|&value| kriya_core::quantizer::f32_to_bf16_bits(value))
+        .collect();
+
+    let expected: Vec<f32> = dequantized
+        .chunks_exact(cols)
+        .map(|row| row.iter().zip(&input).map(|(w, x)| w * x).sum())
+        .collect();
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let weight_buf = device.new_buffer_with_data(
+        blocks.as_ptr() as *const _,
+        (blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let output_buf = device.new_buffer((rows * std::mem::size_of::<u16>()) as u64, shared);
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder
+        .set_compute_pipeline_state(&pipelines.get_or_compile("q4_g64_decode_gemv_4row").unwrap());
+    encoder.set_buffer(0, Some(&weight_buf), 0);
+    encoder.set_buffer(1, Some(&input_buf), 0);
+    encoder.set_buffer(2, Some(&output_buf), 0);
+    let params = kriya_backend_metal::encoder::GemmParams {
+        m: 1,
+        n: rows as u32,
+        k: cols as u32,
+        num_k_blocks: (cols / 64) as u32,
+    };
+    encoder.set_bytes(
+        3,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(rows.div_ceil(16) as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let output = unsafe { std::slice::from_raw_parts(output_buf.contents() as *const u16, rows) };
+    for (gpu_bits, cpu) in output.iter().zip(expected) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "GPU={gpu}, CPU={cpu}");
+    }
+}
+
+#[test]
+fn test_q4_decode_gate_up_swiglu_2chan_matches_cpu_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let intermediate_size = 11usize; // non-multiple of 8 to test boundary clipping
+    let k = 128usize;
+
+    let gate_source: Vec<f32> = (0..intermediate_size * k)
+        .map(|idx| ((idx % 33) as f32 - 16.0) * 0.03125)
+        .collect();
+    let up_source: Vec<f32> = (0..intermediate_size * k)
+        .map(|idx| ((idx % 37) as f32 - 18.0) * 0.03125)
+        .collect();
+
+    let gate_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&gate_source).unwrap();
+    let up_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&up_source).unwrap();
+
+    let gate_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&gate_blocks);
+    let up_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&up_blocks);
+
+    let input: Vec<f32> = (0..k).map(|idx| ((idx % 17) as f32 - 8.0) * 0.1).collect();
+    let input_bf16: Vec<u16> = input
+        .iter()
+        .map(|&value| kriya_core::quantizer::f32_to_bf16_bits(value))
+        .collect();
+
+    let mut expected = Vec::with_capacity(intermediate_size);
+    for row in 0..intermediate_size {
+        let g: f32 = gate_deq[row * k..(row + 1) * k]
+            .iter()
+            .zip(&input)
+            .map(|(w, x)| w * x)
+            .sum();
+        let u: f32 = up_deq[row * k..(row + 1) * k]
+            .iter()
+            .zip(&input)
+            .map(|(w, x)| w * x)
+            .sum();
+        let act_g = g / (1.0 + (-g).exp()); // SwiGLU
+        expected.push(act_g * u);
+    }
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let gate_buf = device.new_buffer_with_data(
+        gate_blocks.as_ptr() as *const _,
+        (gate_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let up_buf = device.new_buffer_with_data(
+        up_blocks.as_ptr() as *const _,
+        (up_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let output_buf = device.new_buffer(
+        (intermediate_size * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(
+        &pipelines
+            .get_or_compile("q4_g64_decode_gate_up_swiglu_gemv_2chan")
+            .unwrap(),
+    );
+    encoder.set_buffer(0, Some(&gate_buf), 0);
+    encoder.set_buffer(1, Some(&up_buf), 0);
+    encoder.set_buffer(2, Some(&input_buf), 0);
+    encoder.set_buffer(3, Some(&output_buf), 0);
+
+    let params = kriya_backend_metal::encoder::GateUpSwigluGemmParams {
+        m: 1,
+        k: k as u32,
+        num_k_blocks: (k / 64) as u32,
+        intermediate_size: intermediate_size as u32,
+        activation_variant: 0, // SwiGLU
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    encoder.set_bytes(
+        4,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(intermediate_size.div_ceil(8) as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let output = unsafe {
+        std::slice::from_raw_parts(output_buf.contents() as *const u16, intermediate_size)
+    };
+    for (gpu_bits, cpu) in output.iter().zip(expected) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "GPU={gpu}, CPU={cpu}");
+    }
+}
+
+#[test]
 fn test_paged_attention_matches_cpu_reference_on_metal() {
     let Some(device) = require_metal_device() else {
         return;
@@ -1185,4 +1379,212 @@ fn test_full_model_descriptors_and_weight_precision_policy() {
 
     let full_desc = kriya_core::descriptor::ModelArchDescriptor::llama_3_2_3b();
     assert_eq!(full_desc.layers.len(), 28);
+}
+
+#[test]
+fn test_q4_decode_qkv_gemv_2row_matches_cpu_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let q_dim = 16usize;
+    let kv_dim = 8usize;
+    let k = 128usize; // 2 blocks
+
+    let q_source: Vec<f32> = (0..q_dim * k)
+        .map(|idx| ((idx % 23) as f32 - 11.0) * 0.03125)
+        .collect();
+    let k_source: Vec<f32> = (0..kv_dim * k)
+        .map(|idx| ((idx % 29) as f32 - 14.0) * 0.03125)
+        .collect();
+    let v_source: Vec<f32> = (0..kv_dim * k)
+        .map(|idx| ((idx % 31) as f32 - 15.0) * 0.03125)
+        .collect();
+
+    let q_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&q_source).unwrap();
+    let k_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&k_source).unwrap();
+    let v_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&v_source).unwrap();
+
+    let q_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&q_blocks);
+    let k_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&k_blocks);
+    let v_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&v_blocks);
+
+    let input: Vec<f32> = (0..k).map(|idx| ((idx % 19) as f32 - 9.0) * 0.1).collect();
+    let input_bf16: Vec<u16> = input
+        .iter()
+        .map(|&value| kriya_core::quantizer::f32_to_bf16_bits(value))
+        .collect();
+
+    let expected_q: Vec<f32> = q_deq
+        .chunks_exact(k)
+        .map(|row| row.iter().zip(&input).map(|(w, x)| w * x).sum())
+        .collect();
+    let expected_k: Vec<f32> = k_deq
+        .chunks_exact(k)
+        .map(|row| row.iter().zip(&input).map(|(w, x)| w * x).sum())
+        .collect();
+    let expected_v: Vec<f32> = v_deq
+        .chunks_exact(k)
+        .map(|row| row.iter().zip(&input).map(|(w, x)| w * x).sum())
+        .collect();
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let q_weight_buf = device.new_buffer_with_data(
+        q_blocks.as_ptr() as *const _,
+        (q_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let k_weight_buf = device.new_buffer_with_data(
+        k_blocks.as_ptr() as *const _,
+        (k_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let v_weight_buf = device.new_buffer_with_data(
+        v_blocks.as_ptr() as *const _,
+        (v_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let q_out_buf = device.new_buffer((q_dim * std::mem::size_of::<u16>()) as u64, shared);
+    let k_out_buf = device.new_buffer((kv_dim * std::mem::size_of::<u16>()) as u64, shared);
+    let v_out_buf = device.new_buffer((kv_dim * std::mem::size_of::<u16>()) as u64, shared);
+
+    let dummy_bias = device.new_buffer(4, shared);
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let total_rows = (q_dim + kv_dim + kv_dim) as u32;
+    let params = kriya_backend_metal::encoder::QkvGemmParams {
+        m: 1,
+        k: k as u32,
+        num_k_blocks: (k / 64) as u32,
+        q_dim: q_dim as u32,
+        k_dim: kv_dim as u32,
+        v_dim: kv_dim as u32,
+        has_bias: 0,
+        _pad: 0,
+    };
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(
+        &pipelines
+            .get_or_compile("q4_g64_decode_qkv_gemv_2row")
+            .unwrap(),
+    );
+    encoder.set_buffer(0, Some(&q_weight_buf), 0);
+    encoder.set_buffer(1, Some(&k_weight_buf), 0);
+    encoder.set_buffer(2, Some(&v_weight_buf), 0);
+    encoder.set_buffer(3, Some(&input_buf), 0);
+    encoder.set_buffer(4, Some(&q_out_buf), 0);
+    encoder.set_buffer(5, Some(&k_out_buf), 0);
+    encoder.set_buffer(6, Some(&v_out_buf), 0);
+    encoder.set_buffer(7, Some(&dummy_bias), 0);
+    encoder.set_buffer(8, Some(&dummy_bias), 0);
+    encoder.set_buffer(9, Some(&dummy_bias), 0);
+    encoder.set_bytes(
+        10,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new((total_rows as usize).div_ceil(8) as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let q_out = unsafe { std::slice::from_raw_parts(q_out_buf.contents() as *const u16, q_dim) };
+    for (gpu_bits, cpu) in q_out.iter().zip(expected_q) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "Q: GPU={gpu}, CPU={cpu}");
+    }
+
+    let k_out = unsafe { std::slice::from_raw_parts(k_out_buf.contents() as *const u16, kv_dim) };
+    for (gpu_bits, cpu) in k_out.iter().zip(expected_k) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "K: GPU={gpu}, CPU={cpu}");
+    }
+
+    let v_out = unsafe { std::slice::from_raw_parts(v_out_buf.contents() as *const u16, kv_dim) };
+    for (gpu_bits, cpu) in v_out.iter().zip(expected_v) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "V: GPU={gpu}, CPU={cpu}");
+    }
+}
+
+#[test]
+fn test_zero_copy_weight_buffer_mapping() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let st_path = dir.path().join("model.safetensors");
+    let norm_bf16 = vec![kriya_core::quantizer::f32_to_bf16_bits(1.0); 3072];
+    let proj_q4 = kriya_core::quantizer::quantize_f32_to_q4_group64(&vec![0.25f32; 128]).unwrap();
+
+    kriya_core::quantizer::write_mixed_safetensors(
+        &st_path,
+        &[
+            (
+                "model.norm.weight".to_string(),
+                vec![3072],
+                kriya_core::quantizer::SavedTensorPayload::Bf16(norm_bf16),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight".to_string(),
+                vec![2, 64],
+                kriya_core::quantizer::SavedTensorPayload::Q4Group64(proj_q4),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let archive = kriya_core::safetensors_loader::open_safetensors_file(&st_path).unwrap();
+    let norm_view = archive.get_tensor("model.norm.weight").unwrap();
+    let proj_view = archive
+        .get_tensor("model.layers.0.self_attn.q_proj.weight")
+        .unwrap();
+
+    // Verify 16 KB page-aligned data pointers
+    assert_eq!((norm_view.data.as_ptr() as usize) % 16384, 0);
+    assert_eq!((proj_view.data.as_ptr() as usize) % 16384, 0);
+
+    // Verify zero-copy Metal buffer creation succeeds on page-aligned mmap data
+    let shared = MTLResourceOptions::StorageModeShared;
+    let norm_buf = device.new_buffer_with_bytes_no_copy(
+        norm_view.data.as_ptr() as *const _,
+        norm_view.data.len() as u64,
+        shared,
+        None,
+    );
+    assert_eq!(norm_buf.length() as usize, norm_view.data.len());
+    let gpu_norm_slice = unsafe {
+        std::slice::from_raw_parts(norm_buf.contents() as *const u8, norm_view.data.len())
+    };
+    assert_eq!(gpu_norm_slice, norm_view.data);
+
+    let proj_buf = device.new_buffer_with_bytes_no_copy(
+        proj_view.data.as_ptr() as *const _,
+        proj_view.data.len() as u64,
+        shared,
+        None,
+    );
+    assert_eq!(proj_buf.length() as usize, proj_view.data.len());
+    let gpu_proj_slice = unsafe {
+        std::slice::from_raw_parts(proj_buf.contents() as *const u8, proj_view.data.len())
+    };
+    assert_eq!(gpu_proj_slice, proj_view.data);
 }
