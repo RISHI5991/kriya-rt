@@ -436,6 +436,10 @@ fn test_bsr_paged_gqa_real_dimensions() {
             apply_qk_norm: 0,
             rms_eps: 1e-5,
             rope_theta: 500_000.0,
+            max_seq_len: 4096,
+            has_table: 0,
+            _pad0: 0,
+            _pad1: 0,
         };
         // We just write K/V to cache; q_inout is unused for this test
         enc.set_buffer(0, Some(&q_buf), 0); // q_inout
@@ -455,6 +459,7 @@ fn test_bsr_paged_gqa_real_dimensions() {
             std::mem::size_of_val(&rope_params) as u64,
             &rope_params as *const _ as *const _,
         );
+        enc.set_buffer(12, None, 0);
         enc.dispatch_thread_groups(
             MTLSize::new((NUM_Q_HEADS + NUM_KV_HEADS) as u64, 1, 1),
             MTLSize::new(32, 1, 1),

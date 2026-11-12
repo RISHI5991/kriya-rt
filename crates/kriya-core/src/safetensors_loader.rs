@@ -40,6 +40,8 @@ impl DType {
             "BF16" => Ok(DType::BF16),
             "F8_E4M3" => Ok(DType::FP8E4M3),
             "Q4_G64" => Ok(DType::Q4Group64),
+            "Q2_G128" => Ok(DType::Q2Group128),
+            "Q3_G64" => Ok(DType::Q3Group64),
             "U32" => Ok(DType::U32),
             "U8" => Ok(DType::U8),
             "I32" => Ok(DType::I32),
@@ -267,6 +269,30 @@ impl ShardedCheckpointLoader {
             .collect();
 
         Ok(packed_blocks)
+    }
+
+    /// Asynchronously prefetches all tensors belonging to a specific transformer layer from SSD (`MADV_WILLNEED`).
+    pub fn prefetch_layer(&self, layer_idx: usize) {
+        let prefix = format!("model.layers.{layer_idx}.");
+        for (name, shard_name) in &self.tensor_to_shard {
+            if name.starts_with(&prefix) {
+                if let Some(archive) = self.shards.get(shard_name) {
+                    let _ = archive.prefetch_tensor(name);
+                }
+            }
+        }
+    }
+
+    /// Resets tensor page advice to Normal when a layer has finished execution.
+    pub fn release_layer(&self, layer_idx: usize) {
+        let prefix = format!("model.layers.{layer_idx}.");
+        for (name, shard_name) in &self.tensor_to_shard {
+            if name.starts_with(&prefix) {
+                if let Some(archive) = self.shards.get(shard_name) {
+                    let _ = archive.release_tensor(name);
+                }
+            }
+        }
     }
 }
 

@@ -726,6 +726,7 @@ mod tests {
             gqa_split_k_partitions: 8,
             gpu_hot_expert_ratio: 1.0,
             compress_kv_cache_q4: false,
+            enable_layer_streaming: false,
         };
 
         // Layer 3 is GQA — should produce a plan

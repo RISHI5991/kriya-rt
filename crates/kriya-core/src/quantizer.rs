@@ -7,7 +7,7 @@ use crate::descriptor::{
     ModelArchDescriptor, NormVariant, PhaseRoutingPolicy, PositionalEncoding,
     SequenceMixerDescriptor,
 };
-use crate::tensor::{BlockQ4Group64, DType, TensorError};
+use crate::tensor::{BlockQ2Group128, BlockQ3Group64, BlockQ4Group64, DType, TensorError};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -116,6 +116,196 @@ pub fn dequantize_q4_group64_to_f32(blocks: &[BlockQ4Group64]) -> Vec<f32> {
                 [
                     ((packed & 0x0F) as f32).mul_add(scale, bias),
                     ((packed >> 4) as f32).mul_add(scale, bias),
+                ]
+            })
+        })
+        .collect()
+}
+
+/// Quantizes a slice of `f32` weights (length must be a multiple of 128) into
+/// 2-bit affine Group-128 blocks (`w_approx = q * scale + bias`, where `q in 0..=3`).
+pub fn quantize_f32_to_q2_group128(weights: &[f32]) -> Result<Vec<BlockQ2Group128>, TensorError> {
+    if weights.len() % 128 != 0 {
+        return Err(TensorError::ShapeMismatch {
+            expected: weights.len().div_ceil(128) * 128,
+            actual: weights.len(),
+        });
+    }
+
+    let num_blocks = weights.len() / 128;
+    let mut out_blocks = Vec::with_capacity(num_blocks);
+
+    for chunk in weights.chunks_exact(128) {
+        let (min_val, max_val) = chunk
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
+
+        let range = (max_val - min_val).max(1e-8);
+        let scale = range / 3.0;
+        let bias = min_val;
+
+        let scale_bf16 = f32_to_bf16_bits(scale);
+        let bias_bf16 = f32_to_bf16_bits(bias);
+
+        let eff_scale = bf16_bits_to_f32(scale_bf16).max(1e-8);
+        let eff_bias = bf16_bits_to_f32(bias_bf16);
+
+        let mut qs = [0u8; 32];
+        for (byte_i, qs_byte) in qs.iter_mut().enumerate() {
+            let base = byte_i * 4;
+            let q0 = ((chunk[base] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 3.0) as u8;
+            let q1 = ((chunk[base + 1] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 3.0) as u8;
+            let q2 = ((chunk[base + 2] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 3.0) as u8;
+            let q3 = ((chunk[base + 3] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 3.0) as u8;
+
+            *qs_byte = (q0 & 0x03) | ((q1 & 0x03) << 2) | ((q2 & 0x03) << 4) | ((q3 & 0x03) << 6);
+        }
+
+        out_blocks.push(BlockQ2Group128 {
+            scale_bf16,
+            bias_bf16,
+            qs,
+        });
+    }
+
+    Ok(out_blocks)
+}
+
+/// Dequantizes a `BlockQ2Group128` slice back to `f32`.
+pub fn dequantize_q2_group128_to_f32(blocks: &[BlockQ2Group128]) -> Vec<f32> {
+    blocks
+        .iter()
+        .flat_map(|blk| {
+            let scale = bf16_bits_to_f32(blk.scale_bf16);
+            let bias = bf16_bits_to_f32(blk.bias_bf16);
+            blk.qs.iter().flat_map(move |&packed| {
+                [
+                    ((packed & 0x03) as f32).mul_add(scale, bias),
+                    (((packed >> 2) & 0x03) as f32).mul_add(scale, bias),
+                    (((packed >> 4) & 0x03) as f32).mul_add(scale, bias),
+                    (((packed >> 6) & 0x03) as f32).mul_add(scale, bias),
+                ]
+            })
+        })
+        .collect()
+}
+
+/// Quantizes a slice of `f32` weights (length must be a multiple of 64) into
+/// 3-bit affine Group-64 blocks (`w_approx = q * scale + bias`, where `q in 0..=7`).
+pub fn quantize_f32_to_q3_group64(weights: &[f32]) -> Result<Vec<BlockQ3Group64>, TensorError> {
+    if weights.len() % 64 != 0 {
+        return Err(TensorError::ShapeMismatch {
+            expected: weights.len().div_ceil(64) * 64,
+            actual: weights.len(),
+        });
+    }
+
+    let num_blocks = weights.len() / 64;
+    let mut out_blocks = Vec::with_capacity(num_blocks);
+
+    for chunk in weights.chunks_exact(64) {
+        let (min_val, max_val) = chunk
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
+
+        let range = (max_val - min_val).max(1e-8);
+        let scale = range / 7.0;
+        let bias = min_val;
+
+        let scale_bf16 = f32_to_bf16_bits(scale);
+        let bias_bf16 = f32_to_bf16_bits(bias);
+
+        let eff_scale = bf16_bits_to_f32(scale_bf16).max(1e-8);
+        let eff_bias = bf16_bits_to_f32(bias_bf16);
+
+        let mut qs = [0u8; 24];
+        for g in 0..8 {
+            let base = g * 8;
+            let q0 = ((chunk[base] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q1 = ((chunk[base + 1] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q2 = ((chunk[base + 2] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q3 = ((chunk[base + 3] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q4 = ((chunk[base + 4] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q5 = ((chunk[base + 5] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q6 = ((chunk[base + 6] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+            let q7 = ((chunk[base + 7] - eff_bias) / eff_scale)
+                .round()
+                .clamp(0.0, 7.0) as u8;
+
+            let b = g * 3;
+            qs[b] = (q0 & 0x07) | ((q1 & 0x07) << 3) | ((q2 & 0x03) << 6);
+            qs[b + 1] =
+                ((q2 >> 2) & 0x01) | ((q3 & 0x07) << 1) | ((q4 & 0x07) << 4) | ((q5 & 0x01) << 7);
+            qs[b + 2] = ((q5 >> 1) & 0x03) | ((q6 & 0x07) << 2) | ((q7 & 0x07) << 5);
+        }
+
+        out_blocks.push(BlockQ3Group64 {
+            scale_bf16,
+            bias_bf16,
+            qs,
+        });
+    }
+
+    Ok(out_blocks)
+}
+
+/// Dequantizes a `BlockQ3Group64` slice back to `f32`.
+pub fn dequantize_q3_group64_to_f32(blocks: &[BlockQ3Group64]) -> Vec<f32> {
+    blocks
+        .iter()
+        .flat_map(|blk| {
+            let scale = bf16_bits_to_f32(blk.scale_bf16);
+            let bias = bf16_bits_to_f32(blk.bias_bf16);
+            (0..8).flat_map(move |g| {
+                let b = g * 3;
+                let b0 = blk.qs[b] as u32;
+                let b1 = blk.qs[b + 1] as u32;
+                let b2 = blk.qs[b + 2] as u32;
+
+                let q0 = b0 & 0x07;
+                let q1 = (b0 >> 3) & 0x07;
+                let q2 = ((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2);
+                let q3 = (b1 >> 1) & 0x07;
+                let q4 = (b1 >> 4) & 0x07;
+                let q5 = ((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1);
+                let q6 = (b2 >> 2) & 0x07;
+                let q7 = (b2 >> 5) & 0x07;
+
+                [
+                    (q0 as f32).mul_add(scale, bias),
+                    (q1 as f32).mul_add(scale, bias),
+                    (q2 as f32).mul_add(scale, bias),
+                    (q3 as f32).mul_add(scale, bias),
+                    (q4 as f32).mul_add(scale, bias),
+                    (q5 as f32).mul_add(scale, bias),
+                    (q6 as f32).mul_add(scale, bias),
+                    (q7 as f32).mul_add(scale, bias),
                 ]
             })
         })
@@ -339,6 +529,10 @@ pub enum SavedTensorPayload {
     Bf16(Vec<u16>),
     /// 4-bit Group-64 affine quantized blocks (used for 2D projection & embedding matrices).
     Q4Group64(Vec<BlockQ4Group64>),
+    /// 2-bit Group-128 affine quantized blocks.
+    Q2Group128(Vec<BlockQ2Group128>),
+    /// 3-bit Group-64 affine quantized blocks.
+    Q3Group64(Vec<BlockQ3Group64>),
 }
 
 /// Virtual memory page size on Apple Silicon unified memory architecture (16 KB).
@@ -362,6 +556,14 @@ pub fn write_mixed_safetensors<P: AsRef<Path>>(
             SavedTensorPayload::Q4Group64(blocks) => (
                 "Q4_G64",
                 blocks.len() * std::mem::size_of::<BlockQ4Group64>(),
+            ),
+            SavedTensorPayload::Q2Group128(blocks) => (
+                "Q2_G128",
+                blocks.len() * std::mem::size_of::<BlockQ2Group128>(),
+            ),
+            SavedTensorPayload::Q3Group64(blocks) => (
+                "Q3_G64",
+                blocks.len() * std::mem::size_of::<BlockQ3Group64>(),
             ),
         };
         // Page-align start of each tensor so GPU buffers can map zero-copy
@@ -413,6 +615,14 @@ pub fn write_mixed_safetensors<P: AsRef<Path>>(
                 bytemuck::cast_slice(blocks.as_slice()),
                 blocks.len() * std::mem::size_of::<BlockQ4Group64>(),
             ),
+            SavedTensorPayload::Q2Group128(blocks) => (
+                bytemuck::cast_slice(blocks.as_slice()),
+                blocks.len() * std::mem::size_of::<BlockQ2Group128>(),
+            ),
+            SavedTensorPayload::Q3Group64(blocks) => (
+                bytemuck::cast_slice(blocks.as_slice()),
+                blocks.len() * std::mem::size_of::<BlockQ3Group64>(),
+            ),
         };
 
         let target_start = if written_offset % VIRTUAL_PAGE_SIZE != 0 {
@@ -459,6 +669,44 @@ mod tests {
 
         // 4-bit affine group-64 MSE on smooth linear ramp must be < 0.005 (theoretical minimum ~0.0036)
         assert!(mse < 0.005, "Quantization MSE too high: {mse}");
+    }
+
+    #[test]
+    fn test_q2_group128_quantization_accuracy() {
+        let original: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.02).collect();
+        let blocks = quantize_f32_to_q2_group128(&original).unwrap();
+        assert_eq!(blocks.len(), 2);
+
+        let reconstructed = dequantize_q2_group128_to_f32(&blocks);
+        assert_eq!(reconstructed.len(), 256);
+        let mse: f32 = original
+            .iter()
+            .zip(reconstructed.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / (original.len() as f32);
+
+        // 2-bit quantization has 4 levels, so MSE is higher than 4-bit but bounded
+        assert!(mse < 0.1, "Q2 MSE too high: {mse}");
+    }
+
+    #[test]
+    fn test_q3_group64_quantization_accuracy() {
+        let original: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) * 0.03).collect();
+        let blocks = quantize_f32_to_q3_group64(&original).unwrap();
+        assert_eq!(blocks.len(), 2);
+
+        let reconstructed = dequantize_q3_group64_to_f32(&blocks);
+        assert_eq!(reconstructed.len(), 128);
+        let mse: f32 = original
+            .iter()
+            .zip(reconstructed.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / (original.len() as f32);
+
+        // 3-bit quantization has 8 levels, MSE should be < 0.02
+        assert!(mse < 0.02, "Q3 MSE too high: {mse}");
     }
 
     #[test]

@@ -140,6 +140,15 @@ pub struct RoutedExpertGemvParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub struct EagleParams {
+    pub hidden_dim: u32,
+    pub vocab_size: u32,
+    pub top_k: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct MoeCombineParams {
     pub num_tokens: u32,
     pub hidden_size: u32,
@@ -158,6 +167,10 @@ pub struct RopeKvWriteParams {
     pub apply_qk_norm: u32,
     pub rms_eps: f32,
     pub rope_theta: f32,
+    pub max_seq_len: u32,
+    pub has_table: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 #[repr(C)]
@@ -228,6 +241,7 @@ fn f32_to_bf16_bits(val: f32) -> u16 {
 }
 
 /// Per-layer GPU weight buffers bound during the forward pass.
+#[derive(Clone)]
 pub struct LayerGpuBuffers {
     pub attn_norm: Buffer,
     pub q_proj: Buffer,
@@ -255,6 +269,7 @@ pub struct ModelGpuWeights {
     pub final_norm: Buffer,
     pub lm_head: Buffer,
     pub _loader: Option<Arc<ShardedCheckpointLoader>>,
+    pub streamer: Option<Arc<std::sync::Mutex<crate::layer_streamer::DoubleBufferedLayerStreamer>>>,
 }
 
 impl ModelGpuWeights {
@@ -636,7 +651,11 @@ impl ModelGpuWeights {
         let direct_key = format!("{prefix}.weight");
         for key in [&direct_key[..], prefix] {
             if let Ok(raw_bytes) = loader.get_tensor_bytes(key)
-                && raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                && (raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
+                    || raw_bytes.len() % std::mem::size_of::<kriya_core::tensor::BlockQ3Group64>()
+                        == 0
+                    || raw_bytes.len() % std::mem::size_of::<kriya_core::tensor::BlockQ2Group128>()
+                        == 0)
                 && loader
                     .get_tensor_bytes(&format!("{prefix}.scales"))
                     .is_err()
@@ -730,7 +749,7 @@ impl ModelGpuWeights {
         Self::validate_production_checkpoint(desc, checkpoint_dir.as_ref())?;
 
         let loader = Arc::new(ShardedCheckpointLoader::open_directory(checkpoint_dir)?);
-        let shared = MTLResourceOptions::StorageModeShared;
+        let _shared = MTLResourceOptions::StorageModeShared;
         let h = desc.hidden_size as usize;
         let vocab = desc.vocab_size as usize;
 
@@ -755,115 +774,10 @@ impl ModelGpuWeights {
         };
 
         let mut layers = Vec::with_capacity(desc.layers.len());
-        for (idx, layer) in desc.layers.iter().enumerate() {
-            let p = format!("model.layers.{idx}");
-            let attn_norm = bind_bf16(&format!("{p}.input_layernorm.weight"), h)?;
-
-            let (q_dim, kv_dim, head_dim, qkv_bias, qk_norm) = match layer.seq_mixer {
-                SequenceMixerDescriptor::GroupedQueryAttention {
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    qkv_bias,
-                    qk_norm,
-                    ..
-                } => (
-                    num_q_heads as usize * head_dim as usize,
-                    num_kv_heads as usize * head_dim as usize,
-                    head_dim as usize,
-                    qkv_bias,
-                    qk_norm.is_some(),
-                ),
-                _ => (h, h, 64, false, false),
-            };
-            let inter = match layer.channel_mixer {
-                ChannelMixerDescriptor::DenseMlp {
-                    intermediate_size, ..
-                } => intermediate_size as usize,
-                _ => h * 4,
-            };
-
-            let q_proj = bind_q4(&format!("{p}.self_attn.q_proj"), &[q_dim, h])?;
-            let k_proj = bind_q4(&format!("{p}.self_attn.k_proj"), &[kv_dim, h])?;
-            let v_proj = bind_q4(&format!("{p}.self_attn.v_proj"), &[kv_dim, h])?;
-            let o_proj = bind_q4(&format!("{p}.self_attn.o_proj"), &[h, q_dim])?;
-
-            let q_bias = if qkv_bias {
-                bind_bf16(&format!("{p}.self_attn.q_proj.bias"), q_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-            let k_bias = if qkv_bias {
-                bind_bf16(&format!("{p}.self_attn.k_proj.bias"), kv_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-            let v_bias = if qkv_bias {
-                bind_bf16(&format!("{p}.self_attn.v_proj.bias"), kv_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-
-            let q_norm = if qk_norm {
-                bind_bf16(&format!("{p}.self_attn.q_norm.weight"), head_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-            let k_norm = if qk_norm {
-                bind_bf16(&format!("{p}.self_attn.k_norm.weight"), head_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-
-            let (ffn_norm, post_attn_norm, post_ffn_norm) =
-                if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
-                    let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
-                    let post_att = if layer.post_attn_norm.is_some() {
-                        Some(bind_bf16(
-                            &format!("{p}.post_attention_layernorm.weight"),
-                            h,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let post_ff = if layer.post_ffn_norm.is_some() {
-                        Some(bind_bf16(
-                            &format!("{p}.post_feedforward_layernorm.weight"),
-                            h,
-                        )?)
-                    } else {
-                        None
-                    };
-                    (pre, post_att, post_ff)
-                } else {
-                    let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
-                    (norm, None, None)
-                };
-
-            let gate_proj = bind_q4(&format!("{p}.mlp.gate_proj"), &[inter, h])?;
-            let up_proj = bind_q4(&format!("{p}.mlp.up_proj"), &[inter, h])?;
-            let down_proj = bind_q4(&format!("{p}.mlp.down_proj"), &[h, inter])?;
-            let moe_router_gate = device.new_buffer(4, shared);
-
-            layers.push(LayerGpuBuffers {
-                attn_norm,
-                q_proj,
-                k_proj,
-                v_proj,
-                q_bias,
-                k_bias,
-                v_bias,
-                o_proj,
-                q_norm,
-                k_norm,
-                post_attn_norm,
-                ffn_norm,
-                post_ffn_norm,
-                gate_proj,
-                up_proj,
-                down_proj,
-                moe_router_gate,
-            });
+        for idx in 0..desc.layers.len() {
+            layers.push(Self::load_layer_from_checkpoint(
+                &loader, device, desc, idx,
+            )?);
         }
 
         Ok(ModelGpuWeights {
@@ -872,6 +786,211 @@ impl ModelGpuWeights {
             final_norm,
             lm_head,
             _loader: Some(loader),
+            streamer: None,
+        })
+    }
+
+    /// Loads model weights configured for double-buffered NVMe SSD layer streaming ("LLM in a Flash").
+    /// Only embeddings, final norm, LM head, and TWO active layer buffers remain in GPU memory.
+    pub fn from_checkpoint_dir_streaming<P: AsRef<Path>>(
+        device: &Device,
+        desc: &ModelArchDescriptor,
+        checkpoint_dir: P,
+    ) -> Result<Self, MetalError> {
+        Self::validate_production_checkpoint(desc, checkpoint_dir.as_ref())?;
+
+        let loader = Arc::new(ShardedCheckpointLoader::open_directory(checkpoint_dir)?);
+        let h = desc.hidden_size as usize;
+        let vocab = desc.vocab_size as usize;
+
+        let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
+            Self::bind_q4_buffer(&loader, device, prefix, Some(expected_shape))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {prefix}"))
+            })
+        };
+
+        let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
+            Self::bind_bf16_buffer(&loader, device, name, Some(expected_len))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {name}"))
+            })
+        };
+
+        let embed_tokens = bind_q4("model.embed_tokens", &[vocab, h])?;
+        let final_norm = bind_bf16("model.norm.weight", h)?;
+        let lm_head = if desc.tie_word_embeddings {
+            embed_tokens.clone()
+        } else {
+            bind_q4("lm_head", &[vocab, h])?
+        };
+
+        let streamer = crate::layer_streamer::DoubleBufferedLayerStreamer::new(
+            loader.clone(),
+            device.clone(),
+            desc.clone(),
+        )?;
+
+        Ok(ModelGpuWeights {
+            embed_tokens,
+            layers: Vec::new(),
+            final_norm,
+            lm_head,
+            _loader: Some(loader),
+            streamer: Some(Arc::new(std::sync::Mutex::new(streamer))),
+        })
+    }
+
+    /// Returns the GPU weight buffers for a specific layer.
+    /// In standard mode, returns a clone of the pinned layer buffer handles.
+    /// In streaming mode, fetches from the double-buffered streaming slots and prefetches the next layer.
+    #[inline]
+    pub fn layer(&self, l_idx: usize) -> LayerGpuBuffers {
+        if let Some(streamer) = &self.streamer {
+            streamer
+                .lock()
+                .unwrap()
+                .get_layer(l_idx)
+                .expect("Failed to stream layer from SSD")
+        } else {
+            self.layers[l_idx].clone()
+        }
+    }
+
+    /// Returns true if weights are streamed asynchronously from SSD rather than fully pinned in RAM.
+    #[inline]
+    pub fn is_streaming(&self) -> bool {
+        self.streamer.is_some()
+    }
+
+    /// Strictly loads a single layer's GPU buffers from a checkpoint archive.
+    pub fn load_layer_from_checkpoint(
+        loader: &ShardedCheckpointLoader,
+        device: &Device,
+        desc: &ModelArchDescriptor,
+        idx: usize,
+    ) -> Result<LayerGpuBuffers, MetalError> {
+        let h = desc.hidden_size as usize;
+        let layer = &desc.layers[idx];
+        let p = format!("model.layers.{idx}");
+        let shared = MTLResourceOptions::StorageModeShared;
+
+        let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
+            Self::bind_q4_buffer(loader, device, prefix, Some(expected_shape))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {prefix}"))
+            })
+        };
+
+        let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
+            Self::bind_bf16_buffer(loader, device, name, Some(expected_len))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {name}"))
+            })
+        };
+
+        let attn_norm = bind_bf16(&format!("{p}.input_layernorm.weight"), h)?;
+
+        let (q_dim, kv_dim, head_dim, qkv_bias, qk_norm) = match layer.seq_mixer {
+            SequenceMixerDescriptor::GroupedQueryAttention {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                qkv_bias,
+                qk_norm,
+                ..
+            } => (
+                num_q_heads as usize * head_dim as usize,
+                num_kv_heads as usize * head_dim as usize,
+                head_dim as usize,
+                qkv_bias,
+                qk_norm.is_some(),
+            ),
+            _ => (h, h, 64, false, false),
+        };
+        let inter = match layer.channel_mixer {
+            ChannelMixerDescriptor::DenseMlp {
+                intermediate_size, ..
+            } => intermediate_size as usize,
+            _ => h * 4,
+        };
+
+        let q_proj = bind_q4(&format!("{p}.self_attn.q_proj"), &[q_dim, h])?;
+        let k_proj = bind_q4(&format!("{p}.self_attn.k_proj"), &[kv_dim, h])?;
+        let v_proj = bind_q4(&format!("{p}.self_attn.v_proj"), &[kv_dim, h])?;
+        let o_proj = bind_q4(&format!("{p}.self_attn.o_proj"), &[h, q_dim])?;
+
+        let q_bias = if qkv_bias {
+            bind_bf16(&format!("{p}.self_attn.q_proj.bias"), q_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+        let k_bias = if qkv_bias {
+            bind_bf16(&format!("{p}.self_attn.k_proj.bias"), kv_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+        let v_bias = if qkv_bias {
+            bind_bf16(&format!("{p}.self_attn.v_proj.bias"), kv_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+
+        let q_norm = if qk_norm {
+            bind_bf16(&format!("{p}.self_attn.q_norm.weight"), head_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+        let k_norm = if qk_norm {
+            bind_bf16(&format!("{p}.self_attn.k_norm.weight"), head_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+
+        let (ffn_norm, post_attn_norm, post_ffn_norm) =
+            if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
+                let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
+                let post_att = if layer.post_attn_norm.is_some() {
+                    Some(bind_bf16(
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        h,
+                    )?)
+                } else {
+                    None
+                };
+                let post_ff = if layer.post_ffn_norm.is_some() {
+                    Some(bind_bf16(
+                        &format!("{p}.post_feedforward_layernorm.weight"),
+                        h,
+                    )?)
+                } else {
+                    None
+                };
+                (pre, post_att, post_ff)
+            } else {
+                let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
+                (norm, None, None)
+            };
+
+        let gate_proj = bind_q4(&format!("{p}.mlp.gate_proj"), &[inter, h])?;
+        let up_proj = bind_q4(&format!("{p}.mlp.up_proj"), &[inter, h])?;
+        let down_proj = bind_q4(&format!("{p}.mlp.down_proj"), &[h, inter])?;
+        let moe_router_gate = device.new_buffer(4, shared);
+
+        Ok(LayerGpuBuffers {
+            attn_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            q_bias,
+            k_bias,
+            v_bias,
+            o_proj,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffn_norm,
+            gate_proj,
+            up_proj,
+            down_proj,
+            moe_router_gate,
         })
     }
 
@@ -1151,6 +1270,7 @@ impl ModelGpuWeights {
             final_norm,
             lm_head,
             _loader: None,
+            streamer: None,
         }
     }
 }
@@ -1328,6 +1448,22 @@ pub struct MetalExecutor {
     /// Ping-pong scratch toggle for double-buffered CPU/GPU overlap.
     /// Iteration N encodes into scratch[idx], iteration N+1 encodes into scratch[idx^1].
     pub scratch_ping_pong_idx: u32,
+    pub hidden_size: usize,
+    pub vocab_size: usize,
+    /// GPU-native EAGLE speculative draft head buffers:
+    pub eagle_fc_fuse_buf: Option<Buffer>,
+    pub eagle_decoder_buf: Option<Buffer>,
+    pub eagle_prev_feat_buf: Buffer,
+    pub eagle_tok_emb_bf16_buf: Buffer,
+    pub eagle_reduced_buf: Buffer,
+    pub eagle_next_feat_f32_buf: Buffer,
+    pub eagle_next_feat_bf16_buf: Buffer,
+    pub eagle_topk_tokens_buf: Buffer,
+    pub eagle_topk_probs_buf: Buffer,
+    pub eagle_draft_logits_buf: Buffer,
+    pub rope_cos_sin_table_buf: Buffer,
+    pub rope_max_seq_len: u32,
+    pub weight_dtype: kriya_core::tensor::DType,
 }
 
 impl MetalExecutor {
@@ -1344,6 +1480,7 @@ impl MetalExecutor {
             checkpoint_dir,
             num_kv_blocks,
             block_size_tokens,
+            false,
             false,
         )
     }
@@ -1365,6 +1502,28 @@ impl MetalExecutor {
             num_kv_blocks,
             block_size_tokens,
             true,
+            false,
+        )
+    }
+
+    /// Creates an executor utilizing double-buffered NVMe SSD layer streaming ("LLM in a Flash").
+    /// Keeps only 2 active transformer layers in GPU memory, allowing 14B-80B models to execute
+    /// within 8 GB-16 GB memory budgets.
+    pub fn new_streaming<P: AsRef<Path>>(
+        descriptor: &ModelArchDescriptor,
+        shader_dir: P,
+        checkpoint_dir: &Path,
+        num_kv_blocks: u32,
+        block_size_tokens: u32,
+    ) -> Result<Self, MetalError> {
+        Self::new_internal(
+            descriptor,
+            shader_dir,
+            Some(checkpoint_dir),
+            num_kv_blocks,
+            block_size_tokens,
+            true,
+            true,
         )
     }
 
@@ -1375,6 +1534,7 @@ impl MetalExecutor {
         num_kv_blocks: u32,
         block_size_tokens: u32,
         production_mode: bool,
+        streaming_mode: bool,
     ) -> Result<Self, MetalError> {
         let device = Device::system_default().ok_or_else(|| {
             MetalError::DeviceInitFailed("No Apple Silicon Metal GPU found".into())
@@ -1406,6 +1566,8 @@ impl MetalExecutor {
             "q4_g64_batched_simdgroup_gemm_m64",
             "q4_g64_batched_simdgroup_qkv_gemm_m64",
             "q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64",
+            "q2_g128_decode_gemv_4row",
+            "q3_g64_decode_gemv_4row",
             "moe_router_topk_and_histogram",
             "moe_router_prefix_scan_and_scatter",
             "q4_g64_routed_moe_gemv",
@@ -1414,10 +1576,12 @@ impl MetalExecutor {
             "bsr_paged_gqa_decode_stage1",
             "bsr_paged_gqa_prefill_stage1",
             "bsr_paged_gqa_prefill_stage1_bq8",
+            "bsr_paged_gqa_tiled_mma_prefill",
             "bsr_paged_gqa_split_k_reduce",
             "bsr_paged_gqa_tree_verify",
             "gated_deltanet_recurrent_step",
             "apply_rope_inplace",
+            "fused_residual_add_rms_norm_bf16",
             "fused_gated_activation_bf16",
             "residual_add_bf16",
             "add_bias_bf16",
@@ -1427,7 +1591,9 @@ impl MetalExecutor {
         }
 
         let weights = if let Some(ckpt) = checkpoint_dir {
-            if production_mode {
+            if streaming_mode {
+                ModelGpuWeights::from_checkpoint_dir_streaming(&device, descriptor, ckpt)?
+            } else if production_mode {
                 ModelGpuWeights::from_checkpoint_dir_strict(&device, descriptor, ckpt)?
             } else {
                 ModelGpuWeights::from_checkpoint_dir(&device, descriptor, ckpt)?
@@ -1531,6 +1697,47 @@ impl MetalExecutor {
             shared,
         );
 
+        let (rope_theta, rotary_dim) = descriptor
+            .layers
+            .iter()
+            .find_map(|l| match &l.seq_mixer {
+                SequenceMixerDescriptor::GroupedQueryAttention {
+                    pos_encoding:
+                        PositionalEncoding::RoPE {
+                            theta, rotary_dim, ..
+                        },
+                    head_dim,
+                    ..
+                } => {
+                    let r_dim = if *rotary_dim > 0 {
+                        *rotary_dim
+                    } else {
+                        *head_dim
+                    };
+                    Some((*theta, r_dim))
+                }
+                _ => None,
+            })
+            .unwrap_or((10_000.0, 64));
+
+        let rope_max_seq_len = descriptor.max_position_embeddings.max(4096);
+        let half_rot = (rotary_dim / 2).max(1);
+        let mut cos_sin_table = Vec::with_capacity((rope_max_seq_len * half_rot * 2) as usize);
+        for pos in 0..rope_max_seq_len {
+            for pair_i in 0..half_rot {
+                let freq_exp = (2.0 * pair_i as f32) / (rotary_dim as f32);
+                let inv_freq = rope_theta.powf(-freq_exp);
+                let angle = (pos as f32) * inv_freq;
+                cos_sin_table.push(angle.cos());
+                cos_sin_table.push(angle.sin());
+            }
+        }
+        let rope_cos_sin_table_buf = device.new_buffer_with_data(
+            cos_sin_table.as_ptr() as *const _,
+            (cos_sin_table.len() * std::mem::size_of::<f32>()) as u64,
+            shared,
+        );
+
         Ok(Self {
             device,
             command_queue,
@@ -1591,6 +1798,21 @@ impl MetalExecutor {
             attn_out_buf_pong: alloc(max_batch_toks * max_q_dim * 2),
             proj_out_buf_ping: alloc(max_batch_toks * h * 2),
             proj_out_buf_pong: alloc(max_batch_toks * h * 2),
+            hidden_size: h,
+            vocab_size: vocab_capped,
+            eagle_fc_fuse_buf: None,
+            eagle_decoder_buf: None,
+            eagle_prev_feat_buf: alloc(h * 4),
+            eagle_tok_emb_bf16_buf: alloc(h * 2),
+            eagle_reduced_buf: alloc(h * 4),
+            eagle_next_feat_f32_buf: alloc(h * 4),
+            eagle_next_feat_bf16_buf: alloc(h * 2),
+            eagle_topk_tokens_buf: alloc(16 * 4),
+            eagle_topk_probs_buf: alloc(16 * 4),
+            eagle_draft_logits_buf: alloc((vocab_capped * 2).max(1024)),
+            rope_cos_sin_table_buf,
+            rope_max_seq_len,
+            weight_dtype: descriptor.weight_dtype,
         })
     }
 
@@ -1825,7 +2047,180 @@ impl MetalExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn encode_fused_residual_add_rmsnorm(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        residual_inout: &Buffer,
+        proj_in: &Buffer,
+        weight_buf: &Buffer,
+        output_norm: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+        norm_variant: &NormVariant,
+    ) -> Result<(), MetalError> {
+        let (eps, zero_centered_offset) = match norm_variant {
+            NormVariant::RmsNorm {
+                eps,
+                zero_centered_unit_offset,
+            } => (*eps, u32::from(*zero_centered_unit_offset)),
+            NormVariant::LayerNorm { eps, .. } => (*eps, 0),
+        };
+        let pso = pipeline_cache.get_or_compile("fused_residual_add_rms_norm_bf16")?;
+        let norm_params = RmsNormParams {
+            num_tokens,
+            hidden_size,
+            eps,
+            zero_centered_offset,
+        };
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(residual_inout), 0);
+        encoder.set_buffer(1, Some(proj_in), 0);
+        encoder.set_buffer(2, Some(weight_buf), 0);
+        encoder.set_buffer(3, Some(output_norm), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<RmsNormParams>() as u64,
+            &norm_params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tokens as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn encode_q4_linear(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        weight_buf: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        output_buf: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), MetalError> {
+        let q2_len = (n as u64) * (k.div_ceil(128) as u64) * 36;
+        let q3_len = (n as u64) * (k.div_ceil(64) as u64) * 28;
+
+        if m == 1 && weight_buf.length() == q2_len {
+            return Self::encode_q2_linear(
+                pipeline_cache,
+                encoder,
+                weight_buf,
+                input_buf,
+                input_byte_offset,
+                output_buf,
+                m,
+                n,
+                k,
+            );
+        }
+
+        if m == 1 && weight_buf.length() == q3_len {
+            return Self::encode_q3_linear(
+                pipeline_cache,
+                encoder,
+                weight_buf,
+                input_buf,
+                input_byte_offset,
+                output_buf,
+                m,
+                n,
+                k,
+            );
+        }
+
+        let params = GemmParams {
+            m,
+            n,
+            k,
+            num_k_blocks: k.div_ceil(64),
+        };
+
+        let (kernel_name, grid, threads) = if m == 1 {
+            let (name, divisor) = if params.num_k_blocks <= 16 {
+                ("q4_g64_decode_gemv_sub16", 8u32)
+            } else if n >= 16 {
+                ("q4_g64_decode_gemv_4row", 16u32)
+            } else {
+                ("q4_g64_decode_gemv_2row", 8u32)
+            };
+            let total_tgs = n.div_ceil(divisor) as u64;
+            let persistent_tgs = total_tgs.min(128);
+            (
+                name,
+                MTLSize::new(persistent_tgs, 1, 1),
+                MTLSize::new(128, 1, 1),
+            )
+        } else if m >= 64 {
+            (
+                "q4_g64_batched_simdgroup_gemm_m64",
+                MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(256, 1, 1),
+            )
+        } else {
+            (
+                "q4_g64_prefill_gemm",
+                MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1),
+                MTLSize::new(16, 16, 1),
+            )
+        };
+
+        let pso = pipeline_cache.get_or_compile(kernel_name)?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(weight_buf), 0);
+        encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(2, Some(output_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(grid, threads);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_q2_linear(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        weight_buf: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        output_buf: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), MetalError> {
+        let params = GemmParams {
+            m,
+            n,
+            k,
+            num_k_blocks: k.div_ceil(128),
+        };
+        let total_tgs = n.div_ceil(4) as u64;
+        let persistent_tgs = total_tgs.min(128);
+        let grid = MTLSize::new(persistent_tgs, 1, 1);
+        let threads = MTLSize::new(128, 1, 1);
+
+        let pso = pipeline_cache.get_or_compile("q2_g128_decode_gemv_4row")?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(weight_buf), 0);
+        encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(2, Some(output_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(grid, threads);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_q3_linear(
         pipeline_cache: &mut MetalPipelineCache,
         encoder: &ComputeCommandEncoderRef,
         weight_buf: &Buffer,
@@ -1842,35 +2237,12 @@ impl MetalExecutor {
             k,
             num_k_blocks: k.div_ceil(64),
         };
+        let total_tgs = n.div_ceil(4) as u64;
+        let persistent_tgs = total_tgs.min(128);
+        let grid = MTLSize::new(persistent_tgs, 1, 1);
+        let threads = MTLSize::new(128, 1, 1);
 
-        let (kernel_name, grid, threads) = if m == 1 {
-            let (name, divisor) = if params.num_k_blocks <= 16 {
-                ("q4_g64_decode_gemv_sub16", 8u32)
-            } else if n >= 16 {
-                ("q4_g64_decode_gemv_4row", 16u32)
-            } else {
-                ("q4_g64_decode_gemv_2row", 8u32)
-            };
-            (
-                name,
-                MTLSize::new(n.div_ceil(divisor) as u64, 1, 1),
-                MTLSize::new(128, 1, 1),
-            )
-        } else if m >= 64 {
-            (
-                "q4_g64_batched_simdgroup_gemm_m64",
-                MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1),
-                MTLSize::new(128, 1, 1),
-            )
-        } else {
-            (
-                "q4_g64_prefill_gemm",
-                MTLSize::new(n.div_ceil(16) as u64, m.div_ceil(16) as u64, 1),
-                MTLSize::new(16, 16, 1),
-            )
-        };
-
-        let pso = pipeline_cache.get_or_compile(kernel_name)?;
+        let pso = pipeline_cache.get_or_compile("q3_g64_decode_gemv_4row")?;
         encoder.set_compute_pipeline_state(&pso);
         encoder.set_buffer(0, Some(weight_buf), 0);
         encoder.set_buffer(1, Some(input_buf), input_byte_offset);
@@ -1921,7 +2293,7 @@ impl MetalExecutor {
             std::mem::size_of::<GemmParams>() as u64,
             &params as *const _ as *const _,
         );
-        let tgp_count = n.div_ceil(tgp_divisor) as u64;
+        let tgp_count = (n.div_ceil(tgp_divisor) as u64).min(128);
         encoder.dispatch_thread_groups(MTLSize::new(tgp_count, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
     }
@@ -1967,16 +2339,18 @@ impl MetalExecutor {
             } else {
                 ("q4_g64_decode_qkv_gemv_2row", 8u32)
             };
+            let total_tgs = total_n.div_ceil(divisor) as u64;
+            let persistent_tgs = total_tgs.min(128);
             (
                 name,
-                MTLSize::new(total_n.div_ceil(divisor) as u64, 1, 1),
+                MTLSize::new(persistent_tgs, 1, 1),
                 MTLSize::new(128, 1, 1),
             )
         } else if m >= 64 {
             (
                 "q4_g64_batched_simdgroup_qkv_gemm_m64",
-                MTLSize::new(total_n.div_ceil(16) as u64, m.div_ceil(64) as u64, 1),
-                MTLSize::new(128, 1, 1),
+                MTLSize::new(total_n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(256, 1, 1),
             )
         } else {
             (
@@ -2053,11 +2427,11 @@ impl MetalExecutor {
                 &params as *const _ as *const _,
             );
             let grid = MTLSize::new(
-                intermediate_size.div_ceil(16) as u64,
+                intermediate_size.div_ceil(32) as u64,
                 m.div_ceil(64) as u64,
                 1,
             );
-            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+            encoder.dispatch_thread_groups(grid, MTLSize::new(256, 1, 1));
         } else if m == 1 {
             let num_k_blocks = k.div_ceil(64);
             let params = GateUpSwigluGemmParams {
@@ -2086,7 +2460,9 @@ impl MetalExecutor {
                 std::mem::size_of::<GateUpSwigluGemmParams>() as u64,
                 &params as *const _ as *const _,
             );
-            let grid = MTLSize::new(intermediate_size.div_ceil(tgp_divisor) as u64, 1, 1);
+            let total_tgs = intermediate_size.div_ceil(tgp_divisor) as u64;
+            let persistent_tgs = total_tgs.min(128);
+            let grid = MTLSize::new(persistent_tgs, 1, 1);
             encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
         } else {
             let params = GateUpGemmParams {
@@ -2097,9 +2473,11 @@ impl MetalExecutor {
             };
             let total_rows = intermediate_size * 2;
             let (kernel_name, grid, threads) = if m == 1 {
+                let total_tgs = total_rows.div_ceil(4) as u64;
+                let persistent_tgs = total_tgs.min(128);
                 (
                     "q4_g64_decode_gate_up_gemv",
-                    MTLSize::new(total_rows.div_ceil(4) as u64, 1, 1),
+                    MTLSize::new(persistent_tgs, 1, 1),
                     MTLSize::new(128, 1, 1),
                 )
             } else {
@@ -2305,7 +2683,12 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
+            let max_chunk = if self.weights.is_streaming() {
+                1
+            } else {
+                WATCHDOG_CHUNK_LAYERS
+            };
+            if layers_in_chunk >= max_chunk && !is_last_layer {
                 enc.end_encoding();
                 cmd_buf.commit();
                 self.wait_for_gpu(cmd_buf).await?;
@@ -2501,7 +2884,7 @@ impl MetalExecutor {
 
         // 2. Execute all Transformer layers (tree mode — no KV cache writes)
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            let lw = &self.weights.layers[l_idx];
+            let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm
@@ -2582,6 +2965,10 @@ impl MetalExecutor {
                         apply_qk_norm: u32::from(qk_norm.is_some()),
                         rms_eps: eps,
                         rope_theta,
+                        max_seq_len: self.rope_max_seq_len,
+                        has_table: 1,
+                        _pad0: 0,
+                        _pad1: 0,
                     };
                     // Tree positions are all 0 (relative positions within the draft tree)
                     let zero_positions: Vec<u32> = vec![0; num_tree_nodes];
@@ -2604,6 +2991,7 @@ impl MetalExecutor {
                         std::mem::size_of::<RopeKvWriteParams>() as u64,
                         &rope_params as *const _ as *const _,
                     );
+                    enc.set_buffer(12, Some(&self.rope_cos_sin_table_buf), 0);
                     let grid_size = (num_q_heads.max(num_kv_heads) * num_tree_nodes as u32).max(1);
                     enc.dispatch_thread_groups(
                         MTLSize::new(grid_size as u64, 1, 1),
@@ -2744,29 +3132,30 @@ impl MetalExecutor {
                     num_tree_nodes as u32,
                     h as u32,
                 )?;
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tree_nodes as u32,
+                    h as u32,
+                    &layer.ffn_norm,
+                )?;
             } else {
-                Self::encode_residual_add(
+                Self::encode_fused_residual_add_rmsnorm(
                     &mut self.pipeline_cache,
                     enc,
                     &self.residual_buf,
                     &self.proj_out_buf,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
                     num_tree_nodes as u32,
                     h as u32,
+                    &layer.ffn_norm,
                 )?;
             }
-
-            // 2d. Pre-FFN RMSNorm
-            Self::encode_rmsnorm(
-                &mut self.pipeline_cache,
-                enc,
-                &self.residual_buf,
-                0,
-                &lw.ffn_norm,
-                &self.norm_out_buf,
-                num_tree_nodes as u32,
-                h as u32,
-                &layer.ffn_norm,
-            )?;
 
             // 2e. Channel Mixer (Dense MLP)
             match layer.channel_mixer {
@@ -2778,7 +3167,7 @@ impl MetalExecutor {
                     Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        lw,
+                        &lw,
                         &self.norm_out_buf,
                         &self.gate_buf,
                         &self.up_buf,
@@ -2967,6 +3356,325 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Loads EAGLE draft head weights (`fc_fuse_weights` and `decoder_layer_weights`) into GPU buffers.
+    pub fn load_eagle_draft_weights(
+        &mut self,
+        fc_fuse_weights: &[f32],
+        decoder_layer_weights: &[f32],
+    ) -> Result<(), MetalError> {
+        let h = self.hidden_size;
+        let expected_fc = h * (2 * h);
+        if fc_fuse_weights.len() != expected_fc {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "EAGLE fc_fuse_weights len mismatch: expected {expected_fc}, got {}",
+                fc_fuse_weights.len()
+            )));
+        }
+        let expected_dec = h * h;
+        if decoder_layer_weights.len() != expected_dec {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "EAGLE decoder_layer_weights len mismatch: expected {expected_dec}, got {}",
+                decoder_layer_weights.len()
+            )));
+        }
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        let fc_buf = self.device.new_buffer_with_data(
+            fc_fuse_weights.as_ptr() as *const _,
+            (fc_fuse_weights.len() * 4) as u64,
+            shared,
+        );
+        let dec_buf = self.device.new_buffer_with_data(
+            decoder_layer_weights.as_ptr() as *const _,
+            (decoder_layer_weights.len() * 4) as u64,
+            shared,
+        );
+
+        self.eagle_fc_fuse_buf = Some(fc_buf);
+        self.eagle_decoder_buf = Some(dec_buf);
+        Ok(())
+    }
+
+    /// Returns `true` if GPU-native EAGLE drafting is ready to execute.
+    pub fn has_eagle_gpu_draft(&self) -> bool {
+        self.eagle_fc_fuse_buf.is_some() && self.eagle_decoder_buf.is_some()
+    }
+
+    /// Executes one GPU-native EAGLE draft step:
+    /// 1. Look up token embedding on GPU (`embedding_lookup_q4_g64`)
+    /// 2. Reduces dimensionality with `eagle_fc_fuse`
+    /// 3. Computes delta with `eagle_decoder_layer` and adds residual
+    /// 4. Projects through frozen target LM Head on GPU (`encode_q4_linear`)
+    /// 5. Extracts top-K tokens and exact probabilities on GPU (`eagle_topk_and_probs`)
+    pub async fn gpu_draft_step(
+        &mut self,
+        token_id: u32,
+        prev_feature: &[f32],
+        top_k: usize,
+    ) -> Result<(Vec<f32>, Vec<u32>, Vec<f32>), MetalError> {
+        let h = self.hidden_size;
+        let vocab = self.vocab_size;
+        let k_capped = top_k.clamp(1, 16) as u32;
+
+        if prev_feature.len() != h {
+            return Err(MetalError::InvalidExecutionInput(format!(
+                "Dimension mismatch: expected {h}, actual {}",
+                prev_feature.len()
+            )));
+        }
+        let fc_buf = self.eagle_fc_fuse_buf.clone().ok_or_else(|| {
+            MetalError::UnsupportedProductionConfiguration(
+                "EAGLE fc_fuse buffer not initialized".into(),
+            )
+        })?;
+        let dec_buf = self.eagle_decoder_buf.clone().ok_or_else(|| {
+            MetalError::UnsupportedProductionConfiguration(
+                "EAGLE decoder buffer not initialized".into(),
+            )
+        })?;
+
+        // 1. Copy previous feature to GPU scratch buffer & set token
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                prev_feature.as_ptr(),
+                self.eagle_prev_feat_buf.contents() as *mut f32,
+                h,
+            );
+            *(self.input_tokens_buf.contents() as *mut u32) = token_id;
+        }
+
+        let cmd_buf = self.command_queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+
+        // 2. Embedding lookup for advanced token
+        {
+            let pso = self
+                .pipeline_cache
+                .get_or_compile("embedding_lookup_q4_g64")?;
+            let embed_params = EmbedLookupParams {
+                num_tokens: 1,
+                hidden_size: h as u32,
+                num_k_blocks: (h / 64) as u32,
+            };
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.weights.embed_tokens), 0);
+            enc.set_buffer(1, Some(&self.input_tokens_buf), 0);
+            enc.set_buffer(2, Some(&self.eagle_tok_emb_bf16_buf), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<EmbedLookupParams>() as u64,
+                &embed_params as *const _ as *const _,
+            );
+            let pairs_per_tok = (h / 2).div_ceil(64);
+            enc.dispatch_thread_groups(
+                MTLSize::new(pairs_per_tok as u64, 1, 1),
+                MTLSize::new(64, 1, 1),
+            );
+        }
+
+        let eagle_params = EagleParams {
+            hidden_dim: h as u32,
+            vocab_size: vocab as u32,
+            top_k: k_capped,
+            _pad: 0,
+        };
+
+        // 3. FC Fuse: [tok_emb_bf16, prev_feat] -> reduced
+        {
+            let pso = self.pipeline_cache.get_or_compile("eagle_fc_fuse")?;
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.eagle_tok_emb_bf16_buf), 0);
+            enc.set_buffer(1, Some(&self.eagle_prev_feat_buf), 0);
+            enc.set_buffer(2, Some(&fc_buf), 0);
+            enc.set_buffer(3, Some(&self.eagle_reduced_buf), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<EagleParams>() as u64,
+                &eagle_params as *const _ as *const _,
+            );
+            let tgs = (h as u64).div_ceil(64);
+            enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(64, 1, 1));
+        }
+
+        // 4. Decoder Layer: reduced -> next_feature (f32 and bf16)
+        {
+            let pso = self.pipeline_cache.get_or_compile("eagle_decoder_layer")?;
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.eagle_reduced_buf), 0);
+            enc.set_buffer(1, Some(&dec_buf), 0);
+            enc.set_buffer(2, Some(&self.eagle_next_feat_f32_buf), 0);
+            enc.set_buffer(3, Some(&self.eagle_next_feat_bf16_buf), 0);
+            enc.set_bytes(
+                4,
+                std::mem::size_of::<EagleParams>() as u64,
+                &eagle_params as *const _ as *const _,
+            );
+            let tgs = (h as u64).div_ceil(64);
+            enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(64, 1, 1));
+        }
+
+        // 5. LM Head Projection: next_feature_bf16 -> eagle_draft_logits_buf (BF16)
+        let lm_head_buf = self.weights.lm_head.clone();
+        Self::encode_q4_linear(
+            &mut self.pipeline_cache,
+            enc,
+            &lm_head_buf,
+            &self.eagle_next_feat_bf16_buf,
+            0,
+            &self.eagle_draft_logits_buf,
+            1,
+            vocab as u32,
+            h as u32,
+        )?;
+
+        // 6. GPU Top-K Token Extraction and Exact Probability Calculation
+        {
+            let pso = self.pipeline_cache.get_or_compile("eagle_topk_and_probs")?;
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&self.eagle_draft_logits_buf), 0);
+            enc.set_buffer(1, Some(&self.eagle_topk_tokens_buf), 0);
+            enc.set_buffer(2, Some(&self.eagle_topk_probs_buf), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<EagleParams>() as u64,
+                &eagle_params as *const _ as *const _,
+            );
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+
+        enc.end_encoding();
+        cmd_buf.commit();
+        self.wait_for_gpu(cmd_buf).await?;
+
+        // 7. Read back results
+        let next_feat = unsafe {
+            let ptr = self.eagle_next_feat_f32_buf.contents() as *const f32;
+            std::slice::from_raw_parts(ptr, h).to_vec()
+        };
+        let top_tokens = unsafe {
+            let ptr = self.eagle_topk_tokens_buf.contents() as *const u32;
+            std::slice::from_raw_parts(ptr, k_capped as usize).to_vec()
+        };
+        let top_probs = unsafe {
+            let ptr = self.eagle_topk_probs_buf.contents() as *const f32;
+            std::slice::from_raw_parts(ptr, k_capped as usize).to_vec()
+        };
+
+        Ok((next_feat, top_tokens, top_probs))
+    }
+
+    /// Builds a tree-structured draft on GPU across `m` forward passes according to `topology`.
+    pub async fn build_draft_tree_gpu(
+        &mut self,
+        root_token_id: u32,
+        root_feature: &[f32],
+        topology: &kriya_speculate::eagle_medusa::DraftTreeTopology,
+    ) -> Result<kriya_speculate::eagle_medusa::DraftTree, MetalError> {
+        let root_branches = topology
+            .level_branching
+            .first()
+            .and_then(|lvl| lvl.first())
+            .copied()
+            .unwrap_or(0);
+
+        let (root_pred_feat, root_top_tokens, root_top_probs) = self
+            .gpu_draft_step(root_token_id, root_feature, root_branches.max(1))
+            .await?;
+
+        let mut root_draft_probs = vec![0.0f32; self.vocab_size];
+        for (&tok, &prob) in root_top_tokens.iter().zip(&root_top_probs) {
+            if (tok as usize) < root_draft_probs.len() {
+                root_draft_probs[tok as usize] = prob;
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(topology.total_draft_tokens + 1);
+        nodes.push(kriya_speculate::eagle_medusa::DraftTreeNode {
+            node_id: 0,
+            parent_id: None,
+            depth: 0,
+            token_id: root_token_id,
+            predicted_feature: root_pred_feat,
+            draft_probs: root_draft_probs,
+            children: Vec::new(),
+        });
+
+        let mut candidate_pools: Vec<Vec<(u32, f32)>> = Vec::new();
+        let root_pool: Vec<(u32, f32)> = root_top_tokens.into_iter().zip(root_top_probs).collect();
+        candidate_pools.push(root_pool);
+
+        let mut current_level_indices = vec![0usize];
+
+        for pass_idx in 0..topology.depth {
+            let branching_spec = topology.level_branching.get(pass_idx).ok_or_else(|| {
+                MetalError::InvalidExecutionInput(format!(
+                    "Missing branching spec at pass {pass_idx}"
+                ))
+            })?;
+
+            let mut next_level_indices = Vec::new();
+
+            for (pos_in_level, &parent_node_idx) in current_level_indices.iter().enumerate() {
+                let num_branches = branching_spec.get(pos_in_level).copied().unwrap_or(0);
+                if num_branches == 0 {
+                    continue;
+                }
+
+                let parent_feat = nodes[parent_node_idx].predicted_feature.clone();
+                let parent_candidates = candidate_pools[parent_node_idx].clone();
+
+                for (tok_id, _tok_prob) in parent_candidates.into_iter().take(num_branches) {
+                    let child_id = nodes.len();
+                    let next_pass = pass_idx + 1;
+                    let next_pos = next_level_indices.len();
+                    let child_branches = topology
+                        .level_branching
+                        .get(next_pass)
+                        .and_then(|spec| spec.get(next_pos))
+                        .copied()
+                        .unwrap_or(0)
+                        .max(1);
+
+                    let (child_feat, child_top_tokens, child_top_probs) = self
+                        .gpu_draft_step(tok_id, &parent_feat, child_branches)
+                        .await?;
+
+                    let mut child_probs = vec![0.0f32; self.vocab_size];
+                    for (&ctok, &cprob) in child_top_tokens.iter().zip(&child_top_probs) {
+                        if (ctok as usize) < child_probs.len() {
+                            child_probs[ctok as usize] = cprob;
+                        }
+                    }
+
+                    nodes[parent_node_idx].children.push(child_id);
+                    nodes.push(kriya_speculate::eagle_medusa::DraftTreeNode {
+                        node_id: child_id,
+                        parent_id: Some(parent_node_idx),
+                        depth: pass_idx + 1,
+                        token_id: tok_id,
+                        predicted_feature: child_feat,
+                        draft_probs: child_probs,
+                        children: Vec::new(),
+                    });
+
+                    let child_pool: Vec<(u32, f32)> =
+                        child_top_tokens.into_iter().zip(child_top_probs).collect();
+                    candidate_pools.push(child_pool);
+                    next_level_indices.push(child_id);
+                }
+            }
+
+            current_level_indices = next_level_indices;
+        }
+
+        let tree_attention_mask =
+            kriya_speculate::eagle_medusa::DraftTree::compute_tree_attention_mask(&nodes);
+        Ok(kriya_speculate::eagle_medusa::DraftTree {
+            nodes,
+            tree_attention_mask,
+        })
+    }
+
     /// Executes one EAGLE speculative decode iteration:
     /// 1. Builds a draft tree from the current token and hidden feature
     /// 2. Verifies the tree against the target model in a single GPU pass
@@ -2986,10 +3694,20 @@ impl MetalExecutor {
         topology: &kriya_speculate::eagle_medusa::DraftTreeTopology,
         rng: &mut kriya_speculate::eagle_medusa::DeterministicRng,
     ) -> Result<Option<(Vec<u32>, Vec<u32>)>, MetalError> {
-        // Build the draft tree on CPU
-        let tree = match draft_engine.build_draft_tree(root_token_id, root_feature, topology) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
+        // Build the draft tree (GPU-accelerated when draft weights are loaded)
+        let tree = if self.has_eagle_gpu_draft() {
+            match self
+                .build_draft_tree_gpu(root_token_id, root_feature, topology)
+                .await
+            {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            match draft_engine.build_draft_tree(root_token_id, root_feature, topology) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            }
         };
 
         let num_nodes = tree.nodes.len();
@@ -3127,7 +3845,7 @@ impl MetalExecutor {
         let mut layers_in_chunk = 0usize;
         let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            let lw = &self.weights.layers[l_idx];
+            let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm (batched)
@@ -3199,6 +3917,10 @@ impl MetalExecutor {
                         apply_qk_norm: u32::from(qk_norm.is_some()),
                         rms_eps: eps,
                         rope_theta,
+                        max_seq_len: self.rope_max_seq_len,
+                        has_table: 1,
+                        _pad0: 0,
+                        _pad1: 0,
                     };
                     enc.set_compute_pipeline_state(&rope_pso);
                     enc.set_buffer(0, Some(&self.q_buf), 0);
@@ -3217,19 +3939,35 @@ impl MetalExecutor {
                         std::mem::size_of::<RopeKvWriteParams>() as u64,
                         &rope_params as *const _ as *const _,
                     );
+                    enc.set_buffer(12, Some(&self.rope_cos_sin_table_buf), 0);
                     enc.dispatch_thread_groups(
                         MTLSize::new((num_q_heads + num_kv_heads) as u64, num_tokens as u64, 1),
                         MTLSize::new(32, 1, 1),
                     );
 
-                    // Attention: Vectorized Block-Query Prefill (bq8) for num_tokens >= 8,
-                    // otherwise scalar parallel causal dispatch.
-                    // Handles full head dimensions (64, 128, 256) with online softmax in SRAM.
-                    let use_bq8 = num_tokens >= 8;
-                    let kernel_name = if use_bq8 {
-                        "bsr_paged_gqa_prefill_stage1_bq8"
+                    // Attention: Tiled Tensor Prefill Attention with `simdgroup_matrix` MMA (Item 4)
+                    // for num_tokens >= 16 and head_dim <= 128 (hardware 8x8 tensor cores).
+                    // Otherwise falls back to vectorized block-query prefill (bq8) for num_tokens >= 8,
+                    // or scalar parallel causal dispatch.
+                    let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
+                    let (kernel_name, grid, threads) = if num_tokens >= 16 && head_dim <= 128 {
+                        (
+                            "bsr_paged_gqa_tiled_mma_prefill",
+                            MTLSize::new(num_tokens.div_ceil(16) as u64, num_q_heads as u64, 1),
+                            MTLSize::new(32, 1, 1),
+                        )
+                    } else if num_tokens >= 8 {
+                        (
+                            "bsr_paged_gqa_prefill_stage1_bq8",
+                            MTLSize::new(num_tokens.div_ceil(8) as u64, num_kv_heads as u64, 1),
+                            MTLSize::new(32 * gqa_ratio, 1, 1),
+                        )
                     } else {
-                        "bsr_paged_gqa_prefill_stage1"
+                        (
+                            "bsr_paged_gqa_prefill_stage1",
+                            MTLSize::new(num_tokens.div_ceil(4) as u64, num_kv_heads as u64, 1),
+                            MTLSize::new(32 * gqa_ratio, 1, 1),
+                        )
                     };
                     let gqa_pso = self.pipeline_cache.get_or_compile(kernel_name)?;
                     let gqa_params = BsrGqaParams {
@@ -3260,13 +3998,7 @@ impl MetalExecutor {
                         std::mem::size_of::<BsrGqaParams>() as u64,
                         &gqa_params as *const _ as *const _,
                     );
-                    let gqa_ratio = (num_q_heads / num_kv_heads).max(1) as u64;
-                    let query_tokens_per_tile = if use_bq8 { 8 } else { 4 };
-                    let num_tiles = num_tokens.div_ceil(query_tokens_per_tile) as u64;
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_tiles, num_kv_heads as u64, 1),
-                        MTLSize::new(32 * gqa_ratio, 1, 1),
-                    );
+                    enc.dispatch_thread_groups(grid, threads);
 
                     // Note: Split-K for prefill (contexts > threshold blocks) is not
                     // yet implemented in the parallel prefill kernel. For typical
@@ -3311,7 +4043,7 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add (batched, with post-attention norm for Gemma 2)
+            // 2c & 2d. First Residual Add + Pre-FFN RMSNorm (batched)
             if let Some(ref post_attn) = lw.post_attn_norm {
                 Self::encode_rmsnorm(
                     &mut self.pipeline_cache,
@@ -3332,29 +4064,30 @@ impl MetalExecutor {
                     num_tokens,
                     h,
                 )?;
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tokens,
+                    h,
+                    &layer.ffn_norm,
+                )?;
             } else {
-                Self::encode_residual_add(
+                Self::encode_fused_residual_add_rmsnorm(
                     &mut self.pipeline_cache,
                     enc,
                     &self.residual_buf,
                     &self.proj_out_buf,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
                     num_tokens,
                     h,
+                    &layer.ffn_norm,
                 )?;
             }
-
-            // 2d. Pre-FFN RMSNorm (batched)
-            Self::encode_rmsnorm(
-                &mut self.pipeline_cache,
-                enc,
-                &self.residual_buf,
-                0,
-                &lw.ffn_norm,
-                &self.norm_out_buf,
-                num_tokens,
-                h,
-                &layer.ffn_norm,
-            )?;
 
             // 2e. Channel Mixer (Dense MLP, batched)
             match layer.channel_mixer {
@@ -3366,7 +4099,7 @@ impl MetalExecutor {
                     Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        lw,
+                        &lw,
                         &self.norm_out_buf,
                         &self.gate_buf,
                         &self.up_buf,
@@ -3616,7 +4349,12 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
+            let max_chunk = if self.weights.is_streaming() {
+                1
+            } else {
+                WATCHDOG_CHUNK_LAYERS
+            };
+            if layers_in_chunk >= max_chunk && !is_last_layer {
                 enc.end_encoding();
                 cmd_buf.commit();
                 self.wait_for_gpu(cmd_buf).await?;
@@ -3828,7 +4566,7 @@ impl MetalExecutor {
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            let lw = &self.weights.layers[l_idx];
+            let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm
@@ -3901,6 +4639,10 @@ impl MetalExecutor {
                         apply_qk_norm: u32::from(qk_norm.is_some()),
                         rms_eps: eps,
                         rope_theta,
+                        max_seq_len: self.rope_max_seq_len,
+                        has_table: 1,
+                        _pad0: 0,
+                        _pad1: 0,
                     };
                     enc.set_compute_pipeline_state(&rope_pso);
                     enc.set_buffer(0, Some(&self.q_buf), 0);
@@ -3919,6 +4661,7 @@ impl MetalExecutor {
                         std::mem::size_of::<RopeKvWriteParams>() as u64,
                         &rope_params as *const _ as *const _,
                     );
+                    enc.set_buffer(12, Some(&self.rope_cos_sin_table_buf), 0);
                     enc.dispatch_thread_groups(
                         MTLSize::new((num_q_heads + num_kv_heads) as u64, num_tokens as u64, 1),
                         MTLSize::new(32, 1, 1),
@@ -4104,7 +4847,7 @@ impl MetalExecutor {
                 }
             }
 
-            // 2c. First Residual Add (with post-attention norm for Gemma 2)
+            // 2c & 2d. First Residual Add + Pre-FFN RMSNorm
             if let Some(ref post_attn) = lw.post_attn_norm {
                 Self::encode_rmsnorm(
                     &mut self.pipeline_cache,
@@ -4125,29 +4868,42 @@ impl MetalExecutor {
                     num_tokens,
                     h,
                 )?;
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tokens,
+                    h,
+                    &layer.ffn_norm,
+                )?;
             } else if num_tokens > 1 {
-                Self::encode_residual_add(
+                Self::encode_fused_residual_add_rmsnorm(
                     &mut self.pipeline_cache,
                     enc,
                     &self.residual_buf,
                     &self.proj_out_buf,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
                     num_tokens,
                     h,
+                    &layer.ffn_norm,
+                )?;
+            } else {
+                Self::encode_rmsnorm(
+                    &mut self.pipeline_cache,
+                    enc,
+                    &self.residual_buf,
+                    0,
+                    &lw.ffn_norm,
+                    &self.norm_out_buf,
+                    num_tokens,
+                    h,
+                    &layer.ffn_norm,
                 )?;
             }
-
-            // 2d. Pre-FFN RMSNorm
-            Self::encode_rmsnorm(
-                &mut self.pipeline_cache,
-                enc,
-                &self.residual_buf,
-                0,
-                &lw.ffn_norm,
-                &self.norm_out_buf,
-                num_tokens,
-                h,
-                &layer.ffn_norm,
-            )?;
 
             // 2e. Channel Mixer: Dense MLP vs. Full GPU-Resident SparseMoE (Closes Gap 4)
             match layer.channel_mixer {
@@ -4159,7 +4915,7 @@ impl MetalExecutor {
                     Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        lw,
+                        &lw,
                         &self.norm_out_buf,
                         &self.gate_buf,
                         &self.up_buf,

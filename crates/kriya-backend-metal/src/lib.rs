@@ -2,3 +2,5 @@
 
 #[cfg(target_os = "macos")]
 pub mod encoder;
+#[cfg(target_os = "macos")]
+pub mod layer_streamer;

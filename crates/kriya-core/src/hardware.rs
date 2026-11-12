@@ -55,6 +55,8 @@ pub struct TunedExecutionPolicy {
     /// Fraction of MoE experts pinned in wired GPU memory (1.0 = all in GPU, <1.0 = PowerInfer CPU-GPU hybrid)
     pub gpu_hot_expert_ratio: f32,
     pub compress_kv_cache_q4: bool,
+    /// When true, streams layer weights asynchronously from SSD via double-buffered GPU layer slots.
+    pub enable_layer_streaming: bool,
 }
 
 impl HardwareProfile {
@@ -114,14 +116,14 @@ impl HardwareProfile {
         // MoE model on a 16GB/24GB MacBook Air), activate PowerInfer hot/cold expert splitting
         // and FlexGen 4-bit KV cache compression.
         let memory_budget_after_kv = (self.max_working_set_bytes as f64 * 0.82) as u64;
-        let (gpu_hot_expert_ratio, compress_kv_cache_q4) =
-            if model_weight_bytes > memory_budget_after_kv {
-                let ratio =
-                    (memory_budget_after_kv as f32 / model_weight_bytes as f32).clamp(0.25, 0.95);
-                (ratio, true)
-            } else {
-                (1.0, false)
-            };
+        let enable_layer_streaming = model_weight_bytes > memory_budget_after_kv;
+        let (gpu_hot_expert_ratio, compress_kv_cache_q4) = if enable_layer_streaming {
+            let ratio =
+                (memory_budget_after_kv as f32 / model_weight_bytes as f32).clamp(0.25, 0.95);
+            (ratio, true)
+        } else {
+            (1.0, false)
+        };
 
         TunedExecutionPolicy {
             use_bf16_kernels: self.supports_native_bf16,
@@ -136,6 +138,7 @@ impl HardwareProfile {
             gqa_split_k_partitions,
             gpu_hot_expert_ratio,
             compress_kv_cache_q4,
+            enable_layer_streaming,
         }
     }
 }
