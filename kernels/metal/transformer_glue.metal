@@ -575,16 +575,15 @@ kernel void eagle_topk_and_probs(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float g_max;
     if (tid == 0u) {
         float gm = shared_max[0];
         for (uint s = 1u; s < 8u; ++s) {
             gm = max(gm, shared_max[s]);
         }
-        g_max = gm;
+        shared_max[0] = gm;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float global_max = g_max;
+    const float global_max = shared_max[0];
 
     threadgroup float shared_sum[8];
     float local_sum = 0.0f;
@@ -602,16 +601,15 @@ kernel void eagle_topk_and_probs(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float g_sum_exp;
     if (tid == 0u) {
         float gs = shared_sum[0];
         for (uint s = 1u; s < 8u; ++s) {
             gs += shared_sum[s];
         }
-        g_sum_exp = max(gs, 1e-12f);
+        shared_sum[0] = max(gs, 1e-12f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float sum_exp = g_sum_exp;
+    const float sum_exp = shared_sum[0];
 
     threadgroup uint  chosen_tokens[16];
     threadgroup float chosen_logits[16];
@@ -705,16 +703,15 @@ kernel void eagle_topk_and_probs_f32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float g_max;
     if (tid == 0u) {
         float gm = shared_max[0];
         for (uint s = 1u; s < 8u; ++s) {
             gm = max(gm, shared_max[s]);
         }
-        g_max = gm;
+        shared_max[0] = gm;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float global_max = g_max;
+    const float global_max = shared_max[0];
 
     threadgroup float shared_sum[8];
     float local_sum = 0.0f;
@@ -732,16 +729,15 @@ kernel void eagle_topk_and_probs_f32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float g_sum_exp;
     if (tid == 0u) {
         float gs = shared_sum[0];
         for (uint s = 1u; s < 8u; ++s) {
             gs += shared_sum[s];
         }
-        g_sum_exp = max(gs, 1e-12f);
+        shared_sum[0] = max(gs, 1e-12f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float sum_exp = g_sum_exp;
+    const float sum_exp = shared_sum[0];
 
     threadgroup uint  chosen_tokens[16];
     threadgroup float chosen_logits[16];
