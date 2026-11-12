@@ -646,6 +646,201 @@ fn test_q4_decode_gemv_matches_cpu_reference_on_metal() {
 }
 
 #[test]
+fn test_q4_decode_gemv_2row_matches_cpu_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let rows = 7usize; // non-multiple of 8 to test boundary clipping
+    let cols = 128usize; // 2 blocks
+    let source_weights: Vec<f32> = (0..rows * cols)
+        .map(|idx| ((idx % 37) as f32 - 18.0) * 0.03125)
+        .collect();
+    let blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&source_weights).unwrap();
+    let dequantized = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
+    let input: Vec<f32> = (0..cols)
+        .map(|idx| ((idx % 11) as f32 - 5.0) * 0.125)
+        .collect();
+    let input_bf16: Vec<u16> = input
+        .iter()
+        .map(|&value| kriya_core::quantizer::f32_to_bf16_bits(value))
+        .collect();
+
+    let expected: Vec<f32> = dequantized
+        .chunks_exact(cols)
+        .map(|row| row.iter().zip(&input).map(|(w, x)| w * x).sum())
+        .collect();
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let weight_buf = device.new_buffer_with_data(
+        blocks.as_ptr() as *const _,
+        (blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let output_buf = device.new_buffer((rows * std::mem::size_of::<u16>()) as u64, shared);
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder
+        .set_compute_pipeline_state(&pipelines.get_or_compile("q4_g64_decode_gemv_2row").unwrap());
+    encoder.set_buffer(0, Some(&weight_buf), 0);
+    encoder.set_buffer(1, Some(&input_buf), 0);
+    encoder.set_buffer(2, Some(&output_buf), 0);
+    let params = kriya_backend_metal::encoder::GemmParams {
+        m: 1,
+        n: rows as u32,
+        k: cols as u32,
+        num_k_blocks: (cols / 64) as u32,
+    };
+    encoder.set_bytes(
+        3,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(rows.div_ceil(8) as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let output = unsafe { std::slice::from_raw_parts(output_buf.contents() as *const u16, rows) };
+    for (gpu_bits, cpu) in output.iter().zip(expected) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "GPU={gpu}, CPU={cpu}");
+    }
+}
+
+#[test]
+fn test_q4_decode_gate_up_swiglu_matches_cpu_reference_on_metal() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let intermediate_size = 9usize;
+    let k = 128usize;
+
+    let gate_source: Vec<f32> = (0..intermediate_size * k)
+        .map(|idx| ((idx % 29) as f32 - 14.0) * 0.03125)
+        .collect();
+    let up_source: Vec<f32> = (0..intermediate_size * k)
+        .map(|idx| ((idx % 31) as f32 - 15.0) * 0.03125)
+        .collect();
+
+    let gate_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&gate_source).unwrap();
+    let up_blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&up_source).unwrap();
+
+    let gate_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&gate_blocks);
+    let up_deq = kriya_core::quantizer::dequantize_q4_group64_to_f32(&up_blocks);
+
+    let input: Vec<f32> = (0..k).map(|idx| ((idx % 13) as f32 - 6.0) * 0.1).collect();
+    let input_bf16: Vec<u16> = input
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+
+    let expected: Vec<f32> = (0..intermediate_size)
+        .map(|i| {
+            let g: f32 = gate_deq[i * k..(i + 1) * k]
+                .iter()
+                .zip(&input)
+                .map(|(w, x)| w * x)
+                .sum();
+            let u: f32 = up_deq[i * k..(i + 1) * k]
+                .iter()
+                .zip(&input)
+                .map(|(w, x)| w * x)
+                .sum();
+            let silu_g = g / (1.0 + (-g).exp());
+            silu_g * u
+        })
+        .collect();
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let gate_buf = device.new_buffer_with_data(
+        gate_blocks.as_ptr() as *const _,
+        (gate_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let up_buf = device.new_buffer_with_data(
+        up_blocks.as_ptr() as *const _,
+        (up_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ4Group64>()) as u64,
+        shared,
+    );
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let output_buf = device.new_buffer(
+        (intermediate_size * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let encoder = cmd.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(
+        &pipelines
+            .get_or_compile("q4_g64_decode_gate_up_swiglu_gemv")
+            .unwrap(),
+    );
+    encoder.set_buffer(0, Some(&gate_buf), 0);
+    encoder.set_buffer(1, Some(&up_buf), 0);
+    encoder.set_buffer(2, Some(&input_buf), 0);
+    encoder.set_buffer(3, Some(&output_buf), 0);
+
+    let params = kriya_backend_metal::encoder::GateUpSwigluGemmParams {
+        m: 1,
+        k: k as u32,
+        num_k_blocks: (k / 64) as u32,
+        intermediate_size: intermediate_size as u32,
+        activation_variant: 0, // SwiGLU
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    encoder.set_bytes(
+        4,
+        std::mem::size_of_val(&params) as u64,
+        &params as *const _ as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(intermediate_size.div_ceil(4) as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
+    encoder.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let output = unsafe {
+        std::slice::from_raw_parts(output_buf.contents() as *const u16, intermediate_size)
+    };
+    for (gpu_bits, cpu) in output.iter().zip(expected) {
+        let gpu = kriya_core::quantizer::bf16_bits_to_f32(*gpu_bits);
+        assert!((gpu - cpu).abs() < 0.05, "GPU={gpu}, CPU={cpu}");
+    }
+}
+
+#[test]
 fn test_paged_attention_matches_cpu_reference_on_metal() {
     let Some(device) = require_metal_device() else {
         return;

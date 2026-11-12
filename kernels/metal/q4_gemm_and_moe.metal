@@ -151,6 +151,96 @@ inline float q4_g64_block_dot_distributive(
     return fma(sum_qx0 + sum_qx1, scale, (sum_x0 + sum_x1) * bias);
 }
 
+/// In-register distributive 64-element block dot product computed across TWO rows simultaneously.
+/// Shares activation vector load and conversion from DRAM across both rows, cutting activation
+/// DRAM memory bandwidth and instruction overhead by 50%.
+inline void q4_g64_2row_block_dot_distributive(
+    device const BlockQ4Group64& blk0,
+    device const BlockQ4Group64& blk1,
+    device const ushort* x_ptr,
+    thread float& acc0,
+    thread float& acc1
+) {
+    const float scale0 = bf16_to_f32(blk0.scale_bf16);
+    const float bias0  = bf16_to_f32(blk0.bias_bf16);
+    const float scale1 = bf16_to_f32(blk1.scale_bf16);
+    const float bias1  = bf16_to_f32(blk1.bias_bf16);
+
+    device const packed_uint4* qs_vec0 = reinterpret_cast<device const packed_uint4*>(blk0.qs);
+    device const packed_uint4* qs_vec1 = reinterpret_cast<device const packed_uint4*>(blk1.qs);
+
+    const uint4 vec_lo0 = uint4(qs_vec0[0]);
+    const uint4 vec_hi0 = uint4(qs_vec0[1]);
+    const uint4 vec_lo1 = uint4(qs_vec1[0]);
+    const uint4 vec_hi1 = uint4(qs_vec1[1]);
+
+    float sum_qx0_r0 = 0.0f;
+    float sum_qx1_r0 = 0.0f;
+    float sum_qx0_r1 = 0.0f;
+    float sum_qx1_r1 = 0.0f;
+    float sum_x0     = 0.0f;
+    float sum_x1     = 0.0f;
+
+    // Unroll first 16 bytes (32 elements) from vec_lo with 128-bit vectorized activation fetches
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_lo0[w_i];
+        uint word1 = vec_lo1[w_i];
+        uint x_base = w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    // Unroll second 16 bytes (32 elements) from vec_hi with 128-bit vectorized activation fetches
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_hi0[w_i];
+        uint word1 = vec_hi1[w_i];
+        uint x_base = 32u + w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    acc0 += fma(sum_qx0_r0 + sum_qx1_r0, scale0, (sum_x0 + sum_x1) * bias0);
+    acc1 += fma(sum_qx0_r1 + sum_qx1_r1, scale1, (sum_x0 + sum_x1) * bias1);
+}
+
 /// 128-Bit Vector-Coalesced M=1 Decode GEMV Kernel (32 lanes per row).
 kernel void q4_g64_decode_gemv(
     device const BlockQ4Group64* weights   [[buffer(0)]],
@@ -286,6 +376,114 @@ kernel void q4_g64_decode_gemv_accumulate_sub16(
     if (sub_lane == 0u) {
         float r = bf16_to_f32(residual_inout[row_idx]);
         residual_inout[row_idx] = f32_to_bf16(acc + r);
+    }
+}
+
+/// 2-Row Distributive M=1 Decode GEMV Kernel (64-element blocks).
+/// Each SIMDgroup computes TWO output rows simultaneously using shared activation loads.
+/// Dispatched with 128 threads/threadgroup (4 SIMDgroups = 8 rows/threadgroup).
+kernel void q4_g64_decode_gemv_2row(
+    device const BlockQ4Group64* weights   [[buffer(0)]],
+    device const ushort*         input_x   [[buffer(1)]], // bf16 [1, K]
+    device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
+    constant GemmParams&         params    [[buffer(3)]],
+    uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint                         simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tgp_pos.x * 8u + simd_id * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= params.N) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+    const bool has_row1 = (row1 < params.N);
+    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (has_row1) {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_2row_block_dot_distributive(
+                row0_blocks[blk_idx],
+                row1_blocks[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc0,
+                acc1
+            );
+        }
+    } else {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+    }
+
+    float res0 = simd_sum(acc0);
+    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+    if (simd_lane == 0u) {
+        output_y[row0] = f32_to_bf16(res0);
+        if (has_row1) {
+            output_y[row1] = f32_to_bf16(res1);
+        }
+    }
+}
+
+/// 2-Row Fused Decode GEMV + Residual Accumulate Kernel (M = 1).
+/// Each SIMDgroup computes TWO output rows simultaneously using shared activation loads
+/// and adds directly into residual_inout in registers.
+kernel void q4_g64_decode_gemv_accumulate_2row(
+    device const BlockQ4Group64* weights        [[buffer(0)]],
+    device const ushort*         input_x        [[buffer(1)]], // bf16 [1, K]
+    device ushort*               residual_inout [[buffer(2)]], // bf16 [1, N]
+    constant GemmParams&         params         [[buffer(3)]],
+    uint3                        tgp_pos        [[threadgroup_position_in_grid]],
+    uint                         simd_id        [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane      [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = tgp_pos.x * 8u + simd_id * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= params.N) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* row0_blocks = weights + (row0 * num_blocks);
+    const bool has_row1 = (row1 < params.N);
+    device const BlockQ4Group64* row1_blocks = has_row1 ? weights + (row1 * num_blocks) : row0_blocks;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    if (has_row1) {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            q4_g64_2row_block_dot_distributive(
+                row0_blocks[blk_idx],
+                row1_blocks[blk_idx],
+                input_x + (blk_idx * 64u),
+                acc0,
+                acc1
+            );
+        }
+    } else {
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc0 += q4_g64_block_dot_distributive(row0_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+    }
+
+    float res0 = simd_sum(acc0);
+    float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+    if (simd_lane == 0u) {
+        float r0 = bf16_to_f32(residual_inout[row0]);
+        residual_inout[row0] = f32_to_bf16(res0 + r0);
+        if (has_row1) {
+            float r1 = bf16_to_f32(residual_inout[row1]);
+            residual_inout[row1] = f32_to_bf16(res1 + r1);
+        }
     }
 }
 
@@ -477,6 +675,120 @@ kernel void q4_g64_decode_gate_up_gemv(
     float row_result = simd_sum(acc);
     if (simd_lane == 0u) {
         out_ptr[out_idx] = f32_to_bf16(row_result);
+    }
+}
+
+/// Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 32 lanes per row).
+/// Evaluates gate and up projections concurrently in registers and applies the chosen
+/// activation (SwiGLU / GeGLU / ReLU) directly before storing to unified memory.
+/// Eliminates intermediate DRAM writes and reads for gate and up buffers.
+kernel void q4_g64_decode_gate_up_swiglu_gemv(
+    device const BlockQ4Group64* gate_weights [[buffer(0)]],
+    device const BlockQ4Group64* up_weights   [[buffer(1)]],
+    device const ushort*         input_x      [[buffer(2)]], // bf16 [1, K]
+    device ushort*               mlp_out      [[buffer(3)]], // bf16 [1, intermediate_size]
+    constant GateUpSwigluGemmParams& params   [[buffer(4)]],
+    uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint                         simd_id      [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane    [[thread_index_in_simdgroup]]
+) {
+    const uint row_idx = tgp_pos.x * 4u + simd_id;
+    if (row_idx >= params.intermediate_size) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* gate_row = gate_weights + (row_idx * num_blocks);
+    device const BlockQ4Group64* up_row   = up_weights + (row_idx * num_blocks);
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+    for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+        q4_g64_2row_block_dot_distributive(
+            gate_row[blk_idx],
+            up_row[blk_idx],
+            input_x + (blk_idx * 64u),
+            acc_gate,
+            acc_up
+        );
+    }
+
+    float g = simd_sum(acc_gate);
+    float u = simd_sum(acc_up);
+    if (simd_lane == 0u) {
+        float act_g = 0.0f;
+        if (params.activation_variant == 0u) {
+            act_g = g / (1.0f + exp(-g));
+        } else if (params.activation_variant == 1u) {
+            constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+            float cubic = fma(0.044715f * g, g * g, g);
+            act_g = 0.5f * g * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+        } else {
+            act_g = max(g, 0.0f);
+        }
+        mlp_out[row_idx] = f32_to_bf16(act_g * u);
+    }
+}
+
+/// 16-Lane Sub-Warp Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, num_k_blocks <= 16).
+/// Each SIMDgroup of 32 lanes computes TWO intermediate channels concurrently (16 lanes per channel).
+kernel void q4_g64_decode_gate_up_swiglu_gemv_sub16(
+    device const BlockQ4Group64* gate_weights [[buffer(0)]],
+    device const BlockQ4Group64* up_weights   [[buffer(1)]],
+    device const ushort*         input_x      [[buffer(2)]], // bf16 [1, K]
+    device ushort*               mlp_out      [[buffer(3)]], // bf16 [1, intermediate_size]
+    constant GateUpSwigluGemmParams& params   [[buffer(4)]],
+    uint3                        tgp_pos      [[threadgroup_position_in_grid]],
+    uint                         simd_id      [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane    [[thread_index_in_simdgroup]]
+) {
+    const uint sub_group = simd_lane / 16u; // 0 or 1
+    const uint sub_lane  = simd_lane % 16u; // 0..15
+    const uint row_idx   = tgp_pos.x * 8u + simd_id * 2u + sub_group;
+    if (row_idx >= params.intermediate_size) {
+        return;
+    }
+
+    const uint num_blocks = params.num_k_blocks;
+    device const BlockQ4Group64* gate_row = gate_weights + (row_idx * num_blocks);
+    device const BlockQ4Group64* up_row   = up_weights + (row_idx * num_blocks);
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+    for (uint blk_idx = sub_lane; blk_idx < num_blocks; blk_idx += 16u) {
+        q4_g64_2row_block_dot_distributive(
+            gate_row[blk_idx],
+            up_row[blk_idx],
+            input_x + (blk_idx * 64u),
+            acc_gate,
+            acc_up
+        );
+    }
+
+    acc_gate += simd_shuffle_down(acc_gate, 8u);
+    acc_gate += simd_shuffle_down(acc_gate, 4u);
+    acc_gate += simd_shuffle_down(acc_gate, 2u);
+    acc_gate += simd_shuffle_down(acc_gate, 1u);
+
+    acc_up += simd_shuffle_down(acc_up, 8u);
+    acc_up += simd_shuffle_down(acc_up, 4u);
+    acc_up += simd_shuffle_down(acc_up, 2u);
+    acc_up += simd_shuffle_down(acc_up, 1u);
+
+    if (sub_lane == 0u) {
+        float g = acc_gate;
+        float u = acc_up;
+        float act_g = 0.0f;
+        if (params.activation_variant == 0u) {
+            act_g = g / (1.0f + exp(-g));
+        } else if (params.activation_variant == 1u) {
+            constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+            float cubic = fma(0.044715f * g, g * g, g);
+            act_g = 0.5f * g * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+        } else {
+            act_g = max(g, 0.0f);
+        }
+        mlp_out[row_idx] = f32_to_bf16(act_g * u);
     }
 }
 

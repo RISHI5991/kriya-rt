@@ -1352,12 +1352,16 @@ impl MetalExecutor {
             "embedding_lookup_q4_g64",
             "rms_norm_bf16",
             "q4_g64_decode_gemv",
+            "q4_g64_decode_gemv_2row",
             "q4_g64_decode_gemv_sub16",
             "q4_g64_decode_gemv_accumulate",
+            "q4_g64_decode_gemv_accumulate_2row",
             "q4_g64_decode_gemv_accumulate_sub16",
             "q4_g64_decode_qkv_gemv",
             "q4_g64_decode_qkv_gemv_sub16",
             "q4_g64_decode_gate_up_gemv",
+            "q4_g64_decode_gate_up_swiglu_gemv",
+            "q4_g64_decode_gate_up_swiglu_gemv_sub16",
             "q4_g64_prefill_gemm",
             "q4_g64_prefill_qkv_gemm",
             "q4_g64_prefill_gate_up_gemm",
@@ -1805,7 +1809,7 @@ impl MetalExecutor {
             let (name, divisor) = if params.num_k_blocks <= 16 {
                 ("q4_g64_decode_gemv_sub16", 8u32)
             } else {
-                ("q4_g64_decode_gemv", 4u32)
+                ("q4_g64_decode_gemv_2row", 8u32)
             };
             (
                 name,
@@ -1862,7 +1866,7 @@ impl MetalExecutor {
         let (kernel_name, tgp_divisor) = if num_k_blocks <= 16 {
             ("q4_g64_decode_gemv_accumulate_sub16", 8u32)
         } else {
-            ("q4_g64_decode_gemv_accumulate", 4u32)
+            ("q4_g64_decode_gemv_accumulate_2row", 8u32)
         };
 
         let pso = pipeline_cache.get_or_compile(kernel_name)?;
@@ -2011,6 +2015,36 @@ impl MetalExecutor {
                 m.div_ceil(64) as u64,
                 1,
             );
+            encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
+        } else if m == 1 {
+            let num_k_blocks = k.div_ceil(64);
+            let params = GateUpSwigluGemmParams {
+                m: 1,
+                k,
+                num_k_blocks,
+                intermediate_size,
+                activation_variant: act_var,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            let (kernel_name, tgp_divisor) = if num_k_blocks <= 16 {
+                ("q4_g64_decode_gate_up_swiglu_gemv_sub16", 8u32)
+            } else {
+                ("q4_g64_decode_gate_up_swiglu_gemv", 4u32)
+            };
+            let pso = pipeline_cache.get_or_compile(kernel_name)?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(gate_weight), 0);
+            encoder.set_buffer(1, Some(up_weight), 0);
+            encoder.set_buffer(2, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(3, Some(mlp_hidden_buf), 0);
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<GateUpSwigluGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            let grid = MTLSize::new(intermediate_size.div_ceil(tgp_divisor) as u64, 1, 1);
             encoder.dispatch_thread_groups(grid, MTLSize::new(128, 1, 1));
         } else {
             let params = GateUpGemmParams {
