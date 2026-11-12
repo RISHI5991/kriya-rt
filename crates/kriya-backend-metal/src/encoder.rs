@@ -21,9 +21,7 @@ use kriya_kv::bsr_paged::{CtaWorkTile, FlashInferSchedulePlan};
 use metal::*;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Notify;
 
 /// Maximum layers per command buffer chunk to avoid macOS command-buffer
 /// watchdog timeout (~5-9s on Apple Silicon). Deep models (42+ layers) must
@@ -50,6 +48,8 @@ pub enum MetalError {
     UnsupportedProductionConfiguration(String),
     #[error("invalid execution input: {0}")]
     InvalidExecutionInput(String),
+    #[error("Metal GPU command buffer execution error: {0}")]
+    ExecutionError(String),
 }
 
 // ============================================================================
@@ -1291,12 +1291,6 @@ pub struct MetalExecutor {
     /// committed to the KV cache without re-running the full forward pass.
     pub tree_k_buf: Buffer,
     pub tree_v_buf: Buffer,
-    /// Shared event for GPU completion signaling (async pipeline).
-    /// Eliminates CPU stall from wait_until_completed() by allowing
-    /// the CPU to continue scheduling while the GPU executes.
-    pub shared_event: SharedEvent,
-    /// Signal value counter for tracking command buffer completion.
-    pub signal_value: u64,
     /// Ping-pong scratch toggle for double-buffered CPU/GPU overlap.
     /// Iteration N encodes into scratch[idx], iteration N+1 encodes into scratch[idx^1].
     pub scratch_ping_pong_idx: u32,
@@ -1352,7 +1346,6 @@ impl MetalExecutor {
             MetalError::DeviceInitFailed("No Apple Silicon Metal GPU found".into())
         })?;
         let command_queue = device.new_command_queue();
-        let shared_event = device.new_shared_event();
         let mut pipeline_cache = MetalPipelineCache::from_shader_dir(device.clone(), shader_dir)?;
 
         for kernel in [
@@ -1546,9 +1539,6 @@ impl MetalExecutor {
             // Layout: [num_layers, max_tree_nodes, max_q_dim] in BF16
             tree_k_buf: alloc(num_layers * 16 * max_q_dim * 2),
             tree_v_buf: alloc(num_layers * 16 * max_q_dim * 2),
-            // Shared event for async GPU completion signaling
-            shared_event,
-            signal_value: 0,
             scratch_ping_pong_idx: 0,
             // Ping-pong scratch buffers (double-buffer for CPU/GPU overlap)
             residual_buf_ping: alloc(max_batch_toks * h * 2),
@@ -1570,25 +1560,47 @@ impl MetalExecutor {
 
     /// Waits for a submitted Metal command buffer to complete asynchronously.
     ///
-    /// Replaces the CPU spin-yield busy-wait that pinned a core at 100%, caused
-    /// thermal throttling on M-series Macs, and stole memory bandwidth from the GPU.
-    /// Uses `MTLCommandBuffer.addCompletedHandler` with a `tokio::sync::Notify` so
-    /// the async worker loop can yield control back to Tokio while the GPU executes.
-    pub async fn wait_for_gpu(&self, signal_value: u64) -> Result<(), MetalError> {
-        let notify = Arc::new(Notify::new());
-        let notify_clone = Arc::clone(&notify);
-        let shared_event = self.shared_event.clone();
-        let sv = signal_value;
+    /// Uses cooperative hybrid spin-polling and Tokio task yielding without spawning
+    /// OS pthreads on every wait, eliminating thread creation latency while
+    /// avoiding CPU starvation and thermal throttling.
+    pub async fn wait_for_gpu(&self, cmd_buf: &CommandBufferRef) -> Result<(), MetalError> {
+        if cmd_buf.status() == MTLCommandBufferStatus::Completed {
+            return Ok(());
+        }
+        if cmd_buf.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalError::ExecutionError(
+                "Metal command buffer failed".into(),
+            ));
+        }
 
-        // Poller thread waits on the GPU signal so the Tokio task can yield control.
-        // This avoids the 100% CPU spin-yield that caused thermal throttling.
-        std::thread::spawn(move || {
-            while shared_event.signaled_value() < sv {
+        // Fast path: quick hybrid spin for immediate GPU completions (sub-microsecond)
+        for _ in 0..1000 {
+            if cmd_buf.status() == MTLCommandBufferStatus::Completed {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+
+        // Async non-blocking polling: yield to Tokio runtime without spawning OS threads
+        let mut yields = 0u32;
+        while cmd_buf.status() != MTLCommandBufferStatus::Completed {
+            if cmd_buf.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalError::ExecutionError(
+                    "Metal command buffer failed".into(),
+                ));
+            }
+            for _ in 0..128 {
+                if cmd_buf.status() == MTLCommandBufferStatus::Completed {
+                    return Ok(());
+                }
                 std::hint::spin_loop();
             }
-            notify_clone.notify_one();
-        });
-        notify.notified().await;
+            yields = yields.saturating_add(1);
+            if yields % 16 == 0 {
+                std::thread::yield_now();
+            }
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 
@@ -2121,33 +2133,6 @@ impl MetalExecutor {
         }
     }
 
-    #[allow(dead_code)]
-    fn encode_bias_add(
-        pipeline_cache: &mut MetalPipelineCache,
-        encoder: &ComputeCommandEncoderRef,
-        values: &Buffer,
-        bias: &Buffer,
-        num_tokens: u32,
-        hidden_size: u32,
-    ) -> Result<(), MetalError> {
-        let pso = pipeline_cache.get_or_compile("add_bias_bf16")?;
-        let shape = [num_tokens, hidden_size];
-        encoder.set_compute_pipeline_state(&pso);
-        encoder.set_buffer(0, Some(values), 0);
-        encoder.set_buffer(1, Some(bias), 0);
-        encoder.set_bytes(
-            2,
-            std::mem::size_of_val(&shape) as u64,
-            shape.as_ptr() as *const _,
-        );
-        let elements = num_tokens.saturating_mul(hidden_size);
-        encoder.dispatch_thread_groups(
-            MTLSize::new(elements.div_ceil(256) as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-        Ok(())
-    }
-
     /// Reads the normalized hidden state vector (`[hidden_size]` in f32) from unified memory
     /// for a specific token index, to feed `EagleDraftEngine` feature-level autoregression.
     ///
@@ -2246,10 +2231,8 @@ impl MetalExecutor {
             let is_last_layer = l_idx + 1 == num_layers;
             if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
+                self.wait_for_gpu(cmd_buf).await?;
                 cmd_buf = self.command_queue.new_command_buffer();
                 enc = cmd_buf.new_compute_command_encoder();
                 layers_in_chunk = 0;
@@ -2411,8 +2394,8 @@ impl MetalExecutor {
             }
         }
 
-        let mut cmd_buf = self.command_queue.new_command_buffer();
-        let mut enc = cmd_buf.new_compute_command_encoder();
+        let cmd_buf = self.command_queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
 
         // 1. Token Embedding Lookup for all tree nodes
         {
@@ -2441,9 +2424,6 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer layers (tree mode — no KV cache writes)
-        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
-        let mut layers_in_chunk = 0usize;
-        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -2771,23 +2751,9 @@ impl MetalExecutor {
                     h as u32,
                 )?;
             }
-
-            layers_in_chunk += 1;
-            let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
-                enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-                cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-                layers_in_chunk = 0;
-            }
         }
 
         // 3. Final RMSNorm (per tree node) — output in norm_out_buf.
-        //    Read back hidden states HERE (before LM Head overwrites norm_out_buf).
         Self::encode_rmsnorm(
             &mut self.pipeline_cache,
             enc,
@@ -2799,18 +2765,6 @@ impl MetalExecutor {
             h as u32,
             &descriptor.final_norm,
         )?;
-
-        // Read back hidden states per tree node (BF16 -> F32).
-        // These are the ACTUAL target model hidden states — needed for correct EAGLE acceptance.
-        let hidden_data =
-            self.read_u16_slice_as_f32_from_buffer(&self.norm_out_buf, 0, num_tree_nodes * h);
-        let mut target_features = Vec::with_capacity(num_tree_nodes);
-        for node in 0..num_tree_nodes {
-            let start = node * h;
-            let end = start + h;
-            let node_feat: Vec<f32> = hidden_data[start..end].to_vec();
-            target_features.push(node_feat);
-        }
 
         // 4. LM Head Projection -> logits per tree node (writes to temp buffer)
         Self::encode_q4_linear(
@@ -2826,10 +2780,20 @@ impl MetalExecutor {
         )?;
 
         enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        self.wait_for_gpu(self.signal_value).await?;
+        self.wait_for_gpu(cmd_buf).await?;
+
+        // Read back hidden states per tree node (BF16 -> F32) after GPU execution.
+        // These are the ACTUAL target model hidden states — needed for correct EAGLE acceptance.
+        let hidden_data =
+            self.read_u16_slice_as_f32_from_buffer(&self.norm_out_buf, 0, num_tree_nodes * h);
+        let mut target_features = Vec::with_capacity(num_tree_nodes);
+        for node in 0..num_tree_nodes {
+            let start = node * h;
+            let end = start + h;
+            let node_feat: Vec<f32> = hidden_data[start..end].to_vec();
+            target_features.push(node_feat);
+        }
 
         // Read back logits for all tree nodes (BF16 -> F32)
         let logits_data =
@@ -3578,10 +3542,8 @@ impl MetalExecutor {
             let is_last_layer = l_idx + 1 == num_layers;
             if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
                 enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
                 cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
+                self.wait_for_gpu(cmd_buf).await?;
                 cmd_buf = self.command_queue.new_command_buffer();
                 enc = cmd_buf.new_compute_command_encoder();
                 layers_in_chunk = 0;
@@ -3632,10 +3594,8 @@ impl MetalExecutor {
         }
 
         enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        self.wait_for_gpu(self.signal_value).await?;
+        self.wait_for_gpu(cmd_buf).await?;
 
         let sampled_token = self.read_u32_from_buffer(&self.sampled_token_buf, 0);
         Ok(sampled_token)
@@ -3761,8 +3721,8 @@ impl MetalExecutor {
             }
         }
 
-        let mut cmd_buf = self.command_queue.new_command_buffer();
-        let mut enc = cmd_buf.new_compute_command_encoder();
+        let cmd_buf = self.command_queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
 
         // 1. Token Embedding Lookup (Q4_G64 -> BF16 residual stream)
         {
@@ -3791,9 +3751,6 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
-        // Watchdog chunking: split every WATCHDOG_CHUNK_LAYERS to avoid macOS command-buffer timeout.
-        let mut layers_in_chunk = 0usize;
-        let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = &self.weights.layers[l_idx];
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -4377,19 +4334,6 @@ impl MetalExecutor {
                     h,
                 )?;
             }
-
-            layers_in_chunk += 1;
-            let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
-                enc.end_encoding();
-                self.signal_value += 1;
-                cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
-                cmd_buf.commit();
-                self.wait_for_gpu(self.signal_value).await?;
-                cmd_buf = self.command_queue.new_command_buffer();
-                enc = cmd_buf.new_compute_command_encoder();
-                layers_in_chunk = 0;
-            }
         }
 
         // 3. Final RMSNorm
@@ -4459,10 +4403,8 @@ impl MetalExecutor {
         }
 
         enc.end_encoding();
-        self.signal_value += 1;
-        cmd_buf.encode_signal_event(&self.shared_event, self.signal_value);
         cmd_buf.commit();
-        self.wait_for_gpu(self.signal_value).await?;
+        self.wait_for_gpu(cmd_buf).await?;
 
         let ptr = self.sampled_token_buf.contents() as *const u32;
         let count = if sample_all { num_tokens as usize } else { 1 };
