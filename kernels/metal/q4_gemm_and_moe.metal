@@ -23,6 +23,20 @@ struct BlockQ4Group64 {
     uchar  qs[32];
 };
 
+/// Matches `BlockQ2Group128` in `crates/kriya-core/src/tensor.rs` (36 bytes packed).
+struct BlockQ2Group128 {
+    ushort scale_bf16;
+    ushort bias_bf16;
+    uchar  qs[32];
+};
+
+/// Matches `BlockQ3Group64` in `crates/kriya-core/src/tensor.rs` (28 bytes packed).
+struct BlockQ3Group64 {
+    ushort scale_bf16;
+    ushort bias_bf16;
+    uchar  qs[24];
+};
+
 /// Constant kernel dispatch arguments for Linear / MLP projections.
 struct GemmParams {
     uint M;              // Number of tokens in batch/chunk (M=1 for decode, M>1 for prefill)
@@ -149,6 +163,129 @@ inline float q4_g64_block_dot_distributive(
     }
 
     return fma(sum_qx0 + sum_qx1, scale, (sum_x0 + sum_x1) * bias);
+}
+
+/// In-register distributive 128-element block dot product for 2-bit quantization (`BlockQ2Group128`).
+/// Computes sum(w_i * x_i) using the distributive identity: scale * sum(q_i * x_i) + bias * sum(x_i).
+inline float q2_g128_block_dot_distributive(
+    device const BlockQ2Group128& blk,
+    device const ushort* x_ptr
+) {
+    const float scale = bf16_to_f32(blk.scale_bf16);
+    const float bias  = bf16_to_f32(blk.bias_bf16);
+
+    device const packed_uint4* qs_vec = reinterpret_cast<device const packed_uint4*>(blk.qs);
+    const uint4 vec_lo = uint4(qs_vec[0]); // bytes 0..15 (64 elements)
+    const uint4 vec_hi = uint4(qs_vec[1]); // bytes 16..31 (64 elements)
+
+    float sum_qx = 0.0f;
+    float sum_x  = 0.0f;
+
+    // First 64 elements (bytes 0..15)
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word = vec_lo[w_i];
+        uint x_base = w_i * 16u;
+        uint4 x_vec0 = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        uint4 x_vec1 = *reinterpret_cast<device const uint4*>(x_ptr + x_base + 8u);
+
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte_val = (word >> (b * 8u)) & 0xFFu;
+            float q0 = float(byte_val & 3u);
+            float q1 = float((byte_val >> 2u) & 3u);
+            float q2 = float((byte_val >> 4u) & 3u);
+            float q3 = float((byte_val >> 6u) & 3u);
+
+            uint pair0 = (b == 0u) ? x_vec0.x : ((b == 1u) ? x_vec0.z : ((b == 2u) ? x_vec1.x : x_vec1.z));
+            uint pair1 = (b == 0u) ? x_vec0.y : ((b == 1u) ? x_vec0.w : ((b == 2u) ? x_vec1.y : x_vec1.w));
+
+            float x0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(pair0 & 0xFFFF0000u);
+            float x2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
+            float x3 = as_type<float>(pair1 & 0xFFFF0000u);
+
+            sum_qx = fma(q0, x0, fma(q1, x1, fma(q2, x2, fma(q3, x3, sum_qx))));
+            sum_x += (x0 + x1 + x2 + x3);
+        }
+    }
+
+    // Second 64 elements (bytes 16..31)
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word = vec_hi[w_i];
+        uint x_base = 64u + w_i * 16u;
+        uint4 x_vec0 = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        uint4 x_vec1 = *reinterpret_cast<device const uint4*>(x_ptr + x_base + 8u);
+
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte_val = (word >> (b * 8u)) & 0xFFu;
+            float q0 = float(byte_val & 3u);
+            float q1 = float((byte_val >> 2u) & 3u);
+            float q2 = float((byte_val >> 4u) & 3u);
+            float q3 = float((byte_val >> 6u) & 3u);
+
+            uint pair0 = (b == 0u) ? x_vec0.x : ((b == 1u) ? x_vec0.z : ((b == 2u) ? x_vec1.x : x_vec1.z));
+            uint pair1 = (b == 0u) ? x_vec0.y : ((b == 1u) ? x_vec0.w : ((b == 2u) ? x_vec1.y : x_vec1.w));
+
+            float x0 = as_type<float>((pair0 & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(pair0 & 0xFFFF0000u);
+            float x2 = as_type<float>((pair1 & 0xFFFFu) << 16u);
+            float x3 = as_type<float>(pair1 & 0xFFFF0000u);
+
+            sum_qx = fma(q0, x0, fma(q1, x1, fma(q2, x2, fma(q3, x3, sum_qx))));
+            sum_x += (x0 + x1 + x2 + x3);
+        }
+    }
+
+    return fma(sum_qx, scale, sum_x * bias);
+}
+
+/// In-register distributive 64-element block dot product for 3-bit quantization (`BlockQ3Group64`).
+/// Computes sum(w_i * x_i) using the distributive identity: scale * sum(q_i * x_i) + bias * sum(x_i).
+inline float q3_g64_block_dot_distributive(
+    device const BlockQ3Group64& blk,
+    device const ushort* x_ptr
+) {
+    const float scale = bf16_to_f32(blk.scale_bf16);
+    const float bias  = bf16_to_f32(blk.bias_bf16);
+
+    float sum_qx = 0.0f;
+    float sum_x  = 0.0f;
+
+    // 64 elements = 8 groups of 8 elements = 8 triplets of 3 bytes
+    #pragma unroll
+    for (uint g = 0u; g < 8u; ++g) {
+        uint b_idx = g * 3u;
+        uint b0 = uint(blk.qs[b_idx]);
+        uint b1 = uint(blk.qs[b_idx + 1u]);
+        uint b2 = uint(blk.qs[b_idx + 2u]);
+
+        float q0 = float(b0 & 0x07u);
+        float q1 = float((b0 >> 3u) & 0x07u);
+        float q2 = float(((b0 >> 6u) & 0x03u) | ((b1 & 0x01u) << 2u));
+        float q3 = float((b1 >> 1u) & 0x07u);
+        float q4 = float((b1 >> 4u) & 0x07u);
+        float q5 = float(((b1 >> 7u) & 0x01u) | ((b2 & 0x03u) << 1u));
+        float q6 = float((b2 >> 2u) & 0x07u);
+        float q7 = float((b2 >> 5u) & 0x07u);
+
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + g * 8u);
+        float x0 = as_type<float>((x_vec.x & 0xFFFFu) << 16u);
+        float x1 = as_type<float>(x_vec.x & 0xFFFF0000u);
+        float x2 = as_type<float>((x_vec.y & 0xFFFFu) << 16u);
+        float x3 = as_type<float>(x_vec.y & 0xFFFF0000u);
+        float x4 = as_type<float>((x_vec.z & 0xFFFFu) << 16u);
+        float x5 = as_type<float>(x_vec.z & 0xFFFF0000u);
+        float x6 = as_type<float>((x_vec.w & 0xFFFFu) << 16u);
+        float x7 = as_type<float>(x_vec.w & 0xFFFF0000u);
+
+        sum_qx = fma(q0, x0, fma(q1, x1, fma(q2, x2, fma(q3, x3, fma(q4, x4, fma(q5, x5, fma(q6, x6, fma(q7, x7, sum_qx))))))));
+        sum_x += ((x0 + x1) + (x2 + x3) + (x4 + x5) + (x6 + x7));
+    }
+
+    return fma(sum_qx, scale, sum_x * bias);
 }
 
 /// In-register distributive 64-element block dot product computed across TWO rows simultaneously.
@@ -396,6 +533,76 @@ kernel void q4_g64_decode_gemv(
         float acc = 0.0f;
         for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
             acc += q4_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            output_y[row_idx] = f32_to_bf16(row_result);
+        }
+    }
+}
+
+/// 2-bit Group-128 Decode GEMV Kernel (persistent threadgroups, 4 rows per threadgroup).
+/// Grid: N.div_ceil(4) threadgroups, 128 threads (4 simdgroups * 32 lanes).
+kernel void q2_g128_decode_gemv_4row(
+    device const BlockQ2Group128* weights   [[buffer(0)]],
+    device const ushort*          input_x   [[buffer(1)]], // bf16 [1, K]
+    device ushort*                output_y  [[buffer(2)]], // bf16 [1, N]
+    constant GemmParams&          params    [[buffer(3)]],
+    uint3                         tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                         grid_dim  [[threadgroups_per_grid]],
+    uint                          simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                          simd_lane [[thread_index_in_simdgroup]]
+) {
+    const uint total_tiles = (params.N + 3u) / 4u;
+    const uint num_blocks = params.K / 128u;
+
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= params.N) {
+            continue;
+        }
+
+        device const BlockQ2Group128* row_blocks = weights + (row_idx * num_blocks);
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q2_g128_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 128u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            output_y[row_idx] = f32_to_bf16(row_result);
+        }
+    }
+}
+
+/// 3-bit Group-64 Decode GEMV Kernel (persistent threadgroups, 4 rows per threadgroup).
+/// Grid: N.div_ceil(4) threadgroups, 128 threads (4 simdgroups * 32 lanes).
+kernel void q3_g64_decode_gemv_4row(
+    device const BlockQ3Group64* weights   [[buffer(0)]],
+    device const ushort*         input_x   [[buffer(1)]], // bf16 [1, K]
+    device ushort*               output_y  [[buffer(2)]], // bf16 [1, N]
+    constant GemmParams&         params    [[buffer(3)]],
+    uint3                        tgp_pos   [[threadgroup_position_in_grid]],
+    uint3                        grid_dim  [[threadgroups_per_grid]],
+    uint                         simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                         simd_lane [[thread_index_in_simdgroup]]
+) {
+    const uint total_tiles = (params.N + 3u) / 4u;
+    const uint num_blocks = params.num_k_blocks;
+
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= params.N) {
+            continue;
+        }
+
+        device const BlockQ3Group64* row_blocks = weights + (row_idx * num_blocks);
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q3_g64_block_dot_distributive(row_blocks[blk_idx], input_x + (blk_idx * 64u));
         }
 
         float row_result = simd_sum(acc);

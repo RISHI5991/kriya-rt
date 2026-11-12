@@ -43,6 +43,10 @@ pub enum DType {
     FP8E4M3,
     /// Lily-style 4-bit group-64 quantization: 64 4-bit weights (32 bytes) + bf16 scale (2B) + bf16 bias (2B) = 36 bytes.
     Q4Group64,
+    /// 2-bit group-128 quantization: 128 2-bit weights (32 bytes) + bf16 scale (2B) + bf16 bias (2B) = 36 bytes.
+    Q2Group128,
+    /// 3-bit group-64 quantization: 64 3-bit weights (24 bytes) + bf16 scale (2B) + bf16 bias (2B) = 28 bytes.
+    Q3Group64,
     /// FlexGen-style 4-bit KV cache / activation group-32 compression: 16 bytes payload + f16 scale/min.
     Q4KvGroup32,
     /// 32-bit unsigned integer (used for MLX packed 4-bit weights).
@@ -68,7 +72,8 @@ impl DType {
             | DType::U8
             | DType::I32
             | DType::I8 => 1,
-            DType::Q4Group64 => 64,
+            DType::Q4Group64 | DType::Q3Group64 => 64,
+            DType::Q2Group128 => 128,
             DType::Q4KvGroup32 => 32,
         }
     }
@@ -81,6 +86,8 @@ impl DType {
             DType::F16 | DType::BF16 => 2,
             DType::FP8E4M3 | DType::U8 | DType::I8 => 1,
             DType::Q4Group64 => 36, // 32B nibbles + 2B bf16 scale + 2B bf16 zero_bias
+            DType::Q2Group128 => 36, // 32B 2-bit codes + 2B bf16 scale + 2B bf16 zero_bias
+            DType::Q3Group64 => 28, // 24B 3-bit codes + 2B bf16 scale + 2B bf16 zero_bias
             DType::Q4KvGroup32 => 20, // 16B nibbles + 2B f16 scale + 2B f16 min
         }
     }
@@ -105,6 +112,32 @@ pub struct BlockQ4Group64 {
     pub bias_bf16: u16,
     /// 64 4-bit quantized weights packed as 32 bytes (low nibble = even idx, high nibble = odd idx).
     pub qs: [u8; 32],
+}
+
+/// 2-bit Group-128 Quantized Block (`Q2_G128`) used for extreme compression inference.
+/// Stores 128 2-bit unsigned codes packed into 32 bytes alongside shared `bf16` scale and bias (36 bytes total).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct BlockQ2Group128 {
+    /// Raw `bf16` bits for the group multiplicative scale.
+    pub scale_bf16: u16,
+    /// Raw `bf16` bits for the group additive bias / zero-point.
+    pub bias_bf16: u16,
+    /// 128 2-bit quantized weights packed as 32 bytes (4 weights per byte, LSB first).
+    pub qs: [u8; 32],
+}
+
+/// 3-bit Group-64 Quantized Block (`Q3_G64`) used for balanced sub-4-bit compression.
+/// Stores 64 3-bit unsigned codes packed into 24 bytes alongside shared `bf16` scale and bias (28 bytes total).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct BlockQ3Group64 {
+    /// Raw `bf16` bits for the group multiplicative scale.
+    pub scale_bf16: u16,
+    /// Raw `bf16` bits for the group additive bias / zero-point.
+    pub bias_bf16: u16,
+    /// 64 3-bit quantized weights packed as 24 bytes (8 triplets of 3 bytes for 8 weights).
+    pub qs: [u8; 24],
 }
 
 /// Target hardware execution unit for hybrid CPU-GPU placement (PowerInfer model).
@@ -204,6 +237,28 @@ impl<'a> TensorView<'a> {
         }
         Ok(bytemuck::cast_slice(self.data))
     }
+
+    /// Zero-copy cast into a slice of `BlockQ2Group128` blocks for `Q2Group128` tensors.
+    pub fn as_q2_g128_blocks(&self) -> Result<&'a [BlockQ2Group128], TensorError> {
+        if self.descriptor.dtype != DType::Q2Group128 {
+            return Err(TensorError::InvalidMetadata(format!(
+                "Expected Q2Group128 dtype, found {:?}",
+                self.descriptor.dtype
+            )));
+        }
+        Ok(bytemuck::cast_slice(self.data))
+    }
+
+    /// Zero-copy cast into a slice of `BlockQ3Group64` blocks for `Q3Group64` tensors.
+    pub fn as_q3_g64_blocks(&self) -> Result<&'a [BlockQ3Group64], TensorError> {
+        if self.descriptor.dtype != DType::Q3Group64 {
+            return Err(TensorError::InvalidMetadata(format!(
+                "Expected Q3Group64 dtype, found {:?}",
+                self.descriptor.dtype
+            )));
+        }
+        Ok(bytemuck::cast_slice(self.data))
+    }
 }
 
 /// Zero-Copy Memory-Mapped Weight Archive (`.base` / `.safetensors` compatible).
@@ -290,6 +345,32 @@ impl MappedWeightArchive {
     #[inline]
     pub fn total_mapped_bytes(&self) -> usize {
         self.mmap.len()
+    }
+
+    /// Issues an asynchronous OS page cache prefetch hint (`MADV_WILLNEED`) for a tensor from NVMe SSD.
+    pub fn prefetch_tensor(&self, name: &str) -> Result<(), TensorError> {
+        let desc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| TensorError::TensorNotFound(name.to_string()))?;
+        let start = self.data_section_offset + desc.byte_offset;
+        let _ = self
+            .mmap
+            .advise_range(memmap2::Advice::WillNeed, start, desc.byte_len);
+        Ok(())
+    }
+
+    /// Resets tensor page advice to Normal when a layer has finished execution.
+    pub fn release_tensor(&self, name: &str) -> Result<(), TensorError> {
+        let desc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| TensorError::TensorNotFound(name.to_string()))?;
+        let start = self.data_section_offset + desc.byte_offset;
+        let _ = self
+            .mmap
+            .advise_range(memmap2::Advice::Normal, start, desc.byte_len);
+        Ok(())
     }
 }
 

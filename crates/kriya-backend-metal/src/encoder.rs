@@ -241,6 +241,7 @@ fn f32_to_bf16_bits(val: f32) -> u16 {
 }
 
 /// Per-layer GPU weight buffers bound during the forward pass.
+#[derive(Clone)]
 pub struct LayerGpuBuffers {
     pub attn_norm: Buffer,
     pub q_proj: Buffer,
@@ -268,6 +269,7 @@ pub struct ModelGpuWeights {
     pub final_norm: Buffer,
     pub lm_head: Buffer,
     pub _loader: Option<Arc<ShardedCheckpointLoader>>,
+    pub streamer: Option<Arc<std::sync::Mutex<crate::layer_streamer::DoubleBufferedLayerStreamer>>>,
 }
 
 impl ModelGpuWeights {
@@ -743,7 +745,7 @@ impl ModelGpuWeights {
         Self::validate_production_checkpoint(desc, checkpoint_dir.as_ref())?;
 
         let loader = Arc::new(ShardedCheckpointLoader::open_directory(checkpoint_dir)?);
-        let shared = MTLResourceOptions::StorageModeShared;
+        let _shared = MTLResourceOptions::StorageModeShared;
         let h = desc.hidden_size as usize;
         let vocab = desc.vocab_size as usize;
 
@@ -768,115 +770,10 @@ impl ModelGpuWeights {
         };
 
         let mut layers = Vec::with_capacity(desc.layers.len());
-        for (idx, layer) in desc.layers.iter().enumerate() {
-            let p = format!("model.layers.{idx}");
-            let attn_norm = bind_bf16(&format!("{p}.input_layernorm.weight"), h)?;
-
-            let (q_dim, kv_dim, head_dim, qkv_bias, qk_norm) = match layer.seq_mixer {
-                SequenceMixerDescriptor::GroupedQueryAttention {
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    qkv_bias,
-                    qk_norm,
-                    ..
-                } => (
-                    num_q_heads as usize * head_dim as usize,
-                    num_kv_heads as usize * head_dim as usize,
-                    head_dim as usize,
-                    qkv_bias,
-                    qk_norm.is_some(),
-                ),
-                _ => (h, h, 64, false, false),
-            };
-            let inter = match layer.channel_mixer {
-                ChannelMixerDescriptor::DenseMlp {
-                    intermediate_size, ..
-                } => intermediate_size as usize,
-                _ => h * 4,
-            };
-
-            let q_proj = bind_q4(&format!("{p}.self_attn.q_proj"), &[q_dim, h])?;
-            let k_proj = bind_q4(&format!("{p}.self_attn.k_proj"), &[kv_dim, h])?;
-            let v_proj = bind_q4(&format!("{p}.self_attn.v_proj"), &[kv_dim, h])?;
-            let o_proj = bind_q4(&format!("{p}.self_attn.o_proj"), &[h, q_dim])?;
-
-            let q_bias = if qkv_bias {
-                bind_bf16(&format!("{p}.self_attn.q_proj.bias"), q_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-            let k_bias = if qkv_bias {
-                bind_bf16(&format!("{p}.self_attn.k_proj.bias"), kv_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-            let v_bias = if qkv_bias {
-                bind_bf16(&format!("{p}.self_attn.v_proj.bias"), kv_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-
-            let q_norm = if qk_norm {
-                bind_bf16(&format!("{p}.self_attn.q_norm.weight"), head_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-            let k_norm = if qk_norm {
-                bind_bf16(&format!("{p}.self_attn.k_norm.weight"), head_dim)?
-            } else {
-                device.new_buffer(4, shared)
-            };
-
-            let (ffn_norm, post_attn_norm, post_ffn_norm) =
-                if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
-                    let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
-                    let post_att = if layer.post_attn_norm.is_some() {
-                        Some(bind_bf16(
-                            &format!("{p}.post_attention_layernorm.weight"),
-                            h,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let post_ff = if layer.post_ffn_norm.is_some() {
-                        Some(bind_bf16(
-                            &format!("{p}.post_feedforward_layernorm.weight"),
-                            h,
-                        )?)
-                    } else {
-                        None
-                    };
-                    (pre, post_att, post_ff)
-                } else {
-                    let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
-                    (norm, None, None)
-                };
-
-            let gate_proj = bind_q4(&format!("{p}.mlp.gate_proj"), &[inter, h])?;
-            let up_proj = bind_q4(&format!("{p}.mlp.up_proj"), &[inter, h])?;
-            let down_proj = bind_q4(&format!("{p}.mlp.down_proj"), &[h, inter])?;
-            let moe_router_gate = device.new_buffer(4, shared);
-
-            layers.push(LayerGpuBuffers {
-                attn_norm,
-                q_proj,
-                k_proj,
-                v_proj,
-                q_bias,
-                k_bias,
-                v_bias,
-                o_proj,
-                q_norm,
-                k_norm,
-                post_attn_norm,
-                ffn_norm,
-                post_ffn_norm,
-                gate_proj,
-                up_proj,
-                down_proj,
-                moe_router_gate,
-            });
+        for idx in 0..desc.layers.len() {
+            layers.push(Self::load_layer_from_checkpoint(
+                &loader, device, desc, idx,
+            )?);
         }
 
         Ok(ModelGpuWeights {
@@ -885,6 +782,211 @@ impl ModelGpuWeights {
             final_norm,
             lm_head,
             _loader: Some(loader),
+            streamer: None,
+        })
+    }
+
+    /// Loads model weights configured for double-buffered NVMe SSD layer streaming ("LLM in a Flash").
+    /// Only embeddings, final norm, LM head, and TWO active layer buffers remain in GPU memory.
+    pub fn from_checkpoint_dir_streaming<P: AsRef<Path>>(
+        device: &Device,
+        desc: &ModelArchDescriptor,
+        checkpoint_dir: P,
+    ) -> Result<Self, MetalError> {
+        Self::validate_production_checkpoint(desc, checkpoint_dir.as_ref())?;
+
+        let loader = Arc::new(ShardedCheckpointLoader::open_directory(checkpoint_dir)?);
+        let h = desc.hidden_size as usize;
+        let vocab = desc.vocab_size as usize;
+
+        let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
+            Self::bind_q4_buffer(&loader, device, prefix, Some(expected_shape))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {prefix}"))
+            })
+        };
+
+        let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
+            Self::bind_bf16_buffer(&loader, device, name, Some(expected_len))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {name}"))
+            })
+        };
+
+        let embed_tokens = bind_q4("model.embed_tokens", &[vocab, h])?;
+        let final_norm = bind_bf16("model.norm.weight", h)?;
+        let lm_head = if desc.tie_word_embeddings {
+            embed_tokens.clone()
+        } else {
+            bind_q4("lm_head", &[vocab, h])?
+        };
+
+        let streamer = crate::layer_streamer::DoubleBufferedLayerStreamer::new(
+            loader.clone(),
+            device.clone(),
+            desc.clone(),
+        )?;
+
+        Ok(ModelGpuWeights {
+            embed_tokens,
+            layers: Vec::new(),
+            final_norm,
+            lm_head,
+            _loader: Some(loader),
+            streamer: Some(Arc::new(std::sync::Mutex::new(streamer))),
+        })
+    }
+
+    /// Returns the GPU weight buffers for a specific layer.
+    /// In standard mode, returns a clone of the pinned layer buffer handles.
+    /// In streaming mode, fetches from the double-buffered streaming slots and prefetches the next layer.
+    #[inline]
+    pub fn layer(&self, l_idx: usize) -> LayerGpuBuffers {
+        if let Some(streamer) = &self.streamer {
+            streamer
+                .lock()
+                .unwrap()
+                .get_layer(l_idx)
+                .expect("Failed to stream layer from SSD")
+        } else {
+            self.layers[l_idx].clone()
+        }
+    }
+
+    /// Returns true if weights are streamed asynchronously from SSD rather than fully pinned in RAM.
+    #[inline]
+    pub fn is_streaming(&self) -> bool {
+        self.streamer.is_some()
+    }
+
+    /// Strictly loads a single layer's GPU buffers from a checkpoint archive.
+    pub fn load_layer_from_checkpoint(
+        loader: &ShardedCheckpointLoader,
+        device: &Device,
+        desc: &ModelArchDescriptor,
+        idx: usize,
+    ) -> Result<LayerGpuBuffers, MetalError> {
+        let h = desc.hidden_size as usize;
+        let layer = &desc.layers[idx];
+        let p = format!("model.layers.{idx}");
+        let shared = MTLResourceOptions::StorageModeShared;
+
+        let bind_q4 = |prefix: &str, expected_shape: &[usize]| -> Result<Buffer, MetalError> {
+            Self::bind_q4_buffer(loader, device, prefix, Some(expected_shape))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {prefix}"))
+            })
+        };
+
+        let bind_bf16 = |name: &str, expected_len: usize| -> Result<Buffer, MetalError> {
+            Self::bind_bf16_buffer(loader, device, name, Some(expected_len))?.ok_or_else(|| {
+                MetalError::UnsupportedProductionConfiguration(format!("Missing tensor {name}"))
+            })
+        };
+
+        let attn_norm = bind_bf16(&format!("{p}.input_layernorm.weight"), h)?;
+
+        let (q_dim, kv_dim, head_dim, qkv_bias, qk_norm) = match layer.seq_mixer {
+            SequenceMixerDescriptor::GroupedQueryAttention {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                qkv_bias,
+                qk_norm,
+                ..
+            } => (
+                num_q_heads as usize * head_dim as usize,
+                num_kv_heads as usize * head_dim as usize,
+                head_dim as usize,
+                qkv_bias,
+                qk_norm.is_some(),
+            ),
+            _ => (h, h, 64, false, false),
+        };
+        let inter = match layer.channel_mixer {
+            ChannelMixerDescriptor::DenseMlp {
+                intermediate_size, ..
+            } => intermediate_size as usize,
+            _ => h * 4,
+        };
+
+        let q_proj = bind_q4(&format!("{p}.self_attn.q_proj"), &[q_dim, h])?;
+        let k_proj = bind_q4(&format!("{p}.self_attn.k_proj"), &[kv_dim, h])?;
+        let v_proj = bind_q4(&format!("{p}.self_attn.v_proj"), &[kv_dim, h])?;
+        let o_proj = bind_q4(&format!("{p}.self_attn.o_proj"), &[h, q_dim])?;
+
+        let q_bias = if qkv_bias {
+            bind_bf16(&format!("{p}.self_attn.q_proj.bias"), q_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+        let k_bias = if qkv_bias {
+            bind_bf16(&format!("{p}.self_attn.k_proj.bias"), kv_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+        let v_bias = if qkv_bias {
+            bind_bf16(&format!("{p}.self_attn.v_proj.bias"), kv_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+
+        let q_norm = if qk_norm {
+            bind_bf16(&format!("{p}.self_attn.q_norm.weight"), head_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+        let k_norm = if qk_norm {
+            bind_bf16(&format!("{p}.self_attn.k_norm.weight"), head_dim)?
+        } else {
+            device.new_buffer(4, shared)
+        };
+
+        let (ffn_norm, post_attn_norm, post_ffn_norm) =
+            if layer.post_attn_norm.is_some() || layer.post_ffn_norm.is_some() {
+                let pre = bind_bf16(&format!("{p}.pre_feedforward_layernorm.weight"), h)?;
+                let post_att = if layer.post_attn_norm.is_some() {
+                    Some(bind_bf16(
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        h,
+                    )?)
+                } else {
+                    None
+                };
+                let post_ff = if layer.post_ffn_norm.is_some() {
+                    Some(bind_bf16(
+                        &format!("{p}.post_feedforward_layernorm.weight"),
+                        h,
+                    )?)
+                } else {
+                    None
+                };
+                (pre, post_att, post_ff)
+            } else {
+                let norm = bind_bf16(&format!("{p}.post_attention_layernorm.weight"), h)?;
+                (norm, None, None)
+            };
+
+        let gate_proj = bind_q4(&format!("{p}.mlp.gate_proj"), &[inter, h])?;
+        let up_proj = bind_q4(&format!("{p}.mlp.up_proj"), &[inter, h])?;
+        let down_proj = bind_q4(&format!("{p}.mlp.down_proj"), &[h, inter])?;
+        let moe_router_gate = device.new_buffer(4, shared);
+
+        Ok(LayerGpuBuffers {
+            attn_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            q_bias,
+            k_bias,
+            v_bias,
+            o_proj,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffn_norm,
+            gate_proj,
+            up_proj,
+            down_proj,
+            moe_router_gate,
         })
     }
 
@@ -1164,6 +1266,7 @@ impl ModelGpuWeights {
             final_norm,
             lm_head,
             _loader: None,
+            streamer: None,
         }
     }
 }
@@ -1373,6 +1476,7 @@ impl MetalExecutor {
             num_kv_blocks,
             block_size_tokens,
             false,
+            false,
         )
     }
 
@@ -1393,6 +1497,28 @@ impl MetalExecutor {
             num_kv_blocks,
             block_size_tokens,
             true,
+            false,
+        )
+    }
+
+    /// Creates an executor utilizing double-buffered NVMe SSD layer streaming ("LLM in a Flash").
+    /// Keeps only 2 active transformer layers in GPU memory, allowing 14B-80B models to execute
+    /// within 8 GB-16 GB memory budgets.
+    pub fn new_streaming<P: AsRef<Path>>(
+        descriptor: &ModelArchDescriptor,
+        shader_dir: P,
+        checkpoint_dir: &Path,
+        num_kv_blocks: u32,
+        block_size_tokens: u32,
+    ) -> Result<Self, MetalError> {
+        Self::new_internal(
+            descriptor,
+            shader_dir,
+            Some(checkpoint_dir),
+            num_kv_blocks,
+            block_size_tokens,
+            true,
+            true,
         )
     }
 
@@ -1403,6 +1529,7 @@ impl MetalExecutor {
         num_kv_blocks: u32,
         block_size_tokens: u32,
         production_mode: bool,
+        streaming_mode: bool,
     ) -> Result<Self, MetalError> {
         let device = Device::system_default().ok_or_else(|| {
             MetalError::DeviceInitFailed("No Apple Silicon Metal GPU found".into())
@@ -1434,6 +1561,8 @@ impl MetalExecutor {
             "q4_g64_batched_simdgroup_gemm_m64",
             "q4_g64_batched_simdgroup_qkv_gemm_m64",
             "q4_g64_batched_simdgroup_gate_up_swiglu_gemm_m64",
+            "q2_g128_decode_gemv_4row",
+            "q3_g64_decode_gemv_4row",
             "moe_router_topk_and_histogram",
             "moe_router_prefix_scan_and_scatter",
             "q4_g64_routed_moe_gemv",
@@ -1457,7 +1586,9 @@ impl MetalExecutor {
         }
 
         let weights = if let Some(ckpt) = checkpoint_dir {
-            if production_mode {
+            if streaming_mode {
+                ModelGpuWeights::from_checkpoint_dir_streaming(&device, descriptor, ckpt)?
+            } else if production_mode {
                 ModelGpuWeights::from_checkpoint_dir_strict(&device, descriptor, ckpt)?
             } else {
                 ModelGpuWeights::from_checkpoint_dir(&device, descriptor, ckpt)?
@@ -2015,6 +2146,80 @@ impl MetalExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn encode_q2_linear(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        weight_buf: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        output_buf: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), MetalError> {
+        let params = GemmParams {
+            m,
+            n,
+            k,
+            num_k_blocks: k.div_ceil(128),
+        };
+        let total_tgs = n.div_ceil(4) as u64;
+        let persistent_tgs = total_tgs.min(128);
+        let grid = MTLSize::new(persistent_tgs, 1, 1);
+        let threads = MTLSize::new(128, 1, 1);
+
+        let pso = pipeline_cache.get_or_compile("q2_g128_decode_gemv_4row")?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(weight_buf), 0);
+        encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(2, Some(output_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(grid, threads);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_q3_linear(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        weight_buf: &Buffer,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        output_buf: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<(), MetalError> {
+        let params = GemmParams {
+            m,
+            n,
+            k,
+            num_k_blocks: k.div_ceil(64),
+        };
+        let total_tgs = n.div_ceil(4) as u64;
+        let persistent_tgs = total_tgs.min(128);
+        let grid = MTLSize::new(persistent_tgs, 1, 1);
+        let threads = MTLSize::new(128, 1, 1);
+
+        let pso = pipeline_cache.get_or_compile("q3_g64_decode_gemv_4row")?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(weight_buf), 0);
+        encoder.set_buffer(1, Some(input_buf), input_byte_offset);
+        encoder.set_buffer(2, Some(output_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParams>() as u64,
+            &params as *const _ as *const _,
+        );
+        encoder.dispatch_thread_groups(grid, threads);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn encode_q4_linear_accumulate(
         pipeline_cache: &mut MetalPipelineCache,
         encoder: &ComputeCommandEncoderRef,
@@ -2441,7 +2646,12 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
+            let max_chunk = if self.weights.is_streaming() {
+                1
+            } else {
+                WATCHDOG_CHUNK_LAYERS
+            };
+            if layers_in_chunk >= max_chunk && !is_last_layer {
                 enc.end_encoding();
                 cmd_buf.commit();
                 self.wait_for_gpu(cmd_buf).await?;
@@ -2637,7 +2847,7 @@ impl MetalExecutor {
 
         // 2. Execute all Transformer layers (tree mode — no KV cache writes)
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            let lw = &self.weights.layers[l_idx];
+            let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm
@@ -2920,7 +3130,7 @@ impl MetalExecutor {
                     Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        lw,
+                        &lw,
                         &self.norm_out_buf,
                         &self.gate_buf,
                         &self.up_buf,
@@ -3598,7 +3808,7 @@ impl MetalExecutor {
         let mut layers_in_chunk = 0usize;
         let num_layers = descriptor.layers.len();
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            let lw = &self.weights.layers[l_idx];
+            let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm (batched)
@@ -3852,7 +4062,7 @@ impl MetalExecutor {
                     Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        lw,
+                        &lw,
                         &self.norm_out_buf,
                         &self.gate_buf,
                         &self.up_buf,
@@ -4102,7 +4312,12 @@ impl MetalExecutor {
 
             layers_in_chunk += 1;
             let is_last_layer = l_idx + 1 == num_layers;
-            if layers_in_chunk >= WATCHDOG_CHUNK_LAYERS && !is_last_layer {
+            let max_chunk = if self.weights.is_streaming() {
+                1
+            } else {
+                WATCHDOG_CHUNK_LAYERS
+            };
+            if layers_in_chunk >= max_chunk && !is_last_layer {
                 enc.end_encoding();
                 cmd_buf.commit();
                 self.wait_for_gpu(cmd_buf).await?;
@@ -4314,7 +4529,7 @@ impl MetalExecutor {
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
-            let lw = &self.weights.layers[l_idx];
+            let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
             let eps = Self::norm_eps(&layer.attn_norm);
             // 2a. Pre-Attention RMSNorm
@@ -4663,7 +4878,7 @@ impl MetalExecutor {
                     Self::encode_dense_mlp(
                         &mut self.pipeline_cache,
                         enc,
-                        lw,
+                        &lw,
                         &self.norm_out_buf,
                         &self.gate_buf,
                         &self.up_buf,

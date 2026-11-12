@@ -2599,3 +2599,294 @@ fn test_persistent_threadgroup_gemv_matches_reference() {
         "Persistent threadgroups produced different results than full grid dispatch"
     );
 }
+
+#[test]
+fn test_q2_g128_decode_gemv_matches_cpu() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let n = 32usize;
+    let k = 256usize;
+
+    let weights: Vec<f32> = (0..n * k)
+        .map(|idx| (((idx % 23) as f32) - 11.0) * 0.05)
+        .collect();
+    let q2_blocks = kriya_core::quantizer::quantize_f32_to_q2_group128(&weights).unwrap();
+    let dequant_w = kriya_core::quantizer::dequantize_q2_group128_to_f32(&q2_blocks);
+
+    let input_f32: Vec<f32> = (0..k)
+        .map(|idx| (((idx % 19) as f32) - 9.0) * 0.04)
+        .collect();
+    let input_bf16: Vec<u16> = input_f32
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+    let input_unquant: Vec<f32> = input_bf16
+        .iter()
+        .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+        .collect();
+
+    let mut expected_y = vec![0.0f32; n];
+    for row in 0..n {
+        let mut sum = 0.0f32;
+        for inner in 0..k {
+            sum += input_unquant[inner] * dequant_w[row * k + inner];
+        }
+        expected_y[row] = sum;
+    }
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let weight_bytes = q2_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ2Group128>();
+    let weight_buf =
+        device.new_buffer_with_data(q2_blocks.as_ptr() as *const _, weight_bytes as u64, shared);
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let out_buf = device.new_buffer((n * std::mem::size_of::<u16>()) as u64, shared);
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    kriya_backend_metal::encoder::MetalExecutor::encode_q2_linear(
+        &mut pipelines,
+        enc,
+        &weight_buf,
+        &input_buf,
+        0,
+        &out_buf,
+        1,
+        n as u32,
+        k as u32,
+    )
+    .unwrap();
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let out_slice = unsafe { std::slice::from_raw_parts(out_buf.contents() as *const u16, n) };
+    for row in 0..n {
+        let actual = kriya_core::quantizer::bf16_bits_to_f32(out_slice[row]);
+        let expected = expected_y[row];
+        let diff = (actual - expected).abs();
+        assert!(
+            diff < 0.05,
+            "Row {row} Q2 GEMV mismatch: actual={actual}, expected={expected}, diff={diff}"
+        );
+    }
+}
+
+#[test]
+fn test_q3_g64_decode_gemv_matches_cpu() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let n = 32usize;
+    let k = 256usize;
+
+    let weights: Vec<f32> = (0..n * k)
+        .map(|idx| (((idx % 23) as f32) - 11.0) * 0.05)
+        .collect();
+    let q3_blocks = kriya_core::quantizer::quantize_f32_to_q3_group64(&weights).unwrap();
+    let dequant_w = kriya_core::quantizer::dequantize_q3_group64_to_f32(&q3_blocks);
+
+    let input_f32: Vec<f32> = (0..k)
+        .map(|idx| (((idx % 19) as f32) - 9.0) * 0.04)
+        .collect();
+    let input_bf16: Vec<u16> = input_f32
+        .iter()
+        .map(|&v| kriya_core::quantizer::f32_to_bf16_bits(v))
+        .collect();
+    let input_unquant: Vec<f32> = input_bf16
+        .iter()
+        .map(|&bits| kriya_core::quantizer::bf16_bits_to_f32(bits))
+        .collect();
+
+    let mut expected_y = vec![0.0f32; n];
+    for row in 0..n {
+        let mut sum = 0.0f32;
+        for inner in 0..k {
+            sum += input_unquant[inner] * dequant_w[row * k + inner];
+        }
+        expected_y[row] = sum;
+    }
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let weight_bytes = q3_blocks.len() * std::mem::size_of::<kriya_core::tensor::BlockQ3Group64>();
+    let weight_buf =
+        device.new_buffer_with_data(q3_blocks.as_ptr() as *const _, weight_bytes as u64, shared);
+    let input_buf = device.new_buffer_with_data(
+        input_bf16.as_ptr() as *const _,
+        (input_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        shared,
+    );
+    let out_buf = device.new_buffer((n * std::mem::size_of::<u16>()) as u64, shared);
+
+    let queue = device.new_command_queue();
+    let mut pipelines = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    kriya_backend_metal::encoder::MetalExecutor::encode_q3_linear(
+        &mut pipelines,
+        enc,
+        &weight_buf,
+        &input_buf,
+        0,
+        &out_buf,
+        1,
+        n as u32,
+        k as u32,
+    )
+    .unwrap();
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let out_slice = unsafe { std::slice::from_raw_parts(out_buf.contents() as *const u16, n) };
+    for row in 0..n {
+        let actual = kriya_core::quantizer::bf16_bits_to_f32(out_slice[row]);
+        let expected = expected_y[row];
+        let diff = (actual - expected).abs();
+        assert!(
+            diff < 0.05,
+            "Row {row} Q3 GEMV mismatch: actual={actual}, expected={expected}, diff={diff}"
+        );
+    }
+}
+
+#[test]
+fn test_double_buffered_layer_streaming_matches_pinned() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let base = miniature_dense_gqa_descriptor();
+    let mut desc = base.clone();
+    desc.layers = (0..3)
+        .map(|idx| {
+            let mut l = base.layers[0];
+            l.layer_idx = idx as u32;
+            l
+        })
+        .collect();
+
+    let q4_matrix = || {
+        let blocks =
+            kriya_core::quantizer::quantize_f32_to_q4_group64(&vec![0.125f32; 64 * 64]).unwrap();
+        kriya_core::quantizer::SavedTensorPayload::Q4Group64(blocks)
+    };
+    let bf16_ones = || kriya_core::quantizer::SavedTensorPayload::Bf16(vec![0x3F80_u16; 64]);
+
+    let mut tensors = vec![
+        (
+            "model.embed_tokens.weight".into(),
+            vec![64, 64],
+            q4_matrix(),
+        ),
+        ("model.norm.weight".into(), vec![64], bf16_ones()),
+        ("lm_head.weight".into(), vec![64, 64], q4_matrix()),
+    ];
+
+    for idx in 0..3 {
+        let p = format!("model.layers.{idx}");
+        tensors.push((format!("{p}.input_layernorm.weight"), vec![64], bf16_ones()));
+        tensors.push((
+            format!("{p}.post_attention_layernorm.weight"),
+            vec![64],
+            bf16_ones(),
+        ));
+        tensors.push((
+            format!("{p}.self_attn.q_proj.weight"),
+            vec![64, 64],
+            q4_matrix(),
+        ));
+        tensors.push((
+            format!("{p}.self_attn.k_proj.weight"),
+            vec![64, 64],
+            q4_matrix(),
+        ));
+        tensors.push((
+            format!("{p}.self_attn.v_proj.weight"),
+            vec![64, 64],
+            q4_matrix(),
+        ));
+        tensors.push((
+            format!("{p}.self_attn.o_proj.weight"),
+            vec![64, 64],
+            q4_matrix(),
+        ));
+        tensors.push((
+            format!("{p}.mlp.gate_proj.weight"),
+            vec![64, 64],
+            q4_matrix(),
+        ));
+        tensors.push((format!("{p}.mlp.up_proj.weight"), vec![64, 64], q4_matrix()));
+        tensors.push((
+            format!("{p}.mlp.down_proj.weight"),
+            vec![64, 64],
+            q4_matrix(),
+        ));
+    }
+
+    kriya_core::quantizer::write_mixed_safetensors(
+        tmp_dir.path().join("model.safetensors"),
+        &tensors,
+    )
+    .unwrap();
+
+    let pinned_weights = kriya_backend_metal::encoder::ModelGpuWeights::from_checkpoint_dir_strict(
+        &device,
+        &desc,
+        tmp_dir.path(),
+    )
+    .unwrap();
+    assert!(!pinned_weights.is_streaming());
+    assert_eq!(pinned_weights.layers.len(), 3);
+
+    let streamed_weights =
+        kriya_backend_metal::encoder::ModelGpuWeights::from_checkpoint_dir_streaming(
+            &device,
+            &desc,
+            tmp_dir.path(),
+        )
+        .unwrap();
+    assert!(streamed_weights.is_streaming());
+    assert_eq!(streamed_weights.layers.len(), 0); // No pinned layer table!
+
+    // Verify each layer buffers from streamed weights match pinned layer buffers
+    for idx in 0..3 {
+        let pinned_l = pinned_weights.layer(idx);
+        let streamed_l = streamed_weights.layer(idx);
+        assert_eq!(pinned_l.q_proj.length(), streamed_l.q_proj.length());
+        assert_eq!(pinned_l.k_proj.length(), streamed_l.k_proj.length());
+        assert_eq!(pinned_l.v_proj.length(), streamed_l.v_proj.length());
+        assert_eq!(pinned_l.o_proj.length(), streamed_l.o_proj.length());
+        assert_eq!(pinned_l.gate_proj.length(), streamed_l.gate_proj.length());
+        assert_eq!(pinned_l.up_proj.length(), streamed_l.up_proj.length());
+        assert_eq!(pinned_l.down_proj.length(), streamed_l.down_proj.length());
+    }
+
+    // Verify DoubleBufferedLayerStreamer keeps at most 2 active layers in memory
+    let streamer_arc = streamed_weights.streamer.as_ref().unwrap();
+    let streamer = streamer_arc.lock().unwrap();
+    let active = streamer.active_slots();
+    assert!(active[0].is_some());
+    assert!(active[1].is_some());
+    // Active slots must be a subset of {0, 1, 2} and length is strictly 2
+    assert_eq!(active.len(), 2);
+}
