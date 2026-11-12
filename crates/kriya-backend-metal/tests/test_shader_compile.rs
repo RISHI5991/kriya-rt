@@ -1149,6 +1149,7 @@ fn test_paged_attention_matches_cpu_reference_on_metal() {
             std::mem::size_of_val(&rope_params) as u64,
             &rope_params as *const _ as *const _,
         );
+        enc.set_buffer(12, None, 0);
         enc.dispatch_thread_groups(MTLSize::new(2, 1, 1), MTLSize::new(32, 1, 1));
 
         enc.set_compute_pipeline_state(
@@ -2182,8 +2183,7 @@ fn test_eagle_topk_and_probs_matches_cpu() {
 
 #[test]
 fn test_precomputed_rope_matches_transcendental() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping test: no Metal GPU available");
+    let Some(device) = require_metal_device() else {
         return;
     };
     let shared = MTLResourceOptions::StorageModeShared;
@@ -2356,8 +2356,7 @@ fn test_precomputed_rope_matches_transcendental() {
 
 #[test]
 fn test_fused_residual_add_rmsnorm_matches_unfused() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping test: no Metal GPU available");
+    let Some(device) = require_metal_device() else {
         return;
     };
     let shared = MTLResourceOptions::StorageModeShared;
@@ -2501,8 +2500,7 @@ fn test_fused_residual_add_rmsnorm_matches_unfused() {
 
 #[test]
 fn test_persistent_threadgroup_gemv_matches_reference() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("Skipping test: no Metal GPU available");
+    let Some(device) = require_metal_device() else {
         return;
     };
     let shared = MTLResourceOptions::StorageModeShared;

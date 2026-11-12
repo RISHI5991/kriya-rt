@@ -1185,6 +1185,12 @@ kernel void bsr_paged_gqa_tiled_mma_prefill(
     uint                           simd_id         [[simdgroup_index_in_threadgroup]],
     uint                           lane_id         [[thread_index_in_simdgroup]]
 ) {
+    (void)simd_id;
+    (void)cta_tiles;
+    (void)tile_split_idx;
+    (void)partial_out;
+    (void)partial_lse;
+
     const uint q_tile     = tgp_id.x; // Query tile index (16 tokens per tile)
     const uint q_base_pos = q_tile * 16u;
     const uint q_head     = tgp_id.y; // Query head index

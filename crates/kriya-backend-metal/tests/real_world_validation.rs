@@ -459,6 +459,7 @@ fn test_bsr_paged_gqa_real_dimensions() {
             std::mem::size_of_val(&rope_params) as u64,
             &rope_params as *const _ as *const _,
         );
+        enc.set_buffer(12, None, 0);
         enc.dispatch_thread_groups(
             MTLSize::new((NUM_Q_HEADS + NUM_KV_HEADS) as u64, 1, 1),
             MTLSize::new(32, 1, 1),

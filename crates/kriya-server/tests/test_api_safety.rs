@@ -221,8 +221,18 @@ async fn test_api_streaming_sse() {
 
     let _ = worker.await;
     // Verify active requests cleaned up after stream completion
-    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-    assert_eq!(handle.metrics.active_requests.load(Ordering::Relaxed), 0);
+    let mut cleaned_up = false;
+    for _ in 0..100 {
+        if handle.metrics.active_requests.load(Ordering::Relaxed) == 0 {
+            cleaned_up = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        cleaned_up,
+        "Active requests gauge must return to zero after all completions"
+    );
 }
 
 #[tokio::test]
@@ -299,10 +309,16 @@ async fn test_server_concurrent_requests_isolation_and_cancellation() {
     assert_eq!(results[3], 1);
 
     let _ = worker.await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    assert_eq!(
-        handle.metrics.active_requests.load(Ordering::Relaxed),
-        0,
+    let mut cleaned_up = false;
+    for _ in 0..100 {
+        if handle.metrics.active_requests.load(Ordering::Relaxed) == 0 {
+            cleaned_up = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        cleaned_up,
         "Active requests gauge must return to zero after all completions and drops"
     );
 }
