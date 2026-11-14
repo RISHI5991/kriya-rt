@@ -119,7 +119,7 @@ impl EngineRuntime {
 
     /// Builds EAGLE only from an explicitly supplied, trained draft-head artifact.
     /// Missing, malformed, and incompatible artifacts leave speculation disabled.
-    fn build_draft_engine(
+    pub(crate) fn build_draft_engine(
         descriptor: &ModelArchDescriptor,
         executor: &mut MetalExecutor,
         checkpoint_dir: &Path,
@@ -215,6 +215,23 @@ impl EngineRuntime {
                 artifact_path.display()
             );
             return None;
+        }
+
+        if !engine.is_trained {
+            let allow_untrained = std::env::var("KRIYA_ALLOW_UNTRAINED_DRAFT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !allow_untrained {
+                eprintln!(
+                    "KriyaRT: speculative decoding disabled; draft head at {} is marked untrained (is_trained=0). Train it using kriya_train_eagle or set KRIYA_ALLOW_UNTRAINED_DRAFT=1 to override.",
+                    artifact_path.display()
+                );
+                return None;
+            }
+            eprintln!(
+                "KriyaRT: WARNING: Loading untrained EAGLE draft head from {} because KRIYA_ALLOW_UNTRAINED_DRAFT=1 is set.",
+                artifact_path.display()
+            );
         }
 
         if let Err(err) = executor
@@ -832,15 +849,36 @@ impl EngineRuntime {
         let ttft_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         let mut generated_ids = Vec::new();
+        let mut decoded_prefix_len = 0usize;
         let decode_start = Instant::now();
 
         if let Ok(tok) = rx.try_recv()
             && tok != self.tokenizer.eos_token_id
         {
-            let piece = self.tokenizer.decode(&[tok], true).unwrap_or_default();
-            print!("{}", piece);
-            let _ = std::io::stdout().flush();
             generated_ids.push(tok);
+            let full = self
+                .tokenizer
+                .decode(&generated_ids, true)
+                .unwrap_or_default();
+            let valid = if full.ends_with('\u{FFFD}') {
+                full.trim_end_matches('\u{FFFD}')
+            } else {
+                &full
+            };
+            if valid.len() > decoded_prefix_len {
+                let safe_idx = if valid.is_char_boundary(decoded_prefix_len) {
+                    decoded_prefix_len
+                } else {
+                    valid
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .find(|&i| i >= decoded_prefix_len)
+                        .unwrap_or(valid.len())
+                };
+                print!("{}", &valid[safe_idx..]);
+                let _ = std::io::stdout().flush();
+                decoded_prefix_len = valid.len();
+            }
         }
 
         while active_streams.contains_key(&req_id) {
@@ -851,11 +889,48 @@ impl EngineRuntime {
                 if tok == self.tokenizer.eos_token_id {
                     break;
                 }
-                let piece = self.tokenizer.decode(&[tok], true).unwrap_or_default();
-                print!("{}", piece);
-                let _ = std::io::stdout().flush();
                 generated_ids.push(tok);
+                let full = self
+                    .tokenizer
+                    .decode(&generated_ids, true)
+                    .unwrap_or_default();
+                let valid = if full.ends_with('\u{FFFD}') {
+                    full.trim_end_matches('\u{FFFD}')
+                } else {
+                    &full
+                };
+                if valid.len() > decoded_prefix_len {
+                    let safe_idx = if valid.is_char_boundary(decoded_prefix_len) {
+                        decoded_prefix_len
+                    } else {
+                        valid
+                            .char_indices()
+                            .map(|(i, _)| i)
+                            .find(|&i| i >= decoded_prefix_len)
+                            .unwrap_or(valid.len())
+                    };
+                    print!("{}", &valid[safe_idx..]);
+                    let _ = std::io::stdout().flush();
+                    decoded_prefix_len = valid.len();
+                }
             }
+        }
+        let final_text = self
+            .tokenizer
+            .decode(&generated_ids, true)
+            .unwrap_or_default();
+        if final_text.len() > decoded_prefix_len {
+            let safe_idx = if final_text.is_char_boundary(decoded_prefix_len) {
+                decoded_prefix_len
+            } else {
+                final_text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= decoded_prefix_len)
+                    .unwrap_or(final_text.len())
+            };
+            print!("{}", &final_text[safe_idx..]);
+            let _ = std::io::stdout().flush();
         }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         println!("\n");

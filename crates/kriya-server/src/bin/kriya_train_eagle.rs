@@ -10,34 +10,13 @@
 
 use kriya_backend_metal::encoder::{MetalExecutor, SamplingConfig};
 use kriya_core::quantizer::HuggingFaceModelConfig;
+use kriya_core::safetensors_loader::sha256_file;
 use kriya_core::tokenizer::KriyaTokenizer;
 use kriya_kv::bsr_paged::PagedKvCacheManager;
 use kriya_speculate::eagle_medusa::{DeterministicRng, EagleDraftEngine};
 use kriya_speculate::trainer::{EagleTrainer, EagleTrainingConfig, FeatureStepSample};
-use ring::digest::{Context, SHA256};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|err| err.to_string())?;
-    let mut context = Context::new(&SHA256);
-    let mut chunk = [0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut chunk).map_err(|err| err.to_string())?;
-        if read == 0 {
-            break;
-        }
-        context.update(&chunk[..read]);
-    }
-    Ok(context
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
 
 fn update_manifest(manifest_path: &Path, draft_file_name: &str, byte_len: u64, sha256: &str) {
     if !manifest_path.is_file() {

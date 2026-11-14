@@ -30,3 +30,7 @@ models/
 *.bin
 *.pt
 *.gguf
+
+# Benchmark outputs
+benchmarks/reports/*.json
+

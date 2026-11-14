@@ -205,6 +205,7 @@ async fn test_api_streaming_sse() {
     let mut body_stream = res.into_body().into_data_stream();
     let mut total_chunks = 0;
     let mut chunk_texts = Vec::new();
+    let mut saw_done = false;
 
     while let Some(chunk_res) = body_stream.next().await {
         let chunk = chunk_res.unwrap();
@@ -213,9 +214,13 @@ async fn test_api_streaming_sse() {
             total_chunks += 1;
             chunk_texts.push(text.to_string());
         }
+        if text.contains("[DONE]") {
+            saw_done = true;
+        }
     }
 
     assert_eq!(total_chunks, 2);
+    assert!(saw_done, "Terminal event must be data: [DONE]");
     assert!(chunk_texts[0].contains("tok201"));
     assert!(chunk_texts[1].contains("tok202"));
 
@@ -358,4 +363,185 @@ async fn test_health_and_metrics_endpoints() {
     assert!(metrics_str.contains("kriya_engine_info"));
     assert!(metrics_str.contains("kriya_active_requests 0"));
     assert!(metrics_str.contains("kriya_server_uptime_seconds"));
+    // Uptime should be a reasonable duration (< 1000s), not Unix epoch timestamp (~1.7B)
+    for line in metrics_str.lines() {
+        if line.starts_with("kriya_server_uptime_seconds ") {
+            let val: u64 = line
+                .strip_prefix("kriya_server_uptime_seconds ")
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(
+                val < 1000,
+                "Server uptime should be elapsed time since start, not epoch timestamp (was {val})"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_untrained_draft_head_detection() {
+    use kriya_speculate::eagle_medusa::EagleDraftEngine;
+
+    let h = 8;
+    let v = 16;
+    let mut engine =
+        EagleDraftEngine::new_gpu_backed(h, v, vec![0.0; h * 2 * h], vec![0.0; h * h]).unwrap();
+    assert!(!engine.is_trained, "New engine must default to untrained");
+    let weights = engine.save_weights();
+
+    let mut loaded =
+        EagleDraftEngine::new_gpu_backed(h, v, vec![0.0; h * 2 * h], vec![0.0; h * h]).unwrap();
+    loaded.load_weights(&weights).unwrap();
+    assert!(
+        !loaded.is_trained,
+        "Untrained draft head weights must preserve is_trained=false"
+    );
+
+    // After training
+    engine.is_trained = true;
+    let trained_weights = engine.save_weights();
+    loaded.load_weights(&trained_weights).unwrap();
+    assert!(
+        loaded.is_trained,
+        "Trained draft head weights must preserve is_trained=true"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_utf8_split_character_detokenization() {
+    struct Utf8SplitMockTokenizer;
+    impl kriya_server::server::admission::TokenizerService for Utf8SplitMockTokenizer {
+        fn encode(
+            &self,
+            _text: &str,
+            _add_special: bool,
+        ) -> Result<Vec<u32>, kriya_core::tokenizer::TokenizerError> {
+            Ok(vec![1])
+        }
+        fn decode(
+            &self,
+            ids: &[u32],
+            _skip_special: bool,
+        ) -> Result<String, kriya_core::tokenizer::TokenizerError> {
+            if ids == [301] {
+                // Emulate incomplete UTF-8 character yielding replacement character at end
+                Ok("prefix \u{FFFD}".to_string())
+            } else if ids == [301, 302] {
+                // Second token completes 4-byte UTF-8 emoji
+                Ok("prefix 🦀".to_string())
+            } else {
+                Ok(ids
+                    .iter()
+                    .map(|id| format!("{id}"))
+                    .collect::<Vec<_>>()
+                    .join(" "))
+            }
+        }
+        fn encode_chat_messages(
+            &self,
+            _messages: &[(String, String)],
+            _add_generation_prompt: bool,
+        ) -> Result<Vec<u32>, kriya_core::tokenizer::TokenizerError> {
+            Ok(vec![1])
+        }
+        fn eos_token_id(&self) -> u32 {
+            999
+        }
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let metrics = Arc::new(ServerMetrics::default());
+    let handle = ServerHandle {
+        work_tx: tx,
+        tokenizer: Arc::new(Utf8SplitMockTokenizer),
+        model_name: "test-qwen-model".to_string(),
+        metrics,
+        max_prompt_tokens: 1024,
+        max_completion_tokens: 512,
+        max_concurrent_requests: 10,
+    };
+    let app = create_app(handle.clone());
+
+    let worker = tokio::spawn(async move {
+        if let Some(cmd) = rx.recv().await {
+            let _ = cmd.token_tx.send(301);
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            let _ = cmd.token_tx.send(302);
+            drop(cmd.token_tx);
+        }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"utf8 split test"}],"stream":true,"model":"test-model"}"#,
+        ))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut body_stream = res.into_body().into_data_stream();
+    let mut chunk_texts = Vec::new();
+    let mut saw_done = false;
+
+    while let Some(chunk_res) = body_stream.next().await {
+        let chunk = chunk_res.unwrap();
+        let text = String::from_utf8_lossy(&chunk);
+        if text.contains("chat.completion.chunk") {
+            chunk_texts.push(text.to_string());
+        }
+        if text.contains("[DONE]") {
+            saw_done = true;
+        }
+    }
+
+    let _ = worker.await;
+    assert!(saw_done, "Terminal event must be data: [DONE]");
+    assert_eq!(chunk_texts.len(), 2);
+    // First chunk emits "prefix " without corrupted replacement character
+    assert!(chunk_texts[0].contains("prefix "));
+    assert!(!chunk_texts[0].contains('\u{FFFD}'));
+    // Second chunk emits completed multi-byte character "🦀"
+    assert!(chunk_texts[1].contains('🦀'));
+}
+
+#[test]
+fn test_untrained_draft_head_env_var_override() {
+    use kriya_speculate::eagle_medusa::EagleDraftEngine;
+
+    let h = 8;
+    let v = 16;
+    let engine =
+        EagleDraftEngine::new_gpu_backed(h, v, vec![0.0; h * 2 * h], vec![0.0; h * h]).unwrap();
+    assert!(!engine.is_trained);
+    let bytes = engine.save_weights();
+
+    let mut loaded =
+        EagleDraftEngine::new_gpu_backed(h, v, vec![0.0; h * 2 * h], vec![0.0; h * h]).unwrap();
+    loaded.load_weights(&bytes).unwrap();
+    assert!(!loaded.is_trained);
+
+    unsafe {
+        std::env::remove_var("KRIYA_ALLOW_UNTRAINED_DRAFT");
+    }
+    let allow = std::env::var("KRIYA_ALLOW_UNTRAINED_DRAFT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    assert!(!allow);
+
+    unsafe {
+        std::env::set_var("KRIYA_ALLOW_UNTRAINED_DRAFT", "1");
+    }
+    let allow = std::env::var("KRIYA_ALLOW_UNTRAINED_DRAFT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    assert!(allow);
+    unsafe {
+        std::env::remove_var("KRIYA_ALLOW_UNTRAINED_DRAFT");
+    }
 }

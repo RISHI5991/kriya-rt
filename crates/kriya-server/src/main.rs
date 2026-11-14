@@ -31,6 +31,9 @@ async fn main() {
         println!("  --port <port>            Port to bind HTTP/OpenAI server (default: 8080)");
         println!("  --prompt <text>          Run prompt directly via CLI and exit");
         println!("  --draft-weights <path>   Enable EAGLE speculative decoding with draft head");
+        println!(
+            "  --allow-untrained-draft  Allow loading untrained EAGLE draft head (is_trained=0)"
+        );
         println!("  --max-tokens <n>         Maximum tokens to generate (default: 256)");
         println!("  --temperature <val>      Sampling temperature (default: 0.7)");
         println!("  --top-p <val>            Nucleus sampling top-p (default: 0.95)");
@@ -108,6 +111,12 @@ async fn main() {
         .windows(2)
         .find(|w| w[0] == "--draft-weights")
         .map(|w| PathBuf::from(&w[1]));
+
+    if args.iter().any(|arg| arg == "--allow-untrained-draft") {
+        unsafe {
+            std::env::set_var("KRIYA_ALLOW_UNTRAINED_DRAFT", "1");
+        }
+    }
 
     let mut runtime = EngineRuntime::new(
         desc.clone(),

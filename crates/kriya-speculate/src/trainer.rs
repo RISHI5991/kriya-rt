@@ -151,23 +151,80 @@ impl EagleTrainer {
             total_reg_loss += sample_reg_loss;
             total_loss += sample_reg_loss;
 
-            // 4. Token Prediction Accuracy Check (Top-1 prediction from pred_feature)
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_tok = 0u32;
-            // Quick projection on target token and sample subset
-            for (v, row) in engine.target_lm_head_weights.chunks_exact(h).enumerate() {
-                let dot: f32 = row
-                    .iter()
-                    .zip(pred_feature.iter())
-                    .map(|(w, f)| w * f)
-                    .sum();
-                if dot > best_score {
-                    best_score = dot;
-                    best_tok = v as u32;
+            // 4. Token Prediction CrossEntropy Loss & Distillation Gradient
+            let num_vocab_rows = engine.target_lm_head_weights.len() / h;
+            if num_vocab_rows > 0 && self.config.cls_weight > 0.0 {
+                let mut logits = Vec::with_capacity(num_vocab_rows);
+                let mut max_logit = f32::NEG_INFINITY;
+                for row in engine.target_lm_head_weights.chunks_exact(h) {
+                    let dot: f32 = row
+                        .iter()
+                        .zip(pred_feature.iter())
+                        .map(|(w, f)| w * f)
+                        .sum();
+                    if dot > max_logit {
+                        max_logit = dot;
+                    }
+                    logits.push(dot);
                 }
-            }
-            if best_tok == sample.target_next_token_id {
-                correct_predictions += 1;
+
+                let mut sum_exp = 0.0f32;
+                for l in &mut logits {
+                    *l = (*l - max_logit).exp();
+                    sum_exp += *l;
+                }
+                let inv_sum = if sum_exp > 1e-12 { 1.0 / sum_exp } else { 0.0 };
+                for l in &mut logits {
+                    *l *= inv_sum;
+                }
+
+                let target_v = sample.target_next_token_id as usize;
+                if target_v < num_vocab_rows {
+                    let p_target = logits[target_v].max(1e-12);
+                    let ce_loss = -p_target.ln();
+                    total_loss += self.config.cls_weight * ce_loss;
+
+                    // Accuracy check
+                    let best_tok = logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
+                    if best_tok == sample.target_next_token_id {
+                        correct_predictions += 1;
+                    }
+
+                    // dCE / d_logit_v = (p_v - delta_{v, target})
+                    // Backprop into pred_feature: g_cls[j] = sum_v d_logit_v * W_lm_head[v, j]
+                    let scale = self.config.cls_weight;
+                    for (v, row) in engine.target_lm_head_weights.chunks_exact(h).enumerate() {
+                        let target_indicator = if v == target_v { 1.0f32 } else { 0.0f32 };
+                        let d_logit = (logits[v] - target_indicator) * scale;
+                        if d_logit.abs() > 1e-12 {
+                            for j in 0..h {
+                                g_feat[j] += d_logit * row[j];
+                            }
+                        }
+                    }
+                }
+            } else {
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_tok = 0u32;
+                for (v, row) in engine.target_lm_head_weights.chunks_exact(h).enumerate() {
+                    let dot: f32 = row
+                        .iter()
+                        .zip(pred_feature.iter())
+                        .map(|(w, f)| w * f)
+                        .sum();
+                    if dot > best_score {
+                        best_score = dot;
+                        best_tok = v as u32;
+                    }
+                }
+                if best_tok == sample.target_next_token_id {
+                    correct_predictions += 1;
+                }
             }
 
             // 5. Backpropagation
@@ -267,6 +324,7 @@ impl EagleTrainer {
             *w -= lr * m_hat / (v_hat.sqrt() + eps);
         }
 
+        engine.is_trained = true;
         let avg_loss = total_loss / n;
         let avg_reg = total_reg_loss / n;
         let accuracy = (correct_predictions as f32) / n;

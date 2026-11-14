@@ -332,6 +332,26 @@ pub fn pack_mlx_affine_q4_group64(
         .collect()
 }
 
+/// Computes the SHA-256 checksum hex string of a file on disk.
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut chunk = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut chunk).map_err(|err| err.to_string())?;
+        if read == 0 {
+            break;
+        }
+        context.update(&chunk[..read]);
+    }
+    Ok(context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +411,21 @@ mod tests {
         let b1 = { blocks[1].bias_bf16 };
         assert_eq!(s1, 0x4000);
         assert_eq!(b1, 0x3C00);
+    }
+
+    #[test]
+    fn test_sha256_file_known_hash_and_missing_error() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello world").unwrap();
+        tmp.flush().unwrap();
+
+        let hash = sha256_file(tmp.path()).unwrap();
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+
+        let missing = Path::new("/nonexistent/path/for/kriya/sha256/test");
+        assert!(sha256_file(missing).is_err());
     }
 }

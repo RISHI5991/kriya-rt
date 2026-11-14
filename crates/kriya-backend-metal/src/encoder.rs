@@ -3307,8 +3307,7 @@ impl MetalExecutor {
             .unwrap_or(h);
 
         for &(node_idx, phys_blk_id, slot_in_blk) in accepted_nodes {
-            for l_idx in 0..num_layers {
-                let layer = &descriptor.layers[l_idx];
+            for (l_idx, layer) in descriptor.layers.iter().enumerate().take(num_layers) {
                 let (num_kv_heads, head_dim) = match layer.seq_mixer {
                     SequenceMixerDescriptor::GroupedQueryAttention {
                         num_kv_heads,
