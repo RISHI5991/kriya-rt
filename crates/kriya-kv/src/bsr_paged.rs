@@ -33,6 +33,8 @@ pub struct PhysicalKvBlock {
     pub num_hashed_tokens: u32,
     /// Optional rolling hash of the prefix token sequence up to and including this block.
     pub prefix_hash: Option<u64>,
+    /// Monotonic generation counter tracking block lifecycle to prevent Radix Cache Use-After-Free.
+    pub generation: u64,
 }
 
 /// vLLM-style Physical Block Allocator with Reference Counting and Copy-on-Write (CoW).
@@ -51,6 +53,7 @@ impl BlockAllocator {
                 ref_count: 0,
                 num_hashed_tokens: 0,
                 prefix_hash: None,
+                generation: 0,
             })
             .collect();
         let free_list = (0..num_blocks).collect();
@@ -91,9 +94,20 @@ impl BlockAllocator {
 
         let blk = &mut self.blocks[block_id as usize];
         blk.ref_count = 1;
+        blk.generation += 1;
         blk.num_hashed_tokens = 0;
         blk.prefix_hash = None;
         Ok(block_id)
+    }
+
+    /// Returns the lifecycle generation counter for a physical block.
+    #[inline]
+    pub fn get_generation(&self, block_id: u32) -> Result<u64, KvCacheError> {
+        Ok(self
+            .blocks
+            .get(block_id as usize)
+            .ok_or(KvCacheError::InvalidBlockId(block_id))?
+            .generation)
     }
 
     /// Increments reference count for an existing physical block (for shared prefixes or beams).
@@ -145,6 +159,8 @@ struct RadixNode {
     block_tokens: Vec<u32>,
     /// Mapped physical GPU block ID holding the KV states for `block_tokens`.
     physical_block_id: Option<u32>,
+    /// Monotonic generation counter of the allocated physical block.
+    block_generation: u64,
     /// Child nodes keyed by the first token ID of the next block.
     children: HashMap<u32, RadixNode>,
 }
@@ -183,6 +199,7 @@ impl RadixPrefixCache {
             if let Some(child) = current.children.get(&first_tok)
                 && child.block_tokens == chunk
                 && let Some(phys_id) = child.physical_block_id
+                && gpu_allocator.get_generation(phys_id).unwrap_or(0) == child.block_generation
                 && gpu_allocator.ref_count(phys_id).unwrap_or(0) > 0
             {
                 gpu_allocator.inc_ref(phys_id)?;
@@ -198,7 +215,12 @@ impl RadixPrefixCache {
     }
 
     /// Inserts full blocks from a sequence into the Radix Tree for future prefix reuse.
-    pub fn insert_prefix(&mut self, tokens: &[u32], physical_blocks: &[u32]) {
+    pub fn insert_prefix(
+        &mut self,
+        tokens: &[u32],
+        physical_blocks: &[u32],
+        gpu_allocator: &BlockAllocator,
+    ) {
         let blk_sz = self.block_size_tokens as usize;
         let num_full_blocks = (tokens.len() / blk_sz).min(physical_blocks.len());
         let mut current = &mut self.root;
@@ -207,6 +229,7 @@ impl RadixPrefixCache {
             let chunk = &tokens[blk_idx * blk_sz..(blk_idx + 1) * blk_sz];
             let first_tok = chunk[0];
             let phys_id = physical_blocks[blk_idx];
+            let blk_gen = gpu_allocator.get_generation(phys_id).unwrap_or(0);
 
             let next_node = current
                 .children
@@ -214,11 +237,13 @@ impl RadixPrefixCache {
                 .or_insert_with(|| RadixNode {
                     block_tokens: chunk.to_vec(),
                     physical_block_id: Some(phys_id),
+                    block_generation: blk_gen,
                     children: HashMap::new(),
                 });
 
             if next_node.block_tokens == chunk {
                 next_node.physical_block_id = Some(phys_id);
+                next_node.block_generation = blk_gen;
                 current = next_node;
             } else {
                 break;
@@ -280,24 +305,33 @@ pub struct FlashInferSchedulePlan {
     pub max_blocks_per_cta: u32,
 }
 
+impl FlashInferSchedulePlan {
+    /// Constructs an empty schedule plan without allocating heap vectors.
+    pub fn empty() -> Self {
+        Self {
+            bsr_layout: BsrKvLayout {
+                page_indptr: Vec::new(),
+                page_indices: Vec::new(),
+                last_page_len: Vec::new(),
+            },
+            cta_work_tiles: Vec::new(),
+            max_blocks_per_cta: 1,
+        }
+    }
+}
+
 /// Unified KV-Cache Manager combining vLLM Paged Allocation, Radix Prefix Sharing,
 /// and FlashInfer BSR Inspector-Executor Scheduling.
 pub struct PagedKvCacheManager {
     pub gpu_allocator: BlockAllocator,
-    pub cpu_swap_allocator: BlockAllocator,
     pub radix_cache: RadixPrefixCache,
     sequences: HashMap<u64, SequenceBlockTable>,
 }
 
 impl PagedKvCacheManager {
-    pub fn new(num_gpu_blocks: u32, num_cpu_swap_blocks: u32, block_size_tokens: u32) -> Self {
+    pub fn new(num_gpu_blocks: u32, _num_cpu_swap_blocks: u32, block_size_tokens: u32) -> Self {
         Self {
             gpu_allocator: BlockAllocator::new("GPU", num_gpu_blocks, block_size_tokens),
-            cpu_swap_allocator: BlockAllocator::new(
-                "CPU_SWAP",
-                num_cpu_swap_blocks,
-                block_size_tokens,
-            ),
             radix_cache: RadixPrefixCache::new(block_size_tokens),
             sequences: HashMap::new(),
         }
@@ -336,7 +370,7 @@ impl PagedKvCacheManager {
         }
 
         self.radix_cache
-            .insert_prefix(prompt_tokens, &logical_blocks);
+            .insert_prefix(prompt_tokens, &logical_blocks, &self.gpu_allocator);
 
         self.sequences.insert(
             seq_id,
@@ -745,5 +779,35 @@ mod tests {
         assert_eq!(at_fifth_token.bsr_layout.page_indptr, vec![0, 2]);
         assert_eq!(at_fifth_token.bsr_layout.last_page_len, vec![1]);
         assert_eq!(at_fifth_token.cta_work_tiles[0].kv_block_count, 2);
+    }
+
+    #[test]
+    fn test_radix_cache_generation_check_prevents_uaf_aliasing() {
+        let mut mgr = PagedKvCacheManager::new(4, 0, 4); // 4 blocks total, 4 tokens per block
+        let prompt_req1 = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 full blocks (tokens 1..=8)
+
+        // Request 1 allocates blocks 0 and 1
+        let matched1 = mgr.allocate_sequence(1, &prompt_req1).unwrap();
+        assert_eq!(matched1, 0);
+
+        // Request 1 completes and is freed. Blocks 0 and 1 are returned to free list.
+        mgr.free_sequence(1).unwrap();
+        assert_eq!(mgr.gpu_allocator.num_free_blocks(), 4);
+
+        // Request 2 arrives with completely different tokens and re-allocates blocks
+        // (now with incremented generation).
+        let prompt_req2 = vec![101, 102, 103, 104, 105, 106, 107, 108];
+        let matched2 = mgr.allocate_sequence(2, &prompt_req2).unwrap();
+        assert_eq!(matched2, 0);
+
+        // Request 3 arrives with request 1's tokens [1..=8].
+        // Because physical blocks 0 and 1 have been reallocated and their generation incremented,
+        // the Radix tree MUST NOT hit stale blocks (preventing Use-After-Free aliasing).
+        let prompt_req3 = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let matched3 = mgr.allocate_sequence(3, &prompt_req3).unwrap();
+        assert_eq!(
+            matched3, 0,
+            "Reallocated physical blocks must NOT be aliased by stale radix cache nodes!"
+        );
     }
 }

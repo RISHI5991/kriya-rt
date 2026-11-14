@@ -186,9 +186,11 @@ fn top_k_indices(probs: &[f32], k: usize) -> Vec<usize> {
 pub struct EagleDraftEngine {
     pub hidden_dim: usize,
     pub vocab_size: usize,
+    /// Indicates whether this draft engine has been trained via distillation (true)
+    /// or contains dummy identity weights (false).
+    pub is_trained: bool,
     /// Frozen target LLM token embedding table `[vocab_size, hidden_dim]`.
     pub target_embedding_weights: Vec<f32>,
-    /// Frozen target LLM language model head `[vocab_size, hidden_dim]`.
     pub target_lm_head_weights: Vec<f32>,
     /// Trainable FC dimensionality reduction matrix `[hidden_dim, 2 * hidden_dim]`.
     pub fc_fuse_weights: Vec<f32>,
@@ -239,6 +241,7 @@ impl EagleDraftEngine {
         Ok(Self {
             hidden_dim,
             vocab_size,
+            is_trained: false,
             target_embedding_weights,
             target_lm_head_weights,
             fc_fuse_weights,
@@ -277,6 +280,7 @@ impl EagleDraftEngine {
         Ok(Self {
             hidden_dim,
             vocab_size,
+            is_trained: false,
             target_embedding_weights: Vec::new(),
             target_lm_head_weights: Vec::new(),
             fc_fuse_weights,
@@ -461,10 +465,12 @@ impl EagleDraftEngine {
             });
         }
 
-        let mut accepted_tokens = Vec::new();
-        let mut accepted_node_indices = Vec::new();
-        let mut accepted_features = Vec::new();
+        let max_nodes = tree.nodes.len();
+        let mut accepted_tokens = Vec::with_capacity(max_nodes);
+        let mut accepted_node_indices = Vec::with_capacity(max_nodes);
+        let mut accepted_features = Vec::with_capacity(max_nodes);
         let mut current_node_id = 0usize;
+        let mut residual_p = vec![0.0f32; self.vocab_size];
 
         loop {
             let node = &tree.nodes[current_node_id];
@@ -472,7 +478,10 @@ impl EagleDraftEngine {
             let p_draft = &node.draft_probs;
 
             // Residual probability distribution tracking remaining target mass after rejections
-            let mut residual_p = p_target.clone();
+            if residual_p.len() != p_target.len() {
+                residual_p.resize(p_target.len(), 0.0);
+            }
+            residual_p.copy_from_slice(p_target);
             let mut accepted_child: Option<usize> = None;
 
             for &child_id in &node.children {
@@ -493,7 +502,7 @@ impl EagleDraftEngine {
                     break;
                 } else {
                     // Adjust residual distribution after rejecting candidate_tok
-                    for (v, res_val) in residual_p.iter_mut().enumerate().take(self.vocab_size) {
+                    for (v, res_val) in residual_p.iter_mut().enumerate() {
                         let draft_p = p_draft.get(v).copied().unwrap_or(0.0);
                         *res_val = (*res_val - draft_p).max(0.0);
                     }
@@ -503,7 +512,7 @@ impl EagleDraftEngine {
                             *v /= sum_res;
                         }
                     } else {
-                        residual_p.clone_from(p_target);
+                        residual_p.copy_from_slice(p_target);
                     }
                 }
             }
@@ -614,7 +623,8 @@ impl EagleDraftEngine {
         buf.extend_from_slice(&Self::WEIGHTS_VERSION.to_le_bytes());
         buf.extend_from_slice(&(self.hidden_dim as u64).to_le_bytes());
         buf.extend_from_slice(&(self.vocab_size as u64).to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved for future format flags.
+        let flags: u32 = if self.is_trained { 1 } else { 0 };
+        buf.extend_from_slice(&flags.to_le_bytes());
         for &weight in self
             .fc_fuse_weights
             .iter()
@@ -644,6 +654,7 @@ impl EagleDraftEngine {
         let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
         let hidden_dim = u64::from_le_bytes(data[12..20].try_into().unwrap()) as usize;
         let vocab_size = u64::from_le_bytes(data[20..28].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(data[28..32].try_into().unwrap());
         if version != Self::WEIGHTS_VERSION
             || hidden_dim != self.hidden_dim
             || vocab_size != self.vocab_size
@@ -655,6 +666,8 @@ impl EagleDraftEngine {
                 self.vocab_size
             )));
         }
+
+        self.is_trained = (flags & 1) != 0;
 
         // Validate the complete payload before mutating this engine. A failed load
         // must not leave a partially overwritten draft head behind.
@@ -763,7 +776,8 @@ mod tests {
 
     #[test]
     fn test_trained_weight_artifact_round_trip_and_dimension_check() {
-        let source = create_test_eagle_engine();
+        let mut source = create_test_eagle_engine();
+        source.is_trained = true;
         let artifact = source.save_weights();
 
         let mut loaded = create_test_eagle_engine();
@@ -772,6 +786,17 @@ mod tests {
         loaded.load_weights(&artifact).unwrap();
         assert_eq!(loaded.fc_fuse_weights, source.fc_fuse_weights);
         assert_eq!(loaded.decoder_layer_weights, source.decoder_layer_weights);
+        assert!(loaded.is_trained, "Trained status must be preserved");
+
+        // Untrained round-trip
+        source.is_trained = false;
+        let untrained_art = source.save_weights();
+        let mut loaded_untrained = create_test_eagle_engine();
+        loaded_untrained.load_weights(&untrained_art).unwrap();
+        assert!(
+            !loaded_untrained.is_trained,
+            "Untrained status must be preserved"
+        );
 
         let mut wrong_model = EagleDraftEngine::new(
             4,

@@ -61,7 +61,7 @@ pub async fn health_handler() -> impl IntoResponse {
 }
 
 pub async fn metrics_handler(State(handle): State<ServerHandle>) -> impl IntoResponse {
-    let uptime = current_timestamp_us() / 1_000_000;
+    let uptime = handle.metrics.start_time.elapsed().as_secs();
     let active = handle.metrics.active_requests.load(Ordering::Relaxed);
     let total_reqs = handle.metrics.total_requests.load(Ordering::Relaxed);
     let total_emitted = handle.metrics.total_tokens_emitted.load(Ordering::Relaxed);
@@ -154,24 +154,37 @@ pub async fn chat_completions_handler(
         );
     }
 
-    // 3. Admission Control: Check queue saturation
-    let current_active = handle.metrics.active_requests.load(Ordering::Relaxed);
-    if current_active >= handle.max_concurrent_requests {
-        handle
-            .metrics
-            .rejected_requests
-            .fetch_add(1, Ordering::Relaxed);
-        return api_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "Server admission queue saturated ({current_active} active requests >= limit {})",
-                handle.max_concurrent_requests
-            ),
-            "rate_limit_error",
-            Some("queue_full"),
-            None,
-        );
+    // 3. Admission Control: Atomic compare-exchange ticket reservation to prevent TOCTOU race conditions
+    let mut current = handle.metrics.active_requests.load(Ordering::Relaxed);
+    loop {
+        if current >= handle.max_concurrent_requests {
+            handle
+                .metrics
+                .rejected_requests
+                .fetch_add(1, Ordering::Relaxed);
+            return api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Server admission queue saturated ({current} active requests >= limit {})",
+                    handle.max_concurrent_requests
+                ),
+                "rate_limit_error",
+                Some("queue_full"),
+                None,
+            );
+        }
+        match handle.metrics.active_requests.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
     }
+
+    let _guard = ActiveGuard(handle.metrics.clone());
 
     let temperature = payload.temperature.unwrap_or(0.0);
     let top_p = payload.top_p.unwrap_or(0.95);
@@ -217,18 +230,12 @@ pub async fn chat_completions_handler(
 
     handle
         .metrics
-        .active_requests
-        .fetch_add(1, Ordering::Relaxed);
-    handle
-        .metrics
         .total_requests
         .fetch_add(1, Ordering::Relaxed);
     handle
         .metrics
         .total_prompt_tokens
         .fetch_add(prompt_len as u64, Ordering::Relaxed);
-
-    let _guard = ActiveGuard(handle.metrics.clone());
 
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
     if handle
@@ -256,21 +263,128 @@ pub async fn chat_completions_handler(
     let metrics_clone = handle.metrics.clone();
     if payload.stream.unwrap_or(false) {
         let sse_stream = stream::unfold(
-            (token_rx, tok_clone, req_id, metrics_clone, _guard),
-            |(mut rx, tokenizer_opt, id, metrics, guard)| async move {
-                let tok_id = rx.recv().await?;
-                metrics.total_tokens_emitted.fetch_add(1, Ordering::Relaxed);
-                let piece = tokenizer_opt
-                    .decode(&[tok_id], true)
-                    .unwrap_or_else(|_| format!("{tok_id} "));
-                let chunk_json = format!(
-                    r#"{{"id":"chatcmpl-{}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{:?}}},"finish_reason":null}}]}}"#,
-                    id, piece
-                );
-                Some((
-                    Ok::<Event, std::convert::Infallible>(Event::default().data(chunk_json)),
-                    (rx, tokenizer_opt, id, metrics, guard),
-                ))
+            (
+                token_rx,
+                tok_clone,
+                req_id,
+                metrics_clone,
+                _guard,
+                Vec::<u32>::new(),
+                0usize,
+                false,
+            ),
+            |(
+                mut rx,
+                tokenizer_opt,
+                id,
+                metrics,
+                guard,
+                mut token_history,
+                mut last_decoded_len,
+                finished,
+            )| async move {
+                if finished {
+                    return None;
+                }
+                match rx.recv().await {
+                    Some(tok_id) => {
+                        metrics.total_tokens_emitted.fetch_add(1, Ordering::Relaxed);
+                        token_history.push(tok_id);
+                        let full_text = tokenizer_opt
+                            .decode(&token_history, true)
+                            .unwrap_or_default();
+                        let valid_text = if full_text.ends_with('\u{FFFD}') {
+                            full_text.trim_end_matches('\u{FFFD}')
+                        } else {
+                            &full_text
+                        };
+                        let new_piece = if valid_text.len() > last_decoded_len {
+                            let safe_idx = if valid_text.is_char_boundary(last_decoded_len) {
+                                last_decoded_len
+                            } else {
+                                valid_text
+                                    .char_indices()
+                                    .map(|(i, _)| i)
+                                    .find(|&i| i >= last_decoded_len)
+                                    .unwrap_or(valid_text.len())
+                            };
+                            let piece = valid_text[safe_idx..].to_string();
+                            last_decoded_len = valid_text.len();
+                            piece
+                        } else {
+                            String::new()
+                        };
+                        let chunk_json = format!(
+                            r#"{{"id":"chatcmpl-{}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{:?}}},"finish_reason":null}}]}}"#,
+                            id, new_piece
+                        );
+                        Some((
+                            Ok::<Event, std::convert::Infallible>(
+                                Event::default().data(chunk_json),
+                            ),
+                            (
+                                rx,
+                                tokenizer_opt,
+                                id,
+                                metrics,
+                                guard,
+                                token_history,
+                                last_decoded_len,
+                                false,
+                            ),
+                        ))
+                    }
+                    None => {
+                        let full_text = tokenizer_opt
+                            .decode(&token_history, true)
+                            .unwrap_or_default();
+                        if full_text.len() > last_decoded_len {
+                            let safe_idx = if full_text.is_char_boundary(last_decoded_len) {
+                                last_decoded_len
+                            } else {
+                                full_text
+                                    .char_indices()
+                                    .map(|(i, _)| i)
+                                    .find(|&i| i >= last_decoded_len)
+                                    .unwrap_or(full_text.len())
+                            };
+                            let piece = full_text[safe_idx..].to_string();
+                            last_decoded_len = full_text.len();
+                            let chunk_json = format!(
+                                r#"{{"id":"chatcmpl-{}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{:?}}},"finish_reason":null}}]}}"#,
+                                id, piece
+                            );
+                            return Some((
+                                Ok::<Event, std::convert::Infallible>(
+                                    Event::default().data(chunk_json),
+                                ),
+                                (
+                                    rx,
+                                    tokenizer_opt,
+                                    id,
+                                    metrics,
+                                    guard,
+                                    token_history,
+                                    last_decoded_len,
+                                    false,
+                                ),
+                            ));
+                        }
+                        Some((
+                            Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]")),
+                            (
+                                rx,
+                                tokenizer_opt,
+                                id,
+                                metrics,
+                                guard,
+                                token_history,
+                                last_decoded_len,
+                                true,
+                            ),
+                        ))
+                    }
+                }
             },
         );
         Sse::new(sse_stream).into_response()

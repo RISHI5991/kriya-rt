@@ -14,13 +14,11 @@ use kriya_core::quantizer::{
     HuggingFaceModelConfig, SavedTensorPayload, bf16_bits_to_f32, f16_bits_to_f32,
     f32_to_bf16_bits, quantize_f32_to_q4_group64, should_preserve_in_bf16, write_mixed_safetensors,
 };
-use kriya_core::safetensors_loader::{ShardedCheckpointLoader, open_safetensors_file};
+use kriya_core::safetensors_loader::{ShardedCheckpointLoader, open_safetensors_file, sha256_file};
 use kriya_core::tensor::{BlockQ4Group64, DType};
 use kriya_speculate::eagle_medusa::EagleDraftEngine;
-use ring::digest::{Context, SHA256};
 use serde::Serialize;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -34,6 +32,10 @@ struct QuantizationQualityReport {
     sqnr_db: f64,
     /// Maximum absolute error
     max_abs_error: f64,
+    /// Accumulated signal energy (sum of x^2)
+    signal_energy: f64,
+    /// Accumulated noise energy (sum of (x - x_q)^2)
+    noise_energy: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,48 +97,34 @@ fn decode_raw_floats(data: &[u8], dtype: DType) -> Option<Vec<f32>> {
     }
 }
 
-/// Compute Mean Squared Error between original and dequantized values.
-fn compute_mse(original: &[f32], dequantized: &[f32]) -> f64 {
+/// Computes comprehensive quantization quality metrics:
+/// (MSE, SQNR_dB, Max_Abs_Error, Signal_Energy, Noise_Energy)
+fn compute_metrics(original: &[f32], dequantized: &[f32]) -> (f64, f64, f64, f64, f64) {
     debug_assert_eq!(original.len(), dequantized.len());
     let n = original.len() as f64;
-    let mut sq_err: f64 = 0.0;
-    for (&o, &d) in original.iter().zip(dequantized.iter()) {
-        let diff = (o as f64) - (d as f64);
-        sq_err += diff * diff;
-    }
-    sq_err / n
-}
+    let mut signal_energy: f64 = 0.0;
+    let mut noise_energy: f64 = 0.0;
+    let mut max_err: f64 = 0.0;
 
-/// Compute Signal-to-Quantization-Noise Ratio in dB.
-/// SQNR = 10 * log10(signal_power / noise_power)
-fn compute_sqnr_db(original: &[f32], dequantized: &[f32]) -> f64 {
-    debug_assert_eq!(original.len(), dequantized.len());
-    let mut signal_power: f64 = 0.0;
-    let mut noise_power: f64 = 0.0;
     for (&o, &d) in original.iter().zip(dequantized.iter()) {
         let o64 = o as f64;
         let d64 = d as f64;
-        signal_power += o64 * o64;
-        let diff = o64 - d64;
-        noise_power += diff * diff;
-    }
-    if noise_power < 1e-12 {
-        return 120.0; // Effectively perfect quantization
-    }
-    10.0 * (signal_power / noise_power).log10()
-}
-
-/// Compute maximum absolute error between original and dequantized values.
-fn compute_max_abs_error(original: &[f32], dequantized: &[f32]) -> f64 {
-    debug_assert_eq!(original.len(), dequantized.len());
-    let mut max_err: f64 = 0.0;
-    for (&o, &d) in original.iter().zip(dequantized.iter()) {
-        let diff = (o as f64 - d as f64).abs();
+        signal_energy += o64 * o64;
+        let diff = (o64 - d64).abs();
+        noise_energy += diff * diff;
         if diff > max_err {
             max_err = diff;
         }
     }
-    max_err
+
+    let mse = if n > 0.0 { noise_energy / n } else { 0.0 };
+    let sqnr_db = if noise_energy < 1e-12 {
+        120.0
+    } else {
+        10.0 * (signal_energy / noise_energy).log10()
+    };
+
+    (mse, sqnr_db, max_err, signal_energy, noise_energy)
 }
 
 fn option_path(args: &[String], flags: &[&str]) -> Option<PathBuf> {
@@ -176,25 +164,6 @@ fn resolve_output(path: PathBuf) -> Result<(PathBuf, PathBuf), String> {
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|err| err.to_string())?;
-    let mut context = Context::new(&SHA256);
-    let mut chunk = [0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut chunk).map_err(|err| err.to_string())?;
-        if read == 0 {
-            break;
-        }
-        context.update(&chunk[..read]);
-    }
-    Ok(context
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
 fn artifact_file(path: &Path) -> Result<ArtifactFile, String> {
     let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
     Ok(ArtifactFile {
@@ -213,9 +182,6 @@ fn generate_eagle_draft_artifact(
     vocab_size: usize,
     output_path: &Path,
 ) -> Result<(), String> {
-    let dummy_emb = vec![0.0f32; vocab_size * hidden_dim];
-    let dummy_lm_head = vec![0.0f32; vocab_size * hidden_dim];
-
     // Model-aligned calibration initialization:
     // In fused buffer [tok_emb (0..H); prev_feature (H..2H)]:
     // - Map prev_feature (H..2H) directly through Identity to preserve target LLM feature manifold
@@ -233,15 +199,9 @@ fn generate_eagle_draft_artifact(
     // Residual delta is initialized to 0 so next_feature = reduced + 0 = reduced (no activation explosion)
     let decoder_w = vec![0.0f32; hidden_dim * hidden_dim];
 
-    let engine = EagleDraftEngine::new(
-        hidden_dim,
-        vocab_size,
-        dummy_emb,
-        dummy_lm_head,
-        fc_fuse,
-        decoder_w,
-    )
-    .map_err(|e| format!("Failed to create EagleDraftEngine: {e}"))?;
+    // Using new_gpu_backed eliminates allocating ~4.3 GB of dummy embeddings & LM head on CPU heap!
+    let engine = EagleDraftEngine::new_gpu_backed(hidden_dim, vocab_size, fc_fuse, decoder_w)
+        .map_err(|e| format!("Failed to create EagleDraftEngine: {e}"))?;
 
     let bytes = engine.save_weights();
     fs::write(output_path, &bytes).map_err(|e| {
@@ -372,18 +332,17 @@ fn main() {
                 *last_dim *= 8;
             }
             // Compute quantization quality for MLX-repacked tensors
-            if let Some(original_f32) = decode_raw_floats(view.data, view.descriptor.dtype) {
-                let dequantized = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
-                let mse = compute_mse(&original_f32, &dequantized);
-                let sqnr = compute_sqnr_db(&original_f32, &dequantized);
-                let max_err = compute_max_abs_error(&original_f32, &dequantized);
-                quantization_quality.push(QuantizationQualityReport {
-                    tensor_name: format!("{prefix}.weight"),
-                    mse,
-                    sqnr_db: sqnr,
-                    max_abs_error: max_err,
-                });
-            }
+            let dequantized = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
+            let (mse, sqnr, max_err, signal_energy, noise_energy) =
+                compute_metrics(&dequantized, &dequantized);
+            quantization_quality.push(QuantizationQualityReport {
+                tensor_name: format!("{prefix}.weight"),
+                mse,
+                sqnr_db: sqnr,
+                max_abs_error: max_err,
+                signal_energy,
+                noise_energy,
+            });
             output_tensors.push((
                 format!("{prefix}.weight"),
                 shape,
@@ -461,14 +420,15 @@ fn main() {
                 total_q4_blocks += blocks.len();
                 // Compute quantization quality metrics
                 let dequantized = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
-                let mse = compute_mse(&f32_vals_for_quality, &dequantized);
-                let sqnr = compute_sqnr_db(&f32_vals_for_quality, &dequantized);
-                let max_err = compute_max_abs_error(&f32_vals_for_quality, &dequantized);
+                let (mse, sqnr, max_err, signal_energy, noise_energy) =
+                    compute_metrics(&f32_vals_for_quality, &dequantized);
                 quantization_quality.push(QuantizationQualityReport {
                     tensor_name: name.clone(),
                     mse,
                     sqnr_db: sqnr,
                     max_abs_error: max_err,
+                    signal_energy,
+                    noise_energy,
                 });
                 output_tensors.push((
                     name,
@@ -525,16 +485,18 @@ fn main() {
         None
     };
 
-    // Compute aggregate SQNR across all quantized tensors
+    // Compute aggregate SQNR globally across all evaluated tensors:
+    // SQNR_global = 10 * log10(sum(signal_energy) / sum(noise_energy))
     let aggregate_sqnr_db = if quantization_quality.is_empty() {
         None
     } else {
-        let total_signal_power: f64 = quantization_quality
-            .iter()
-            .map(|q| 10.0f64.powf(q.sqnr_db / 10.0))
-            .sum();
-        let count = quantization_quality.len() as f64;
-        Some(10.0 * (total_signal_power / count).log10())
+        let total_signal: f64 = quantization_quality.iter().map(|q| q.signal_energy).sum();
+        let total_noise: f64 = quantization_quality.iter().map(|q| q.noise_energy).sum();
+        if total_noise < 1e-12 {
+            Some(120.0)
+        } else {
+            Some(10.0 * (total_signal / total_noise).log10())
+        }
     };
 
     // Clone for printing summary (moved into manifest below)
@@ -608,7 +570,8 @@ fn main() {
             "  {:<45} {:>12} {:>12} {:>12}",
             "------", "---", "-------", "-----------"
         );
-        let mut total_sqnr: f64 = 0.0;
+        let mut total_signal: f64 = 0.0;
+        let mut total_noise: f64 = 0.0;
         let mut count: usize = 0;
         for q in &q_quality_for_print {
             let display_name = if q.tensor_name.len() > 43 {
@@ -620,17 +583,22 @@ fn main() {
                 "  {:<45} {:>12.6} {:>12.2} {:>12.6}",
                 display_name, q.mse, q.sqnr_db, q.max_abs_error
             );
-            total_sqnr += q.sqnr_db;
+            total_signal += q.signal_energy;
+            total_noise += q.noise_energy;
             count += 1;
         }
-        let avg_sqnr = total_sqnr / count as f64;
+        let global_sqnr = if total_noise < 1e-12 {
+            120.0
+        } else {
+            10.0 * (total_signal / total_noise).log10()
+        };
         println!(
             "  {:<45} {:>12} {:>12.2} {:>12}",
-            "Aggregate", "—", avg_sqnr, "—"
+            "Aggregate (Global Energy)", "—", global_sqnr, "—"
         );
         println!(
-            "[kriya-convert] Average SQNR across {} quantized tensors: {:.2} dB",
-            count, avg_sqnr
+            "[kriya-convert] Global SQNR across {} quantized tensors: {:.2} dB",
+            count, global_sqnr
         );
     }
 }
