@@ -665,6 +665,71 @@ impl PagedKvCacheManager {
             max_blocks_per_cta,
         })
     }
+
+    /// Builds a flat, deduplicated BSR layout where `page_indices` contains each
+    /// physical KV block ID strictly once for the sequence without M-row duplication.
+    pub fn build_deduplicated_prefill_layout(
+        &self,
+        seq_id: u64,
+        prefix_tokens: u32,
+        num_tokens: u32,
+        max_blocks_per_cta: u32,
+    ) -> Result<FlashInferSchedulePlan, KvCacheError> {
+        let blk_sz = self.gpu_allocator.block_size_tokens();
+        let seq = self
+            .sequences
+            .get(&seq_id)
+            .ok_or(KvCacheError::InvalidSequenceId(seq_id))?;
+
+        if num_tokens == 0 || prefix_tokens.saturating_add(num_tokens) > seq.total_tokens {
+            return Err(KvCacheError::InvalidSequenceId(seq_id));
+        }
+
+        let max_visible_tokens = prefix_tokens + num_tokens;
+        let max_blocks_needed =
+            (max_visible_tokens.div_ceil(blk_sz) as usize).min(seq.logical_blocks.len());
+
+        // Deduplicated: page_indices contains physical block IDs strictly once [0..max_blocks_needed]
+        let page_indices: Vec<i32> = seq.logical_blocks[..max_blocks_needed]
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+
+        // page_indptr has M rows, each pointing from 0 to blocks_needed
+        let mut page_indptr = Vec::with_capacity(num_tokens as usize + 1);
+        page_indptr.push(0);
+        for i in 0..num_tokens {
+            let visible_tokens = prefix_tokens + i + 1;
+            let blocks_needed = visible_tokens.div_ceil(blk_sz) as i32;
+            page_indptr.push(blocks_needed);
+        }
+
+        let last_page_len = (0..num_tokens)
+            .map(|i| (((prefix_tokens + i) % blk_sz) + 1) as i32)
+            .collect();
+
+        let cta_work_tiles = (0..num_tokens)
+            .map(|i| {
+                let blocks_for_pos = (prefix_tokens + i + 1).div_ceil(blk_sz);
+                CtaWorkTile {
+                    request_idx: 0,
+                    kv_block_start: 0,
+                    kv_block_count: blocks_for_pos,
+                    is_split_k: u32::from(blocks_for_pos > max_blocks_per_cta),
+                }
+            })
+            .collect();
+
+        Ok(FlashInferSchedulePlan {
+            bsr_layout: BsrKvLayout {
+                page_indptr,
+                page_indices,
+                last_page_len,
+            },
+            cta_work_tiles,
+            max_blocks_per_cta,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +790,18 @@ mod tests {
         let plan = mgr.build_parallel_prefill_layout(7, 2, 3, 8).unwrap();
         assert_eq!(plan.bsr_layout.page_indptr, vec![0, 1, 2, 4]);
         assert_eq!(plan.bsr_layout.page_indices, vec![0, 0, 0, 1]);
+        assert_eq!(plan.bsr_layout.last_page_len, vec![3, 4, 1]);
+    }
+
+    #[test]
+    fn test_deduplicated_prefill_layout_has_no_duplicate_blocks() {
+        let mut mgr = PagedKvCacheManager::new(16, 8, 4);
+        mgr.allocate_sequence(7, &[10, 11, 12, 13, 14, 15]).unwrap();
+
+        // In deduplicated layout, page_indices contains strictly unique blocks [0, 1] without M-row repetition!
+        let plan = mgr.build_deduplicated_prefill_layout(7, 2, 3, 8).unwrap();
+        assert_eq!(plan.bsr_layout.page_indices, vec![0, 1]);
+        assert_eq!(plan.bsr_layout.page_indptr, vec![0, 1, 1, 2]);
         assert_eq!(plan.bsr_layout.last_page_len, vec![3, 4, 1]);
     }
 

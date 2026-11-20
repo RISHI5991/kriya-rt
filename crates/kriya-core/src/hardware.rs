@@ -94,6 +94,45 @@ impl HardwareProfile {
         }
     }
 
+    /// Auto-detects hardware profile and GPU family from chip name string (e.g. from `Device::name()`).
+    pub fn detect_from_chip_name(chip_name: &str, unified_memory_bytes: u64) -> Self {
+        let (gpu_family, gpu_core_count) = if chip_name.contains("M1") {
+            if chip_name.contains("Ultra") {
+                (AppleGpuFamily::Apple7, 64)
+            } else if chip_name.contains("Max") {
+                (AppleGpuFamily::Apple7, 32)
+            } else if chip_name.contains("Pro") {
+                (AppleGpuFamily::Apple7, 16)
+            } else {
+                (AppleGpuFamily::Apple7, 8)
+            }
+        } else if chip_name.contains("M2") {
+            if chip_name.contains("Ultra") {
+                (AppleGpuFamily::Apple8, 76)
+            } else if chip_name.contains("Max") {
+                (AppleGpuFamily::Apple8, 38)
+            } else if chip_name.contains("Pro") {
+                (AppleGpuFamily::Apple8, 19)
+            } else {
+                (AppleGpuFamily::Apple8, 10)
+            }
+        } else if chip_name.contains("M3") || chip_name.contains("M4") {
+            if chip_name.contains("Ultra") {
+                (AppleGpuFamily::Apple9, 80)
+            } else if chip_name.contains("Max") {
+                (AppleGpuFamily::Apple9, 40)
+            } else if chip_name.contains("Pro") {
+                (AppleGpuFamily::Apple9, 18)
+            } else {
+                (AppleGpuFamily::Apple9, 10)
+            }
+        } else {
+            (AppleGpuFamily::Apple8, 10)
+        };
+
+        Self::detect(chip_name, gpu_family, gpu_core_count, unified_memory_bytes)
+    }
+
     /// Generates an optimal execution policy for any combination of Mac hardware and model size.
     pub fn tune_for_model(&self, model_weight_bytes: u64) -> TunedExecutionPolicy {
         // On Max/Ultra (40-80 cores), trigger Split-K attention much earlier (4K context)
@@ -201,5 +240,28 @@ mod tests {
         let policy = profile.tune_for_model(14 * 1024 * 1024 * 1024); // 14 GB model
         assert!(policy.gpu_hot_expert_ratio < 1.0);
         assert!(policy.compress_kv_cache_q4);
+    }
+
+    #[test]
+    fn test_detect_from_chip_name_apple7_m1() {
+        let profile = HardwareProfile::detect_from_chip_name("Apple M1", 8 * 1024 * 1024 * 1024);
+        assert_eq!(profile.gpu_family, AppleGpuFamily::Apple7);
+        assert_eq!(profile.gpu_core_count, 8);
+        assert!(!profile.supports_native_bf16);
+
+        let policy = profile.tune_for_model(2 * 1024 * 1024 * 1024);
+        assert!(
+            !policy.use_bf16_kernels,
+            "M1 must NOT use BF16 kernels (native FP16 required)"
+        );
+    }
+
+    #[test]
+    fn test_detect_from_chip_name_apple9_m4() {
+        let profile =
+            HardwareProfile::detect_from_chip_name("Apple M4 Max", 64 * 1024 * 1024 * 1024);
+        assert_eq!(profile.gpu_family, AppleGpuFamily::Apple9);
+        assert_eq!(profile.gpu_core_count, 40);
+        assert!(profile.supports_native_bf16);
     }
 }

@@ -1,6 +1,6 @@
 //! HTTP Handlers for Health, Metrics, and OpenAI-Compatible Chat Completions.
 
-use crate::server::admission::{ActiveGuard, EnqueueRequestCmd, ServerHandle};
+use crate::server::admission::{ActiveGuard, EnqueueRequestCmd, ServerHandle, TokenizerService};
 use crate::server::metrics::current_timestamp_us;
 use axum::{
     Json,
@@ -67,6 +67,15 @@ pub async fn metrics_handler(State(handle): State<ServerHandle>) -> impl IntoRes
     let total_emitted = handle.metrics.total_tokens_emitted.load(Ordering::Relaxed);
     let total_prompt = handle.metrics.total_prompt_tokens.load(Ordering::Relaxed);
     let rejected = handle.metrics.rejected_requests.load(Ordering::Relaxed);
+    let depth2_active = if handle
+        .metrics
+        .pipeline_depth2_active
+        .load(Ordering::Relaxed)
+    {
+        1
+    } else {
+        0
+    };
     let metrics_text = format!(
         "# HELP kriya_engine_info Engine metadata\n\
          # TYPE kriya_engine_info gauge\n\
@@ -91,8 +100,8 @@ pub async fn metrics_handler(State(handle): State<ServerHandle>) -> impl IntoRes
          kriya_rejected_requests_total {}\n\
          # HELP kriya_pipeline_depth2_active Depth-2 Lookahead pipelining flag\n\
          # TYPE kriya_pipeline_depth2_active gauge\n\
-         kriya_pipeline_depth2_active 1\n",
-        uptime, active, total_reqs, total_prompt, total_emitted, rejected
+         kriya_pipeline_depth2_active {}\n",
+        uptime, active, total_reqs, total_prompt, total_emitted, rejected, depth2_active
     );
     (
         [(
@@ -122,6 +131,111 @@ fn api_error(
         err["param"] = serde_json::Value::String(p.to_string());
     }
     (status, Json(serde_json::json!({ "error": err }))).into_response()
+}
+
+/// StreamingDetokenizer provides O(1) sliding-window detokenization for SSE streaming.
+///
+/// It maintains a sliding window of recent tokens (typically 4..=6 tokens),
+/// detecting and holding back incomplete multi-byte UTF-8 sequences (indicated by trailing U+FFFD),
+/// suppressing window sliding while multi-byte characters are pending, and using UTF-8 char boundary
+/// slicing to emit clean incremental string deltas.
+#[derive(Debug, Clone)]
+pub struct StreamingDetokenizer {
+    tokens: Vec<u32>,
+    window_emitted_bytes: usize,
+    window_size: usize,
+}
+
+impl StreamingDetokenizer {
+    /// Creates a new `StreamingDetokenizer` with the specified sliding window size.
+    /// Recommended window size is 6 (clamped between 4 and 6).
+    pub fn new(window_size: usize) -> Self {
+        Self {
+            tokens: Vec::with_capacity(12),
+            window_emitted_bytes: 0,
+            window_size: window_size.clamp(4, 6),
+        }
+    }
+
+    /// Number of tokens currently held in the sliding window.
+    pub fn window_tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Configured sliding window size W.
+    pub fn window_size(&self) -> usize {
+        self.window_size
+    }
+
+    /// Ingests a new token ID, returning the incremental UTF-8 string delta.
+    pub fn step(&mut self, tok_id: u32, tokenizer: &dyn TokenizerService) -> String {
+        self.tokens.push(tok_id);
+
+        let raw_text = tokenizer.decode(&self.tokens, true).unwrap_or_default();
+        let ends_with_replacement = raw_text.ends_with('\u{FFFD}');
+        let valid_text = if ends_with_replacement {
+            raw_text.trim_end_matches('\u{FFFD}')
+        } else {
+            &raw_text
+        };
+
+        let piece = if valid_text.len() > self.window_emitted_bytes {
+            let safe_idx = if valid_text.is_char_boundary(self.window_emitted_bytes) {
+                self.window_emitted_bytes
+            } else {
+                valid_text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= self.window_emitted_bytes)
+                    .unwrap_or(valid_text.len())
+            };
+            let delta = valid_text[safe_idx..].to_string();
+            self.window_emitted_bytes = valid_text.len();
+            delta
+        } else {
+            String::new()
+        };
+
+        // Slide window only when no incomplete UTF-8 sequence is pending,
+        // so that multi-byte code points are never split across window boundaries.
+        if !ends_with_replacement && self.tokens.len() > self.window_size {
+            let drop_count = self.tokens.len() - self.window_size;
+            self.tokens.drain(0..drop_count);
+            let new_text = tokenizer.decode(&self.tokens, true).unwrap_or_default();
+            let new_valid = if new_text.ends_with('\u{FFFD}') {
+                new_text.trim_end_matches('\u{FFFD}')
+            } else {
+                &new_text
+            };
+            self.window_emitted_bytes = new_valid.len();
+        }
+
+        piece
+    }
+
+    /// Flushes any remaining un-emitted text on stream completion.
+    pub fn flush(&mut self, tokenizer: &dyn TokenizerService) -> String {
+        if self.tokens.is_empty() {
+            return String::new();
+        }
+        let full_text = tokenizer.decode(&self.tokens, true).unwrap_or_default();
+        if full_text.len() > self.window_emitted_bytes {
+            let safe_idx = if full_text.is_char_boundary(self.window_emitted_bytes) {
+                self.window_emitted_bytes
+            } else {
+                full_text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= self.window_emitted_bytes)
+                    .unwrap_or(full_text.len())
+            };
+            let piece = full_text[safe_idx..].to_string();
+            self.window_emitted_bytes = full_text.len();
+            piece
+        } else {
+            String::new()
+        }
+    }
 }
 
 pub async fn chat_completions_handler(
@@ -262,6 +376,7 @@ pub async fn chat_completions_handler(
     let tok_clone = handle.tokenizer.clone();
     let metrics_clone = handle.metrics.clone();
     if payload.stream.unwrap_or(false) {
+        let detok = StreamingDetokenizer::new(6);
         let sse_stream = stream::unfold(
             (
                 token_rx,
@@ -269,51 +384,18 @@ pub async fn chat_completions_handler(
                 req_id,
                 metrics_clone,
                 _guard,
-                Vec::<u32>::new(),
-                0usize,
+                detok,
+                false,
                 false,
             ),
-            |(
-                mut rx,
-                tokenizer_opt,
-                id,
-                metrics,
-                guard,
-                mut token_history,
-                mut last_decoded_len,
-                finished,
-            )| async move {
+            |(mut rx, tokenizer_opt, id, metrics, guard, mut detok, mut flushed, finished)| async move {
                 if finished {
                     return None;
                 }
                 match rx.recv().await {
                     Some(tok_id) => {
                         metrics.total_tokens_emitted.fetch_add(1, Ordering::Relaxed);
-                        token_history.push(tok_id);
-                        let full_text = tokenizer_opt
-                            .decode(&token_history, true)
-                            .unwrap_or_default();
-                        let valid_text = if full_text.ends_with('\u{FFFD}') {
-                            full_text.trim_end_matches('\u{FFFD}')
-                        } else {
-                            &full_text
-                        };
-                        let new_piece = if valid_text.len() > last_decoded_len {
-                            let safe_idx = if valid_text.is_char_boundary(last_decoded_len) {
-                                last_decoded_len
-                            } else {
-                                valid_text
-                                    .char_indices()
-                                    .map(|(i, _)| i)
-                                    .find(|&i| i >= last_decoded_len)
-                                    .unwrap_or(valid_text.len())
-                            };
-                            let piece = valid_text[safe_idx..].to_string();
-                            last_decoded_len = valid_text.len();
-                            piece
-                        } else {
-                            String::new()
-                        };
+                        let new_piece = detok.step(tok_id, &*tokenizer_opt);
                         let chunk_json = format!(
                             r#"{{"id":"chatcmpl-{}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{:?}}},"finish_reason":null}}]}}"#,
                             id, new_piece
@@ -322,66 +404,29 @@ pub async fn chat_completions_handler(
                             Ok::<Event, std::convert::Infallible>(
                                 Event::default().data(chunk_json),
                             ),
-                            (
-                                rx,
-                                tokenizer_opt,
-                                id,
-                                metrics,
-                                guard,
-                                token_history,
-                                last_decoded_len,
-                                false,
-                            ),
+                            (rx, tokenizer_opt, id, metrics, guard, detok, flushed, false),
                         ))
                     }
                     None => {
-                        let full_text = tokenizer_opt
-                            .decode(&token_history, true)
-                            .unwrap_or_default();
-                        if full_text.len() > last_decoded_len {
-                            let safe_idx = if full_text.is_char_boundary(last_decoded_len) {
-                                last_decoded_len
-                            } else {
-                                full_text
-                                    .char_indices()
-                                    .map(|(i, _)| i)
-                                    .find(|&i| i >= last_decoded_len)
-                                    .unwrap_or(full_text.len())
-                            };
-                            let piece = full_text[safe_idx..].to_string();
-                            last_decoded_len = full_text.len();
-                            let chunk_json = format!(
-                                r#"{{"id":"chatcmpl-{}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{:?}}},"finish_reason":null}}]}}"#,
-                                id, piece
-                            );
-                            return Some((
-                                Ok::<Event, std::convert::Infallible>(
-                                    Event::default().data(chunk_json),
-                                ),
-                                (
-                                    rx,
-                                    tokenizer_opt,
-                                    id,
-                                    metrics,
-                                    guard,
-                                    token_history,
-                                    last_decoded_len,
-                                    false,
-                                ),
-                            ));
+                        if !flushed {
+                            flushed = true;
+                            let piece = detok.flush(&*tokenizer_opt);
+                            if !piece.is_empty() {
+                                let chunk_json = format!(
+                                    r#"{{"id":"chatcmpl-{}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"content":{:?}}},"finish_reason":null}}]}}"#,
+                                    id, piece
+                                );
+                                return Some((
+                                    Ok::<Event, std::convert::Infallible>(
+                                        Event::default().data(chunk_json),
+                                    ),
+                                    (rx, tokenizer_opt, id, metrics, guard, detok, flushed, false),
+                                ));
+                            }
                         }
                         Some((
                             Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]")),
-                            (
-                                rx,
-                                tokenizer_opt,
-                                id,
-                                metrics,
-                                guard,
-                                token_history,
-                                last_decoded_len,
-                                true,
-                            ),
+                            (rx, tokenizer_opt, id, metrics, guard, detok, flushed, true),
                         ))
                     }
                 }

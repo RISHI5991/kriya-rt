@@ -12,6 +12,39 @@
 using namespace metal;
 
 // ============================================================================
+// Compile-Time Metal Function Constants (Milestone 1 Optimization)
+// ============================================================================
+constant bool fc_has_qkv_bias       [[function_constant(0)]];
+constant uint fc_activation_variant [[function_constant(1)]];
+constant uint fc_head_dim           [[function_constant(2)]];
+constant uint fc_gqa_ratio          [[function_constant(3)]];
+constant bool fc_apply_qk_norm      [[function_constant(4)]];
+constant bool fc_has_logit_softcap  [[function_constant(5)]];
+constant bool fc_zero_centered      [[function_constant(6)]];
+
+inline bool get_fc_has_qkv_bias() {
+    return is_function_constant_defined(fc_has_qkv_bias) ? fc_has_qkv_bias : false;
+}
+inline uint get_fc_activation_variant() {
+    return is_function_constant_defined(fc_activation_variant) ? fc_activation_variant : 0u;
+}
+inline uint get_fc_head_dim() {
+    return is_function_constant_defined(fc_head_dim) ? fc_head_dim : 0u;
+}
+inline uint get_fc_gqa_ratio() {
+    return is_function_constant_defined(fc_gqa_ratio) ? fc_gqa_ratio : 0u;
+}
+inline bool get_fc_apply_qk_norm() {
+    return is_function_constant_defined(fc_apply_qk_norm) ? fc_apply_qk_norm : false;
+}
+inline bool get_fc_has_logit_softcap() {
+    return is_function_constant_defined(fc_has_logit_softcap) ? fc_has_logit_softcap : false;
+}
+inline bool get_fc_zero_centered() {
+    return is_function_constant_defined(fc_zero_centered) ? fc_zero_centered : false;
+}
+
+// ============================================================================
 // 1. Shared Structures Matching `kriya-kv` (File #4) & `kriya-core` (File #2)
 // ============================================================================
 
@@ -110,7 +143,8 @@ kernel void fused_qknorm_rope_and_kv_append(
 
     // 1. Compute optional per-head RMSNorm scale across SIMD lanes
     float sum_sq = 0.0f;
-    if (params.apply_qk_norm != 0u) {
+    const bool do_qk_norm = get_fc_apply_qk_norm() || (params.apply_qk_norm != 0u);
+    if (do_qk_norm) {
         for (uint d = lane_id; d < D; d += 32u) {
             float v = is_q_head
                 ? bf16_to_f32(q_inout[(req_idx * params.num_q_heads + local_head) * D + d])
@@ -119,7 +153,7 @@ kernel void fused_qknorm_rope_and_kv_append(
         }
         sum_sq = simd_sum(sum_sq);
     }
-    const float rms_scale = (params.apply_qk_norm != 0u)
+    const float rms_scale = do_qk_norm
         ? rsqrt((sum_sq / float(D)) + params.rms_eps)
         : 1.0f;
 
@@ -227,9 +261,10 @@ kernel void bsr_paged_gqa_decode_stage1(
 
     const CtaWorkTile tile = cta_tiles[tile_idx];
     const uint req_idx   = tile.request_idx;
-    const uint gqa_ratio = params.num_q_heads / params.num_kv_heads;
+    const uint gqa_ratio = (get_fc_gqa_ratio() != 0u) ? get_fc_gqa_ratio() : (params.num_q_heads / params.num_kv_heads);
     const uint kv_head   = q_head / gqa_ratio;
-    const uint D         = params.head_dim;
+    const uint D         = (get_fc_head_dim() != 0u) ? get_fc_head_dim() : params.head_dim;
+    const bool has_softcap = get_fc_has_logit_softcap() || (params.logit_softcap > 0.0f);
 
     const uint q_base = (req_idx * params.num_q_heads + q_head) * D;
 
@@ -270,7 +305,7 @@ kernel void bsr_paged_gqa_decode_stage1(
 
                 float dot = fma(q0, k0, q1 * k1);
                 float score = simd_sum(dot);
-                if (params.logit_softcap > 0.0f) {
+                if (has_softcap) {
                     score = safe_tanh(score / params.logit_softcap) * params.logit_softcap;
                 }
 
@@ -339,7 +374,7 @@ kernel void bsr_paged_gqa_decode_stage1(
 
                 float dot = fma(q_reg[0], k0, fma(q_reg[1], k1, fma(q_reg[2], k2, q_reg[3] * k3)));
                 float score = simd_sum(dot);
-                if (params.logit_softcap > 0.0f) {
+                if (has_softcap) {
                     score = safe_tanh(score / params.logit_softcap) * params.logit_softcap;
                 }
 
@@ -412,7 +447,7 @@ kernel void bsr_paged_gqa_decode_stage1(
                     }
                 }
                 float score = simd_sum(dot);
-                if (params.logit_softcap > 0.0f) {
+                if (has_softcap) {
                     score = safe_tanh(score / params.logit_softcap) * params.logit_softcap;
                 }
                 float m_new = max(m_i, score);
