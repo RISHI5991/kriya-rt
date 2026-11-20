@@ -13,8 +13,47 @@
 using namespace metal;
 
 // ============================================================================
+// Compile-Time Metal Function Constants (Milestone 1 Optimization)
+// ============================================================================
+constant bool fc_has_qkv_bias       [[function_constant(0)]];
+constant uint fc_activation_variant [[function_constant(1)]];
+constant uint fc_head_dim           [[function_constant(2)]];
+constant uint fc_gqa_ratio          [[function_constant(3)]];
+constant bool fc_apply_qk_norm      [[function_constant(4)]];
+constant bool fc_has_logit_softcap  [[function_constant(5)]];
+constant bool fc_zero_centered      [[function_constant(6)]];
+
+inline bool get_fc_has_qkv_bias() {
+    return is_function_constant_defined(fc_has_qkv_bias) ? fc_has_qkv_bias : false;
+}
+inline uint get_fc_activation_variant() {
+    return is_function_constant_defined(fc_activation_variant) ? fc_activation_variant : 0u;
+}
+inline uint get_fc_head_dim() {
+    return is_function_constant_defined(fc_head_dim) ? fc_head_dim : 0u;
+}
+inline uint get_fc_gqa_ratio() {
+    return is_function_constant_defined(fc_gqa_ratio) ? fc_gqa_ratio : 0u;
+}
+inline bool get_fc_apply_qk_norm() {
+    return is_function_constant_defined(fc_apply_qk_norm) ? fc_apply_qk_norm : false;
+}
+inline bool get_fc_has_logit_softcap() {
+    return is_function_constant_defined(fc_has_logit_softcap) ? fc_has_logit_softcap : false;
+}
+inline bool get_fc_zero_centered() {
+    return is_function_constant_defined(fc_zero_centered) ? fc_zero_centered : false;
+}
+
+// ============================================================================
 // 1. Data Structures & In-Register Dequantization Helpers
 // ============================================================================
+
+/// 16-byte aligned 32-byte Q4 block containing 64 4-bit nibbles packed into two native 128-bit uint4 vectors.
+/// Guarantees 100% coalesced 16-byte memory bus transactions on Apple Silicon unified memory controllers.
+struct alignas(16) ScaledAlignedQ4Block {
+    uint4 packed_nibbles[2]; // 32 bytes, 16-byte aligned
+};
 
 /// Matches `BlockQ4Group64` in `crates/kriya-core/src/tensor.rs` (36 bytes packed).
 struct BlockQ4Group64 {
@@ -100,6 +139,274 @@ inline ushort f32_to_bf16(float val) {
 // ============================================================================
 // 2. Decode Path: Memory-Bandwidth-Bound M=1 GEMV Kernel (coalesced vector loads)
 // ============================================================================
+
+/// In-register distributive 64-element block dot product for 16-byte aligned weights:
+/// sum(w_i * x_i) = scale * sum(q_i * x_i) + bias * sum(x_i)
+/// Guarantees 100% coalesced 16-byte vector loads from native uint4 packed_nibbles.
+inline float q4_aligned_block_dot_distributive(
+    const ScaledAlignedQ4Block blk,
+    const ushort2 sb,
+    device const ushort* x_ptr
+) {
+    const float scale = bf16_to_f32(sb.x);
+    const float bias  = bf16_to_f32(sb.y);
+
+    const uint4 vec_lo = blk.packed_nibbles[0];
+    const uint4 vec_hi = blk.packed_nibbles[1];
+
+    float sum_qx0 = 0.0f;
+    float sum_qx1 = 0.0f;
+    float sum_x0  = 0.0f;
+    float sum_x1  = 0.0f;
+
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word = vec_lo[w_i];
+        uint x_base = w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte_val = (word >> (b * 8u)) & 0xFFu;
+            float q0 = float(byte_val & 0x0Fu);
+            float q1 = float(byte_val >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0 = fma(q0, x0, sum_qx0);
+            sum_qx1 = fma(q1, x1, sum_qx1);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word = vec_hi[w_i];
+        uint x_base = 32u + w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint byte_val = (word >> (b * 8u)) & 0xFFu;
+            float q0 = float(byte_val & 0x0Fu);
+            float q1 = float(byte_val >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0 = fma(q0, x0, sum_qx0);
+            sum_qx1 = fma(q1, x1, sum_qx1);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    return fma(sum_qx0 + sum_qx1, scale, (sum_x0 + sum_x1) * bias);
+}
+
+/// In-register distributive 64-element block dot product computed across TWO rows simultaneously.
+inline void q4_aligned_2row_block_dot_distributive(
+    const ScaledAlignedQ4Block blk0,
+    const ushort2 sb0,
+    const ScaledAlignedQ4Block blk1,
+    const ushort2 sb1,
+    device const ushort* x_ptr,
+    thread float& acc0,
+    thread float& acc1
+) {
+    const float scale0 = bf16_to_f32(sb0.x);
+    const float bias0  = bf16_to_f32(sb0.y);
+    const float scale1 = bf16_to_f32(sb1.x);
+    const float bias1  = bf16_to_f32(sb1.y);
+
+    const uint4 vec_lo0 = blk0.packed_nibbles[0];
+    const uint4 vec_hi0 = blk0.packed_nibbles[1];
+    const uint4 vec_lo1 = blk1.packed_nibbles[0];
+    const uint4 vec_hi1 = blk1.packed_nibbles[1];
+
+    float sum_qx0_r0 = 0.0f;
+    float sum_qx1_r0 = 0.0f;
+    float sum_qx0_r1 = 0.0f;
+    float sum_qx1_r1 = 0.0f;
+    float sum_x0     = 0.0f;
+    float sum_x1     = 0.0f;
+
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_lo0[w_i];
+        uint word1 = vec_lo1[w_i];
+        uint x_base = w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_hi0[w_i];
+        uint word1 = vec_hi1[w_i];
+        uint x_base = 32u + w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    acc0 += fma(sum_qx0_r0 + sum_qx1_r0, scale0, (sum_x0 + sum_x1) * bias0);
+    acc1 += fma(sum_qx0_r1 + sum_qx1_r1, scale1, (sum_x0 + sum_x1) * bias1);
+}
+
+/// In-register distributive 64-element block dot product computed across FOUR rows simultaneously.
+inline void q4_aligned_4row_block_dot_distributive(
+    const ScaledAlignedQ4Block blk0, const ushort2 sb0,
+    const ScaledAlignedQ4Block blk1, const ushort2 sb1,
+    const ScaledAlignedQ4Block blk2, const ushort2 sb2,
+    const ScaledAlignedQ4Block blk3, const ushort2 sb3,
+    device const ushort* x_ptr,
+    thread float& acc0,
+    thread float& acc1,
+    thread float& acc2,
+    thread float& acc3
+) {
+    const float scale0 = bf16_to_f32(sb0.x);
+    const float bias0  = bf16_to_f32(sb0.y);
+    const float scale1 = bf16_to_f32(sb1.x);
+    const float bias1  = bf16_to_f32(sb1.y);
+    const float scale2 = bf16_to_f32(sb2.x);
+    const float bias2  = bf16_to_f32(sb2.y);
+    const float scale3 = bf16_to_f32(sb3.x);
+    const float bias3  = bf16_to_f32(sb3.y);
+
+    const uint4 vec_lo0 = blk0.packed_nibbles[0];
+    const uint4 vec_hi0 = blk0.packed_nibbles[1];
+    const uint4 vec_lo1 = blk1.packed_nibbles[0];
+    const uint4 vec_hi1 = blk1.packed_nibbles[1];
+    const uint4 vec_lo2 = blk2.packed_nibbles[0];
+    const uint4 vec_hi2 = blk2.packed_nibbles[1];
+    const uint4 vec_lo3 = blk3.packed_nibbles[0];
+    const uint4 vec_hi3 = blk3.packed_nibbles[1];
+
+    float sum_qx0_r0 = 0.0f, sum_qx1_r0 = 0.0f;
+    float sum_qx0_r1 = 0.0f, sum_qx1_r1 = 0.0f;
+    float sum_qx0_r2 = 0.0f, sum_qx1_r2 = 0.0f;
+    float sum_qx0_r3 = 0.0f, sum_qx1_r3 = 0.0f;
+    float sum_x0     = 0.0f;
+    float sum_x1     = 0.0f;
+
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_lo0[w_i];
+        uint word1 = vec_lo1[w_i];
+        uint word2 = vec_lo2[w_i];
+        uint word3 = vec_lo3[w_i];
+        uint x_base = w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            uint byte_val2 = (word2 >> b_shift) & 0xFFu;
+            uint byte_val3 = (word3 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            float q0_2 = float(byte_val2 & 0x0Fu);
+            float q1_2 = float(byte_val2 >> 4u);
+            float q0_3 = float(byte_val3 & 0x0Fu);
+            float q1_3 = float(byte_val3 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_qx0_r2 = fma(q0_2, x0, sum_qx0_r2);
+            sum_qx1_r2 = fma(q1_2, x1, sum_qx1_r2);
+            sum_qx0_r3 = fma(q0_3, x0, sum_qx0_r3);
+            sum_qx1_r3 = fma(q1_3, x1, sum_qx1_r3);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    #pragma unroll
+    for (uint w_i = 0u; w_i < 4u; ++w_i) {
+        uint word0 = vec_hi0[w_i];
+        uint word1 = vec_hi1[w_i];
+        uint word2 = vec_hi2[w_i];
+        uint word3 = vec_hi3[w_i];
+        uint x_base = 32u + w_i * 8u;
+        uint4 x_vec = *reinterpret_cast<device const uint4*>(x_ptr + x_base);
+        #pragma unroll
+        for (uint b = 0u; b < 4u; ++b) {
+            uint b_shift = b * 8u;
+            uint byte_val0 = (word0 >> b_shift) & 0xFFu;
+            uint byte_val1 = (word1 >> b_shift) & 0xFFu;
+            uint byte_val2 = (word2 >> b_shift) & 0xFFu;
+            uint byte_val3 = (word3 >> b_shift) & 0xFFu;
+            float q0_0 = float(byte_val0 & 0x0Fu);
+            float q1_0 = float(byte_val0 >> 4u);
+            float q0_1 = float(byte_val1 & 0x0Fu);
+            float q1_1 = float(byte_val1 >> 4u);
+            float q0_2 = float(byte_val2 & 0x0Fu);
+            float q1_2 = float(byte_val2 >> 4u);
+            float q0_3 = float(byte_val3 & 0x0Fu);
+            float q1_3 = float(byte_val3 >> 4u);
+            uint x_pair = (b == 0u) ? x_vec.x : ((b == 1u) ? x_vec.y : ((b == 2u) ? x_vec.z : x_vec.w));
+            float x0 = as_type<float>((x_pair & 0xFFFFu) << 16u);
+            float x1 = as_type<float>(x_pair & 0xFFFF0000u);
+            sum_qx0_r0 = fma(q0_0, x0, sum_qx0_r0);
+            sum_qx1_r0 = fma(q1_0, x1, sum_qx1_r0);
+            sum_qx0_r1 = fma(q0_1, x0, sum_qx0_r1);
+            sum_qx1_r1 = fma(q1_1, x1, sum_qx1_r1);
+            sum_qx0_r2 = fma(q0_2, x0, sum_qx0_r2);
+            sum_qx1_r2 = fma(q1_2, x1, sum_qx1_r2);
+            sum_qx0_r3 = fma(q0_3, x0, sum_qx0_r3);
+            sum_qx1_r3 = fma(q1_3, x1, sum_qx1_r3);
+            sum_x0 += x0;
+            sum_x1 += x1;
+        }
+    }
+
+    acc0 += fma(sum_qx0_r0 + sum_qx1_r0, scale0, (sum_x0 + sum_x1) * bias0);
+    acc1 += fma(sum_qx0_r1 + sum_qx1_r1, scale1, (sum_x0 + sum_x1) * bias1);
+    acc2 += fma(sum_qx0_r2 + sum_qx1_r2, scale2, (sum_x0 + sum_x1) * bias2);
+    acc3 += fma(sum_qx0_r3 + sum_qx1_r3, scale3, (sum_x0 + sum_x1) * bias3);
+}
 
 /// In-register distributive 64-element block dot product:
 /// sum(w_i * x_i) = scale * sum(q_i * x_i) + bias * sum(x_i)
@@ -506,6 +813,119 @@ inline void q4_g64_4row_block_dot_distributive(
     acc1 += fma(sum_qx0_r1 + sum_qx1_r1, scale1, (sum_x0 + sum_x1) * bias1);
     acc2 += fma(sum_qx0_r2 + sum_qx1_r2, scale2, (sum_x0 + sum_x1) * bias2);
     acc3 += fma(sum_qx0_r3 + sum_qx1_r3, scale3, (sum_x0 + sum_x1) * bias3);
+}
+
+/// 16-Byte Aligned Vector-Coalesced M=1 Decode GEMV Kernel (32 lanes per row, persistent threadgroups).
+/// Buffer 0: weights (32B ScaledAlignedQ4Block, align(16))
+/// Buffer 1: scales_and_biases (4B ushort2 / half2)
+kernel void q4_aligned_decode_gemv(
+    device const ScaledAlignedQ4Block* weights           [[buffer(0)]],
+    device const ushort2*              scales_and_biases [[buffer(1)]],
+    device const ushort*               input_x           [[buffer(2)]],
+    device ushort*                     output_y          [[buffer(3)]],
+    constant GemmParams&               params            [[buffer(4)]],
+    uint3                              tgp_pos           [[threadgroup_position_in_grid]],
+    uint3                              grid_dim          [[threadgroups_per_grid]],
+    uint                               simd_id           [[simdgroup_index_in_threadgroup]],
+    uint                               simd_lane         [[thread_index_in_simdgroup]]
+) {
+    const uint total_tiles = (params.N + 3u) / 4u;
+    const uint num_blocks = params.num_k_blocks;
+
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row_idx = tile_x * 4u + simd_id;
+        if (row_idx >= params.N) {
+            continue;
+        }
+
+        device const ScaledAlignedQ4Block* row_blocks = weights + (row_idx * num_blocks);
+        device const ushort2* row_sb = scales_and_biases + (row_idx * num_blocks);
+
+        float acc = 0.0f;
+        for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+            acc += q4_aligned_block_dot_distributive(row_blocks[blk_idx], row_sb[blk_idx], input_x + (blk_idx * 64u));
+        }
+
+        float row_result = simd_sum(acc);
+        if (simd_lane == 0u) {
+            output_y[row_idx] = f32_to_bf16(row_result);
+        }
+    }
+}
+
+/// 16-Byte Aligned 4-Row Decode GEMV Kernel with Shared Activation Loads.
+kernel void q4_aligned_decode_gemv_4row(
+    device const ScaledAlignedQ4Block* weights           [[buffer(0)]],
+    device const ushort2*              scales_and_biases [[buffer(1)]],
+    device const ushort*               input_x           [[buffer(2)]],
+    device ushort*                     output_y          [[buffer(3)]],
+    constant GemmParams&               params            [[buffer(4)]],
+    uint3                              tgp_pos           [[threadgroup_position_in_grid]],
+    uint3                              grid_dim          [[threadgroups_per_grid]],
+    uint                               simd_id           [[simdgroup_index_in_threadgroup]],
+    uint                               simd_lane         [[thread_index_in_simdgroup]]
+) {
+    const uint total_tiles = (params.N + 15u) / 16u;
+    const uint num_blocks = params.num_k_blocks;
+
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint base_row = tile_x * 16u + simd_id * 4u;
+        const uint row0 = base_row;
+        const uint row1 = base_row + 1u;
+        const uint row2 = base_row + 2u;
+        const uint row3 = base_row + 3u;
+
+        if (row0 >= params.N) {
+            continue;
+        }
+
+        device const ScaledAlignedQ4Block* r0_w = weights + (row0 * num_blocks);
+        device const ushort2* r0_sb = scales_and_biases + (row0 * num_blocks);
+
+        const bool has_r1 = (row1 < params.N);
+        const bool has_r2 = (row2 < params.N);
+        const bool has_r3 = (row3 < params.N);
+
+        device const ScaledAlignedQ4Block* r1_w = has_r1 ? weights + (row1 * num_blocks) : r0_w;
+        device const ushort2* r1_sb = has_r1 ? scales_and_biases + (row1 * num_blocks) : r0_sb;
+        device const ScaledAlignedQ4Block* r2_w = has_r2 ? weights + (row2 * num_blocks) : r0_w;
+        device const ushort2* r2_sb = has_r2 ? scales_and_biases + (row2 * num_blocks) : r0_sb;
+        device const ScaledAlignedQ4Block* r3_w = has_r3 ? weights + (row3 * num_blocks) : r0_w;
+        device const ushort2* r3_sb = has_r3 ? scales_and_biases + (row3 * num_blocks) : r0_sb;
+
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+        if (has_r3) {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_aligned_4row_block_dot_distributive(
+                    r0_w[blk_idx], r0_sb[blk_idx],
+                    r1_w[blk_idx], r1_sb[blk_idx],
+                    r2_w[blk_idx], r2_sb[blk_idx],
+                    r3_w[blk_idx], r3_sb[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0, acc1, acc2, acc3
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                acc0 += q4_aligned_block_dot_distributive(r0_w[blk_idx], r0_sb[blk_idx], input_x + (blk_idx * 64u));
+                if (has_r1) acc1 += q4_aligned_block_dot_distributive(r1_w[blk_idx], r1_sb[blk_idx], input_x + (blk_idx * 64u));
+                if (has_r2) acc2 += q4_aligned_block_dot_distributive(r2_w[blk_idx], r2_sb[blk_idx], input_x + (blk_idx * 64u));
+            }
+        }
+
+        float res0 = simd_sum(acc0);
+        float res1 = has_r1 ? simd_sum(acc1) : 0.0f;
+        float res2 = has_r2 ? simd_sum(acc2) : 0.0f;
+        float res3 = has_r3 ? simd_sum(acc3) : 0.0f;
+
+        if (simd_lane == 0u) {
+            output_y[row0] = f32_to_bf16(res0);
+            if (has_r1) output_y[row1] = f32_to_bf16(res1);
+            if (has_r2) output_y[row2] = f32_to_bf16(res2);
+            if (has_r3) output_y[row3] = f32_to_bf16(res3);
+        }
+    }
 }
 
 /// 128-Bit Vector-Coalesced M=1 Decode GEMV Kernel (32 lanes per row, persistent threadgroups).
@@ -1045,6 +1465,99 @@ inline QkvRowMeta get_qkv_row_meta(
     return meta;
 }
 
+/// 16-Byte Aligned Consolidated QKV Decode GEMV Kernel (M = 1, persistent threadgroups).
+/// Eliminates 3-buffer branch logic by using direct row indexing into unified QKV buffer:
+/// row `r` indexes `weights + r * num_k_blocks` directly.
+/// Buffer 0: weights (32B ScaledAlignedQ4Block, align(16))
+/// Buffer 1: scales_and_biases (4B ushort2 / half2)
+/// Buffer 2: input_x (bf16 [1, K])
+/// Buffer 3: q_out (bf16 [1, q_dim])
+/// Buffer 4: k_out (bf16 [1, k_dim])
+/// Buffer 5: v_out (bf16 [1, v_dim])
+/// Buffer 6: qkv_bias (bf16 [q_dim + k_dim + v_dim], optional)
+/// Buffer 7: params (QkvGemmParams)
+kernel void q4_aligned_decode_qkv_gemv_2row(
+    device const ScaledAlignedQ4Block* weights           [[buffer(0)]],
+    device const ushort2*              scales_and_biases [[buffer(1)]],
+    device const ushort*               input_x           [[buffer(2)]],
+    device ushort*                     q_out             [[buffer(3)]],
+    device ushort*                     k_out             [[buffer(4)]],
+    device ushort*                     v_out             [[buffer(5)]],
+    device const ushort*               qkv_bias          [[buffer(6)]],
+    constant QkvGemmParams&            params            [[buffer(7)]],
+    uint3                              tgp_pos           [[threadgroup_position_in_grid]],
+    uint3                              grid_dim          [[threadgroups_per_grid]],
+    uint                               simd_id           [[simdgroup_index_in_threadgroup]],
+    uint                               simd_lane         [[thread_index_in_simdgroup]]
+) {
+    const uint total_rows = params.q_dim + params.k_dim + params.v_dim;
+    const uint total_tiles = (total_rows + 7u) / 8u;
+    const uint num_blocks = params.num_k_blocks;
+    const bool has_bias = get_fc_has_qkv_bias() || (params.has_bias != 0u);
+
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint row0 = tile_x * 8u + simd_id * 2u;
+        const uint row1 = row0 + 1u;
+        if (row0 >= total_rows) {
+            continue;
+        }
+
+        device const ScaledAlignedQ4Block* row0_w = weights + (row0 * num_blocks);
+        device const ushort2* row0_sb = scales_and_biases + (row0 * num_blocks);
+
+        const bool has_row1 = (row1 < total_rows);
+        device const ScaledAlignedQ4Block* row1_w = has_row1 ? weights + (row1 * num_blocks) : row0_w;
+        device const ushort2* row1_sb = has_row1 ? scales_and_biases + (row1 * num_blocks) : row0_sb;
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+
+        if (has_row1) {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_aligned_2row_block_dot_distributive(
+                    row0_w[blk_idx], row0_sb[blk_idx],
+                    row1_w[blk_idx], row1_sb[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc0, acc1
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                acc0 += q4_aligned_block_dot_distributive(row0_w[blk_idx], row0_sb[blk_idx], input_x + (blk_idx * 64u));
+            }
+        }
+
+        float res0 = simd_sum(acc0);
+        float res1 = has_row1 ? simd_sum(acc1) : 0.0f;
+
+        if (simd_lane == 0u) {
+            if (has_bias && qkv_bias != nullptr) {
+                res0 += bf16_to_f32(qkv_bias[row0]);
+            }
+            if (row0 < params.q_dim) {
+                q_out[row0] = f32_to_bf16(res0);
+            } else if (row0 < params.q_dim + params.k_dim) {
+                k_out[row0 - params.q_dim] = f32_to_bf16(res0);
+            } else {
+                v_out[row0 - (params.q_dim + params.k_dim)] = f32_to_bf16(res0);
+            }
+
+            if (has_row1) {
+                if (has_bias && qkv_bias != nullptr) {
+                    res1 += bf16_to_f32(qkv_bias[row1]);
+                }
+                if (row1 < params.q_dim) {
+                    q_out[row1] = f32_to_bf16(res1);
+                } else if (row1 < params.q_dim + params.k_dim) {
+                    k_out[row1 - params.q_dim] = f32_to_bf16(res1);
+                } else {
+                    v_out[row1 - (params.q_dim + params.k_dim)] = f32_to_bf16(res1);
+                }
+            }
+        }
+    }
+}
+
 /// 2-Row Distributive Fused QKV Decode GEMV Kernel (M = 1, persistent threadgroups).
 /// Each SIMDgroup computes TWO output rows simultaneously using shared activation vector loads,
 /// cutting activation DRAM memory traffic and instruction overhead by 50%.
@@ -1387,6 +1900,102 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv(
     }
 }
 
+/// 16-Byte Aligned 2-Channel Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, persistent threadgroups).
+kernel void q4_aligned_decode_gate_up_swiglu_gemv_2chan(
+    device const ScaledAlignedQ4Block* gate_weights      [[buffer(0)]],
+    device const ushort2*              gate_scales_bias  [[buffer(1)]],
+    device const ScaledAlignedQ4Block* up_weights        [[buffer(2)]],
+    device const ushort2*              up_scales_bias    [[buffer(3)]],
+    device const ushort*               input_x           [[buffer(4)]],
+    device ushort*                     mlp_out           [[buffer(5)]],
+    constant GateUpSwigluGemmParams&   params            [[buffer(6)]],
+    uint3                              tgp_pos           [[threadgroup_position_in_grid]],
+    uint3                              grid_dim          [[threadgroups_per_grid]],
+    uint                               simd_id           [[simdgroup_index_in_threadgroup]],
+    uint                               simd_lane         [[thread_index_in_simdgroup]]
+) {
+    const uint total_tiles = (params.intermediate_size + 7u) / 8u;
+    const uint num_blocks = params.num_k_blocks;
+    const uint act_var = (get_fc_activation_variant() != 0u) ? get_fc_activation_variant() : params.activation_variant;
+
+    for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
+        const uint chan0 = tile_x * 8u + simd_id * 2u;
+        const uint chan1 = chan0 + 1u;
+        if (chan0 >= params.intermediate_size) {
+            continue;
+        }
+
+        device const ScaledAlignedQ4Block* gate_row0 = gate_weights + (chan0 * num_blocks);
+        device const ushort2*              gate_sb0  = gate_scales_bias + (chan0 * num_blocks);
+        device const ScaledAlignedQ4Block* up_row0   = up_weights   + (chan0 * num_blocks);
+        device const ushort2*              up_sb0    = up_scales_bias + (chan0 * num_blocks);
+
+        const bool has_chan1 = (chan1 < params.intermediate_size);
+        device const ScaledAlignedQ4Block* gate_row1 = has_chan1 ? gate_weights + (chan1 * num_blocks) : gate_row0;
+        device const ushort2*              gate_sb1  = has_chan1 ? gate_scales_bias + (chan1 * num_blocks) : gate_sb0;
+        device const ScaledAlignedQ4Block* up_row1   = has_chan1 ? up_weights   + (chan1 * num_blocks) : up_row0;
+        device const ushort2*              up_sb1    = has_chan1 ? up_scales_bias + (chan1 * num_blocks) : up_sb0;
+
+        float acc_gate0 = 0.0f, acc_up0 = 0.0f;
+        float acc_gate1 = 0.0f, acc_up1 = 0.0f;
+
+        if (has_chan1) {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_aligned_4row_block_dot_distributive(
+                    gate_row0[blk_idx], gate_sb0[blk_idx],
+                    up_row0[blk_idx],   up_sb0[blk_idx],
+                    gate_row1[blk_idx], gate_sb1[blk_idx],
+                    up_row1[blk_idx],   up_sb1[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc_gate0, acc_up0, acc_gate1, acc_up1
+                );
+            }
+        } else {
+            for (uint blk_idx = simd_lane; blk_idx < num_blocks; blk_idx += 32u) {
+                q4_aligned_2row_block_dot_distributive(
+                    gate_row0[blk_idx], gate_sb0[blk_idx],
+                    up_row0[blk_idx],   up_sb0[blk_idx],
+                    input_x + (blk_idx * 64u),
+                    acc_gate0, acc_up0
+                );
+            }
+        }
+
+        float g0 = simd_sum(acc_gate0);
+        float u0 = simd_sum(acc_up0);
+        float g1 = has_chan1 ? simd_sum(acc_gate1) : 0.0f;
+        float u1 = has_chan1 ? simd_sum(acc_up1) : 0.0f;
+
+        if (simd_lane == 0u) {
+            float act_g0 = 0.0f;
+            if (act_var == 0u) {
+                act_g0 = g0 / (1.0f + exp(-g0));
+            } else if (act_var == 1u) {
+                constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+                float cubic = fma(0.044715f * g0, g0 * g0, g0);
+                act_g0 = 0.5f * g0 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+            } else {
+                act_g0 = max(g0, 0.0f);
+            }
+            mlp_out[chan0] = f32_to_bf16(act_g0 * u0);
+
+            if (has_chan1) {
+                float act_g1 = 0.0f;
+                if (act_var == 0u) {
+                    act_g1 = g1 / (1.0f + exp(-g1));
+                } else if (act_var == 1u) {
+                    constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+                    float cubic = fma(0.044715f * g1, g1 * g1, g1);
+                    act_g1 = 0.5f * g1 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
+                } else {
+                    act_g1 = max(g1, 0.0f);
+                }
+                mlp_out[chan1] = f32_to_bf16(act_g1 * u1);
+            }
+        }
+    }
+}
+
 /// 2-Channel Fused Gate+Up+SwiGLU Decode GEMV Kernel (M = 1, 4 rows per SIMDgroup, persistent threadgroups).
 /// Concurrently computes Gate and Up projections for TWO intermediate channels in registers
 /// using 4-row distributive dot product, cutting activation DRAM bandwidth by 75%.
@@ -1404,6 +2013,7 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv_2chan(
 ) {
     const uint total_tiles = (params.intermediate_size + 7u) / 8u;
     const uint num_blocks = params.num_k_blocks;
+    const uint act_var = (get_fc_activation_variant() != 0u) ? get_fc_activation_variant() : params.activation_variant;
 
     for (uint tile_x = tgp_pos.x; tile_x < total_tiles; tile_x += grid_dim.x) {
         const uint chan0 = tile_x * 8u + simd_id * 2u;
@@ -1451,9 +2061,9 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv_2chan(
         if (simd_lane == 0u) {
             // Channel 0 activation
             float act_g0 = 0.0f;
-            if (params.activation_variant == 0u) {
+            if (act_var == 0u) {
                 act_g0 = g0 / (1.0f + exp(-g0));
-            } else if (params.activation_variant == 1u) {
+            } else if (act_var == 1u) {
                 constexpr float SQRT_2_OVER_PI = 0.7978845608f;
                 float cubic = fma(0.044715f * g0, g0 * g0, g0);
                 act_g0 = 0.5f * g0 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));
@@ -1465,9 +2075,9 @@ kernel void q4_g64_decode_gate_up_swiglu_gemv_2chan(
             // Channel 1 activation
             if (has_chan1) {
                 float act_g1 = 0.0f;
-                if (params.activation_variant == 0u) {
+                if (act_var == 0u) {
                     act_g1 = g1 / (1.0f + exp(-g1));
-                } else if (params.activation_variant == 1u) {
+                } else if (act_var == 1u) {
                     constexpr float SQRT_2_OVER_PI = 0.7978845608f;
                     float cubic = fma(0.044715f * g1, g1 * g1, g1);
                     act_g1 = 0.5f * g1 * (1.0f + tanh(SQRT_2_OVER_PI * cubic));

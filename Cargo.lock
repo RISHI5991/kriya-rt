@@ -1023,6 +1023,7 @@ dependencies = [
  "kriya-speculate",
  "metal",
  "objc",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

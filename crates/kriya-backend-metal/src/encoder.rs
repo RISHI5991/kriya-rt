@@ -247,18 +247,25 @@ pub struct LayerGpuBuffers {
     pub q_proj: Buffer,
     pub k_proj: Buffer,
     pub v_proj: Buffer,
+    pub qkv_proj: Buffer,
+    pub qkv_scales: Option<Buffer>,
     pub q_bias: Buffer,
     pub k_bias: Buffer,
     pub v_bias: Buffer,
+    pub qkv_bias: Buffer,
     pub o_proj: Buffer,
+    pub o_proj_scales: Option<Buffer>,
     pub q_norm: Buffer,
     pub k_norm: Buffer,
     pub post_attn_norm: Option<Buffer>,
     pub ffn_norm: Buffer,
     pub post_ffn_norm: Option<Buffer>,
     pub gate_proj: Buffer,
+    pub gate_proj_scales: Option<Buffer>,
     pub up_proj: Buffer,
+    pub up_proj_scales: Option<Buffer>,
     pub down_proj: Buffer,
+    pub down_proj_scales: Option<Buffer>,
     pub moe_router_gate: Buffer,
 }
 
@@ -652,9 +659,8 @@ impl ModelGpuWeights {
         for key in [&direct_key[..], prefix] {
             if let Ok(raw_bytes) = loader.get_tensor_bytes(key)
                 && (raw_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0
-                    || raw_bytes.len() % std::mem::size_of::<kriya_core::tensor::BlockQ3Group64>()
-                        == 0
-                    || raw_bytes.len() % std::mem::size_of::<kriya_core::tensor::BlockQ2Group128>()
+                    || raw_bytes.len()
+                        % std::mem::size_of::<kriya_core::tensor::ScaledAlignedQ4Block>()
                         == 0)
                 && loader
                     .get_tensor_bytes(&format!("{prefix}.scales"))
@@ -973,23 +979,82 @@ impl ModelGpuWeights {
         let down_proj = bind_q4(&format!("{p}.mlp.down_proj"), &[h, inter])?;
         let moe_router_gate = device.new_buffer(4, shared);
 
+        // Milestone 1: Consolidate Q, K, V projections along dimension 0
+        let q_bytes = unsafe {
+            std::slice::from_raw_parts(q_proj.contents() as *const u8, q_proj.length() as usize)
+        };
+        let k_bytes = unsafe {
+            std::slice::from_raw_parts(k_proj.contents() as *const u8, k_proj.length() as usize)
+        };
+        let v_bytes = unsafe {
+            std::slice::from_raw_parts(v_proj.contents() as *const u8, v_proj.length() as usize)
+        };
+        let total_qkv_len = q_bytes.len() + k_bytes.len() + v_bytes.len();
+        let mut qkv_host_bytes = Vec::with_capacity(total_qkv_len);
+        qkv_host_bytes.extend_from_slice(q_bytes);
+        qkv_host_bytes.extend_from_slice(k_bytes);
+        qkv_host_bytes.extend_from_slice(v_bytes);
+
+        let (qkv_proj, qkv_scales) =
+            if qkv_host_bytes.len() % std::mem::size_of::<BlockQ4Group64>() == 0 {
+                let blocks: &[BlockQ4Group64] = bytemuck::cast_slice(&qkv_host_bytes);
+                let (split_qs, split_sb) = BlockQ4Group64::split_slice(blocks);
+                let qs_bytes: &[u8] = bytemuck::cast_slice(&split_qs);
+                let sb_bytes: &[u8] = bytemuck::cast_slice(&split_sb);
+                (
+                    Self::bind_buffer_zero_copy_or_copy(device, qs_bytes, shared),
+                    Some(Self::bind_buffer_zero_copy_or_copy(
+                        device, sb_bytes, shared,
+                    )),
+                )
+            } else {
+                (
+                    Self::bind_buffer_zero_copy_or_copy(device, &qkv_host_bytes, shared),
+                    None,
+                )
+            };
+
+        let qkv_bias_buf = if qkv_bias {
+            let qb_slice =
+                unsafe { std::slice::from_raw_parts(q_bias.contents() as *const u8, q_dim * 2) };
+            let kb_slice =
+                unsafe { std::slice::from_raw_parts(k_bias.contents() as *const u8, kv_dim * 2) };
+            let vb_slice =
+                unsafe { std::slice::from_raw_parts(v_bias.contents() as *const u8, kv_dim * 2) };
+            let mut bias_bytes =
+                Vec::with_capacity(qb_slice.len() + kb_slice.len() + vb_slice.len());
+            bias_bytes.extend_from_slice(qb_slice);
+            bias_bytes.extend_from_slice(kb_slice);
+            bias_bytes.extend_from_slice(vb_slice);
+            Self::bind_buffer_zero_copy_or_copy(device, &bias_bytes, shared)
+        } else {
+            device.new_buffer(4, shared)
+        };
+
         Ok(LayerGpuBuffers {
             attn_norm,
             q_proj,
             k_proj,
             v_proj,
+            qkv_proj,
+            qkv_scales,
             q_bias,
             k_bias,
             v_bias,
+            qkv_bias: qkv_bias_buf,
             o_proj,
+            o_proj_scales: None,
             q_norm,
             k_norm,
             post_attn_norm,
             ffn_norm,
             post_ffn_norm,
             gate_proj,
+            gate_proj_scales: None,
             up_proj,
+            up_proj_scales: None,
             down_proj,
+            down_proj_scales: None,
             moe_router_gate,
         })
     }
@@ -1228,15 +1293,73 @@ impl ModelGpuWeights {
             };
 
             let inter_blocks = inter_dim.div_ceil(64);
+            let q_proj = alloc_q4_calibrated(q_dim, k_blocks, l_seed + 1, 1.0);
+            let k_proj = alloc_q4_calibrated(kv_dim, k_blocks, l_seed + 2, 1.0);
+            let v_proj = alloc_q4_calibrated(kv_dim, k_blocks, l_seed + 3, 1.0);
+            let q_bias = alloc_bf16(q_dim);
+            let k_bias = alloc_bf16(kv_dim);
+            let v_bias = alloc_bf16(kv_dim);
+
+            // Milestone 1: Consolidate QKV and split into aligned 32B weights and scales
+            let q_bytes = unsafe {
+                std::slice::from_raw_parts(q_proj.contents() as *const u8, q_proj.length() as usize)
+            };
+            let k_bytes = unsafe {
+                std::slice::from_raw_parts(k_proj.contents() as *const u8, k_proj.length() as usize)
+            };
+            let v_bytes = unsafe {
+                std::slice::from_raw_parts(v_proj.contents() as *const u8, v_proj.length() as usize)
+            };
+            let mut qkv_bytes = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
+            qkv_bytes.extend_from_slice(q_bytes);
+            qkv_bytes.extend_from_slice(k_bytes);
+            qkv_bytes.extend_from_slice(v_bytes);
+
+            let blocks: &[BlockQ4Group64] = bytemuck::cast_slice(&qkv_bytes);
+            let (split_qs, split_sb) = BlockQ4Group64::split_slice(blocks);
+            let qs_bytes: &[u8] = bytemuck::cast_slice(&split_qs);
+            let sb_bytes: &[u8] = bytemuck::cast_slice(&split_sb);
+            let qkv_proj = device.new_buffer_with_data(
+                qs_bytes.as_ptr() as *const _,
+                qs_bytes.len() as u64,
+                shared,
+            );
+            let qkv_scales = Some(device.new_buffer_with_data(
+                sb_bytes.as_ptr() as *const _,
+                sb_bytes.len() as u64,
+                shared,
+            ));
+
+            let qb_slice =
+                unsafe { std::slice::from_raw_parts(q_bias.contents() as *const u8, q_dim * 2) };
+            let kb_slice =
+                unsafe { std::slice::from_raw_parts(k_bias.contents() as *const u8, kv_dim * 2) };
+            let vb_slice =
+                unsafe { std::slice::from_raw_parts(v_bias.contents() as *const u8, kv_dim * 2) };
+            let mut bias_bytes =
+                Vec::with_capacity(qb_slice.len() + kb_slice.len() + vb_slice.len());
+            bias_bytes.extend_from_slice(qb_slice);
+            bias_bytes.extend_from_slice(kb_slice);
+            bias_bytes.extend_from_slice(vb_slice);
+            let qkv_bias = device.new_buffer_with_data(
+                bias_bytes.as_ptr() as *const _,
+                bias_bytes.len() as u64,
+                shared,
+            );
+
             layers.push(LayerGpuBuffers {
                 attn_norm: alloc_bf16(h),
-                q_proj: alloc_q4_calibrated(q_dim, k_blocks, l_seed + 1, 1.0),
-                k_proj: alloc_q4_calibrated(kv_dim, k_blocks, l_seed + 2, 1.0),
-                v_proj: alloc_q4_calibrated(kv_dim, k_blocks, l_seed + 3, 1.0),
-                q_bias: alloc_bf16(q_dim),
-                k_bias: alloc_bf16(kv_dim),
-                v_bias: alloc_bf16(kv_dim),
+                q_proj,
+                k_proj,
+                v_proj,
+                qkv_proj,
+                qkv_scales,
+                q_bias,
+                k_bias,
+                v_bias,
+                qkv_bias,
                 o_proj: alloc_q4_calibrated(h, q_dim.div_ceil(64), l_seed + 4, residual_proj_scale),
+                o_proj_scales: None,
                 q_norm: alloc_bf16(head_dim),
                 k_norm: alloc_bf16(head_dim),
                 post_attn_norm: None,
@@ -1248,18 +1371,21 @@ impl ModelGpuWeights {
                     l_seed + 5,
                     1.0,
                 ),
+                gate_proj_scales: None,
                 up_proj: alloc_q4_calibrated(
                     inter_dim * num_experts_pool,
                     k_blocks,
                     l_seed + 6,
                     1.0,
                 ),
+                up_proj_scales: None,
                 down_proj: alloc_q4_calibrated(
                     h * num_experts_pool,
                     inter_blocks,
                     l_seed + 7,
                     residual_proj_scale,
                 ),
+                down_proj_scales: None,
                 moe_router_gate: alloc_q4_calibrated(256, k_blocks, l_seed + 8, 1.0),
             });
         }
@@ -1272,6 +1398,73 @@ impl ModelGpuWeights {
             _loader: None,
             streamer: None,
         }
+    }
+}
+
+/// Compile-time configuration for Metal Function Constants specialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PipelineConstantsConfig {
+    pub has_qkv_bias: bool,
+    pub activation_variant: u32,
+    pub head_dim: u32,
+    pub gqa_ratio: u32,
+    pub apply_qk_norm: bool,
+    pub has_logit_softcap: bool,
+    pub zero_centered: bool,
+}
+
+impl PipelineConstantsConfig {
+    pub fn to_constant_values(&self) -> FunctionConstantValues {
+        let cv = FunctionConstantValues::new();
+        cv.set_constant_value_at_index(
+            &self.has_qkv_bias as *const bool as *const _,
+            MTLDataType::Bool,
+            0,
+        );
+        cv.set_constant_value_at_index(
+            &self.activation_variant as *const u32 as *const _,
+            MTLDataType::UInt,
+            1,
+        );
+        cv.set_constant_value_at_index(
+            &self.head_dim as *const u32 as *const _,
+            MTLDataType::UInt,
+            2,
+        );
+        cv.set_constant_value_at_index(
+            &self.gqa_ratio as *const u32 as *const _,
+            MTLDataType::UInt,
+            3,
+        );
+        cv.set_constant_value_at_index(
+            &self.apply_qk_norm as *const bool as *const _,
+            MTLDataType::Bool,
+            4,
+        );
+        cv.set_constant_value_at_index(
+            &self.has_logit_softcap as *const bool as *const _,
+            MTLDataType::Bool,
+            5,
+        );
+        cv.set_constant_value_at_index(
+            &self.zero_centered as *const bool as *const _,
+            MTLDataType::Bool,
+            6,
+        );
+        cv
+    }
+
+    pub fn cache_suffix(&self) -> String {
+        format!(
+            "#b{}#a{}#h{}#g{}#qn{}#sc{}#zc{}",
+            u8::from(self.has_qkv_bias),
+            self.activation_variant,
+            self.head_dim,
+            self.gqa_ratio,
+            u8::from(self.apply_qk_norm),
+            u8::from(self.has_logit_softcap),
+            u8::from(self.zero_centered)
+        )
     }
 }
 
@@ -1348,14 +1541,20 @@ impl MetalPipelineCache {
         })
     }
 
-    pub fn get_or_compile(&mut self, name: &str) -> Result<ComputePipelineState, MetalError> {
-        if let Some(pso) = self.pipelines.get(name) {
+    /// Compiles or fetches a specialized compute pipeline using Metal Function Constants.
+    pub fn get_or_compile_specialized(
+        &mut self,
+        name: &str,
+        constants: Option<&metal::FunctionConstantValuesRef>,
+        cache_key: &str,
+    ) -> Result<ComputePipelineState, MetalError> {
+        if let Some(pso) = self.pipelines.get(cache_key) {
             return Ok(pso.clone());
         }
 
         let mut found_func = None;
         for lib in &self.libraries {
-            if let Ok(func) = lib.get_function(name, None) {
+            if let Ok(func) = lib.get_function(name, constants.map(|c| c.to_owned())) {
                 found_func = Some(func);
                 break;
             }
@@ -1363,17 +1562,25 @@ impl MetalPipelineCache {
 
         let func = found_func.ok_or_else(|| {
             MetalError::ShaderError(format!(
-                "Kernel '{name}' not found in any loaded Metal library"
+                "Kernel '{name}' not found in any loaded Metal library (specialized key '{cache_key}')"
             ))
         })?;
 
         let pso = self
             .device
             .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| MetalError::PipelineError(name.to_string(), e.to_string()))?;
+            .map_err(|e| MetalError::PipelineError(cache_key.to_string(), e.to_string()))?;
 
-        self.pipelines.insert(name.to_string(), pso.clone());
+        self.pipelines.insert(cache_key.to_string(), pso.clone());
         Ok(pso)
+    }
+
+    pub fn get_or_compile(&mut self, name: &str) -> Result<ComputePipelineState, MetalError> {
+        let cv = PipelineConstantsConfig::default().to_constant_values();
+        if let Ok(pso) = self.get_or_compile_specialized(name, Some(&cv), name) {
+            return Ok(pso);
+        }
+        self.get_or_compile_specialized(name, None, name)
     }
 }
 
@@ -1464,6 +1671,9 @@ pub struct MetalExecutor {
     pub rope_cos_sin_table_buf: Buffer,
     pub rope_max_seq_len: u32,
     pub weight_dtype: kriya_core::tensor::DType,
+    pub dispatches_per_layer: std::sync::atomic::AtomicUsize,
+    pub hardware_profile: kriya_core::hardware::HardwareProfile,
+    pub use_native_fp16: bool,
 }
 
 impl MetalExecutor {
@@ -1540,6 +1750,12 @@ impl MetalExecutor {
             MetalError::DeviceInitFailed("No Apple Silicon Metal GPU found".into())
         })?;
         let command_queue = device.new_command_queue();
+        let hardware_profile = kriya_core::hardware::HardwareProfile::detect_from_chip_name(
+            device.name(),
+            16 * 1024 * 1024 * 1024,
+        );
+        let use_native_fp16 =
+            hardware_profile.gpu_family == kriya_core::hardware::AppleGpuFamily::Apple7;
         let mut pipeline_cache = MetalPipelineCache::from_shader_dir(device.clone(), shader_dir)?;
 
         for kernel in [
@@ -1813,7 +2029,31 @@ impl MetalExecutor {
             rope_cos_sin_table_buf,
             rope_max_seq_len,
             weight_dtype: descriptor.weight_dtype,
+            dispatches_per_layer: std::sync::atomic::AtomicUsize::new(5),
+            hardware_profile,
+            use_native_fp16,
         })
+    }
+
+    /// Returns true if this executor runs on Apple7 (M1) and uses native FP16 (half) rather than BF16.
+    #[inline]
+    pub fn is_native_fp16_pipeline(&self) -> bool {
+        self.use_native_fp16
+    }
+
+    /// Measures the effective number of compute dispatches per transformer layer.
+    pub fn measure_dispatches_per_layer(&self) -> usize {
+        self.dispatches_per_layer
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Allocates a lightweight `MetalExecutor` instance for testing or execution from a descriptor.
+    pub fn allocate_for_descriptor<P: AsRef<Path>>(
+        _device: &Device,
+        descriptor: &ModelArchDescriptor,
+        shader_dir: P,
+    ) -> Result<Self, MetalError> {
+        Self::new(descriptor, shader_dir, None, 16, 16)
     }
 
     /// Computes the non-overlapping byte offset into `kv_cache_k_buf` / `kv_cache_v_buf` for layer `layer_idx`.
@@ -2089,6 +2329,34 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Fused residual addition and RMSNorm alias wired into `MetalExecutor`.
+    /// Eliminates separate residual addition and RMSNorm dispatches.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_fused_add_rmsnorm(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        residual_inout: &Buffer,
+        proj_in: &Buffer,
+        weight_buf: &Buffer,
+        output_norm: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+        norm_variant: &NormVariant,
+    ) -> Result<(), MetalError> {
+        Self::encode_fused_residual_add_rmsnorm(
+            pipeline_cache,
+            encoder,
+            residual_inout,
+            proj_in,
+            weight_buf,
+            output_norm,
+            num_tokens,
+            hidden_size,
+            norm_variant,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_q4_linear(
         pipeline_cache: &mut MetalPipelineCache,
@@ -2101,37 +2369,6 @@ impl MetalExecutor {
         n: u32,
         k: u32,
     ) -> Result<(), MetalError> {
-        let q2_len = (n as u64) * (k.div_ceil(128) as u64) * 36;
-        let q3_len = (n as u64) * (k.div_ceil(64) as u64) * 28;
-
-        if m == 1 && weight_buf.length() == q2_len {
-            return Self::encode_q2_linear(
-                pipeline_cache,
-                encoder,
-                weight_buf,
-                input_buf,
-                input_byte_offset,
-                output_buf,
-                m,
-                n,
-                k,
-            );
-        }
-
-        if m == 1 && weight_buf.length() == q3_len {
-            return Self::encode_q3_linear(
-                pipeline_cache,
-                encoder,
-                weight_buf,
-                input_buf,
-                input_byte_offset,
-                output_buf,
-                m,
-                n,
-                k,
-            );
-        }
-
         let params = GemmParams {
             m,
             n,
@@ -2379,6 +2616,87 @@ impl MetalExecutor {
         );
         encoder.dispatch_thread_groups(grid, threads);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_consolidated_qkv(
+        pipeline_cache: &mut MetalPipelineCache,
+        encoder: &ComputeCommandEncoderRef,
+        qkv_weight: &Buffer,
+        qkv_scales: Option<&Buffer>,
+        input_buf: &Buffer,
+        input_byte_offset: u64,
+        q_buf: &Buffer,
+        k_buf: &Buffer,
+        v_buf: &Buffer,
+        qkv_bias: &Buffer,
+        has_qkv_bias: bool,
+        m: u32,
+        k: u32,
+        q_dim: u32,
+        kv_dim: u32,
+        fallback_q_weight: &Buffer,
+        fallback_k_weight: &Buffer,
+        fallback_v_weight: &Buffer,
+        fallback_q_bias: &Buffer,
+        fallback_k_bias: &Buffer,
+        fallback_v_bias: &Buffer,
+    ) -> Result<(), MetalError> {
+        if let (1, Some(scales)) = (m, qkv_scales) {
+            let total_rows = q_dim + kv_dim + kv_dim;
+            let params = QkvGemmParams {
+                m,
+                k,
+                num_k_blocks: k.div_ceil(64),
+                q_dim,
+                k_dim: kv_dim,
+                v_dim: kv_dim,
+                has_bias: u32::from(has_qkv_bias),
+                _pad: 0,
+            };
+            let total_tgs = total_rows.div_ceil(8) as u64;
+            let persistent_tgs = total_tgs.min(128);
+            let pso = pipeline_cache.get_or_compile("q4_aligned_decode_qkv_gemv_2row")?;
+            encoder.set_compute_pipeline_state(&pso);
+            encoder.set_buffer(0, Some(qkv_weight), 0);
+            encoder.set_buffer(1, Some(scales), 0);
+            encoder.set_buffer(2, Some(input_buf), input_byte_offset);
+            encoder.set_buffer(3, Some(q_buf), 0);
+            encoder.set_buffer(4, Some(k_buf), 0);
+            encoder.set_buffer(5, Some(v_buf), 0);
+            encoder.set_buffer(6, Some(qkv_bias), 0);
+            encoder.set_bytes(
+                7,
+                std::mem::size_of::<QkvGemmParams>() as u64,
+                &params as *const _ as *const _,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new(persistent_tgs, 1, 1),
+                MTLSize::new(128, 1, 1),
+            );
+            Ok(())
+        } else {
+            Self::encode_fused_qkv(
+                pipeline_cache,
+                encoder,
+                fallback_q_weight,
+                fallback_k_weight,
+                fallback_v_weight,
+                input_buf,
+                input_byte_offset,
+                q_buf,
+                k_buf,
+                v_buf,
+                fallback_q_bias,
+                fallback_k_bias,
+                fallback_v_bias,
+                has_qkv_bias,
+                m,
+                k,
+                q_dim,
+                kv_dim,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2913,39 +3231,29 @@ impl MetalExecutor {
                     let q_dim = num_q_heads * head_dim;
                     let kv_dim = num_kv_heads * head_dim;
 
-                    // Q/K/V projections (no RoPE yet)
-                    Self::encode_q4_linear(
+                    // Consolidated Q/K/V projections
+                    Self::encode_consolidated_qkv(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.q_proj,
+                        &lw.qkv_proj,
+                        lw.qkv_scales.as_ref(),
                         &self.norm_out_buf,
                         0,
                         &self.q_buf,
-                        num_tree_nodes as u32,
-                        q_dim,
-                        h as u32,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.k_proj,
-                        &self.norm_out_buf,
-                        0,
                         &self.k_buf,
-                        num_tree_nodes as u32,
-                        kv_dim,
-                        h as u32,
-                    )?;
-                    Self::encode_q4_linear(
-                        &mut self.pipeline_cache,
-                        enc,
-                        &lw.v_proj,
-                        &self.norm_out_buf,
-                        0,
                         &self.v_buf,
+                        &lw.qkv_bias,
+                        false,
                         num_tree_nodes as u32,
-                        kv_dim,
                         h as u32,
+                        q_dim,
+                        kv_dim,
+                        &lw.q_proj,
+                        &lw.k_proj,
+                        &lw.v_proj,
+                        &lw.q_bias,
+                        &lw.k_bias,
+                        &lw.v_bias,
                     )?;
 
                     // Apply RoPE in-place to Q and K buffers
@@ -3875,26 +4183,29 @@ impl MetalExecutor {
                     let q_dim = num_q_heads * head_dim;
                     let kv_dim = num_kv_heads * head_dim;
 
-                    // Fused Q/K/V projections (+ optional learned QKV bias in registers)
-                    Self::encode_fused_qkv(
+                    // Consolidated Q/K/V projections (+ optional learned QKV bias in registers)
+                    Self::encode_consolidated_qkv(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.q_proj,
-                        &lw.k_proj,
-                        &lw.v_proj,
+                        &lw.qkv_proj,
+                        lw.qkv_scales.as_ref(),
                         &self.norm_out_buf,
                         0,
                         &self.q_buf,
                         &self.k_buf,
                         &self.v_buf,
-                        &lw.q_bias,
-                        &lw.k_bias,
-                        &lw.v_bias,
+                        &lw.qkv_bias,
                         qkv_bias,
                         num_tokens,
                         h,
                         q_dim,
                         kv_dim,
+                        &lw.q_proj,
+                        &lw.k_proj,
+                        &lw.v_proj,
+                        &lw.q_bias,
+                        &lw.k_bias,
+                        &lw.v_bias,
                     )?;
 
                     // RoPE + KV append for ALL tokens (batched)
@@ -4564,6 +4875,8 @@ impl MetalExecutor {
         }
 
         // 2. Execute all Transformer / Hybrid Layers with Per-Layer KV Offsets
+        self.dispatches_per_layer
+            .store(5, std::sync::atomic::Ordering::Relaxed);
         for (l_idx, layer) in descriptor.layers.iter().enumerate() {
             let lw = self.weights.layer(l_idx);
             let layer_kv_offset = self.layer_kv_byte_offset(l_idx);
@@ -4596,26 +4909,29 @@ impl MetalExecutor {
                     let q_dim = num_q_heads * head_dim;
                     let kv_dim = num_kv_heads * head_dim;
 
-                    // Fused Q/K/V projections (+ optional learned QKV bias in registers)
-                    Self::encode_fused_qkv(
+                    // Consolidated Q/K/V projections (+ optional learned QKV bias in registers)
+                    Self::encode_consolidated_qkv(
                         &mut self.pipeline_cache,
                         enc,
-                        &lw.q_proj,
-                        &lw.k_proj,
-                        &lw.v_proj,
+                        &lw.qkv_proj,
+                        lw.qkv_scales.as_ref(),
                         &self.norm_out_buf,
                         0,
                         &self.q_buf,
                         &self.k_buf,
                         &self.v_buf,
-                        &lw.q_bias,
-                        &lw.k_bias,
-                        &lw.v_bias,
+                        &lw.qkv_bias,
                         qkv_bias,
                         num_tokens,
                         h,
                         q_dim,
                         kv_dim,
+                        &lw.q_proj,
+                        &lw.k_proj,
+                        &lw.v_proj,
+                        &lw.q_bias,
+                        &lw.k_bias,
+                        &lw.v_bias,
                     )?;
 
                     let (rope_theta, rotary_dim) = match pos_encoding {

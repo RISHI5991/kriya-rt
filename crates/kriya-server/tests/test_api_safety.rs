@@ -6,7 +6,9 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
-use kriya_server::server::admission::SimpleMockTokenizer;
+use kriya_core::tokenizer::TokenizerError;
+use kriya_server::server::admission::{SimpleMockTokenizer, TokenizerService};
+use kriya_server::server::handlers::StreamingDetokenizer;
 use kriya_server::server::{ServerHandle, ServerMetrics, create_app};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -544,4 +546,229 @@ fn test_untrained_draft_head_env_var_override() {
     unsafe {
         std::env::remove_var("KRIYA_ALLOW_UNTRAINED_DRAFT");
     }
+}
+
+/// Mock tokenizer that decodes token IDs as individual raw UTF-8 bytes,
+/// reproducing byte-level BPE and byte-fallback behavior.
+struct ByteSequenceMockTokenizer;
+
+impl TokenizerService for ByteSequenceMockTokenizer {
+    fn encode(&self, _text: &str, _add_special: bool) -> Result<Vec<u32>, TokenizerError> {
+        Ok(vec![])
+    }
+    fn decode(&self, ids: &[u32], _skip_special: bool) -> Result<String, TokenizerError> {
+        let bytes: Vec<u8> = ids.iter().map(|&id| (id & 0xFF) as u8).collect();
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+    fn encode_chat_messages(
+        &self,
+        _messages: &[(String, String)],
+        _add_generation_prompt: bool,
+    ) -> Result<Vec<u32>, TokenizerError> {
+        Ok(vec![])
+    }
+    fn eos_token_id(&self) -> u32 {
+        0
+    }
+}
+
+#[test]
+fn test_sliding_window_detokenizer_long_sequence_o1_bounds() {
+    let tokenizer = SimpleMockTokenizer::new(151645);
+    let mut detok = StreamingDetokenizer::new(6);
+    let mut streamed_text = String::new();
+    let num_tokens = 2000;
+    let all_tokens: Vec<u32> = (1..=num_tokens).collect();
+
+    let start = std::time::Instant::now();
+    for &tok in &all_tokens {
+        let delta = detok.step(tok, &tokenizer);
+        streamed_text.push_str(&delta);
+
+        // Verify strict O(1) sliding window capacity bound at every iteration
+        assert!(
+            detok.window_tokens().len() <= detok.window_size(),
+            "Window token count {} exceeded configured window size {}",
+            detok.window_tokens().len(),
+            detok.window_size()
+        );
+    }
+    let flushed = detok.flush(&tokenizer);
+    streamed_text.push_str(&flushed);
+    let elapsed = start.elapsed();
+
+    // Verify O(1) runtime: 2,000 token steps should complete in well under 50ms
+    assert!(
+        elapsed.as_millis() < 50,
+        "Streaming detokenization took {:?}, exceeding O(1) bound",
+        elapsed
+    );
+
+    // Verify streamed output matches full sequence decode output bit-for-bit
+    let expected = tokenizer.decode(&all_tokens, true).unwrap();
+    assert_eq!(
+        streamed_text, expected,
+        "Streaming reconstructed text must match full decode output bit-for-bit"
+    );
+}
+
+#[test]
+fn test_sliding_window_detokenizer_multibyte_emoji_and_cjk_split() {
+    let tokenizer = ByteSequenceMockTokenizer;
+    let mut detok = StreamingDetokenizer::new(6);
+
+    // Mixed ASCII, 4-byte UTF-8 emojis, and 3-byte CJK characters
+    let test_string = "Hi 🦀 🚀 and 你好世界!";
+    let input_bytes = test_string.as_bytes();
+
+    let mut streamed_text = String::new();
+    for (i, &b) in input_bytes.iter().enumerate() {
+        let delta = detok.step(b as u32, &tokenizer);
+
+        // Every emitted delta must be valid UTF-8 without corrupted replacement characters
+        assert!(
+            !delta.contains('\u{FFFD}'),
+            "Delta at byte index {i} ('{delta}') leaked Unicode replacement character U+FFFD"
+        );
+        streamed_text.push_str(&delta);
+
+        // Window size should stay bounded: at most W (6) + max multi-byte sequence length (4)
+        assert!(
+            detok.window_tokens().len() <= detok.window_size() + 4,
+            "Window token count {} exceeded bounded limit",
+            detok.window_tokens().len()
+        );
+    }
+    let flushed = detok.flush(&tokenizer);
+    assert!(!flushed.contains('\u{FFFD}'));
+    streamed_text.push_str(&flushed);
+
+    assert_eq!(
+        streamed_text, test_string,
+        "Reconstructed text must match original multi-byte string exactly"
+    );
+}
+
+#[test]
+fn test_sliding_window_detokenizer_terminal_flush_and_eof() {
+    let tokenizer = ByteSequenceMockTokenizer;
+
+    // Case 1: Clean stream completion (all characters fully formed)
+    let mut detok_clean = StreamingDetokenizer::new(6);
+    for &b in b"Clean termination test" {
+        detok_clean.step(b as u32, &tokenizer);
+    }
+    let flush_clean = detok_clean.flush(&tokenizer);
+    assert_eq!(
+        flush_clean, "",
+        "Clean completion should have zero leftover bytes to flush"
+    );
+
+    // Case 2: Interrupted stream ending with incomplete multi-byte UTF-8 sequence
+    let mut detok_truncated = StreamingDetokenizer::new(6);
+    // Send "Hi " followed by only first 2 bytes of crab emoji (0xF0, 0x9F)
+    let incomplete_bytes = [0x48, 0x69, 0x20, 0xF0, 0x9F];
+    let mut streamed = String::new();
+    for &b in &incomplete_bytes {
+        streamed.push_str(&detok_truncated.step(b as u32, &tokenizer));
+    }
+    assert_eq!(
+        streamed, "Hi ",
+        "Incomplete multi-byte sequence must be held back during streaming"
+    );
+
+    // On EOF / close, flush emits the held-back incomplete replacement character
+    let flush_piece = detok_truncated.flush(&tokenizer);
+    assert!(
+        flush_piece.contains('\u{FFFD}'),
+        "Flush must emit pending replacement character on EOF"
+    );
+    // Subsequent flush calls return empty
+    assert_eq!(detok_truncated.flush(&tokenizer), "");
+
+    // Case 3: Immediate EOF on empty stream
+    let mut detok_empty = StreamingDetokenizer::new(6);
+    assert_eq!(detok_empty.flush(&tokenizer), "");
+}
+
+#[tokio::test]
+async fn test_streaming_sse_sliding_window_e2e_long_sequence() {
+    let (handle, mut rx) = make_test_handle(2048, 1024, 10);
+    let app = create_app(handle.clone());
+    let num_tokens = 100;
+
+    let worker = tokio::spawn(async move {
+        if let Some(cmd) = rx.recv().await {
+            for id in 1000..1000 + num_tokens {
+                let _ = cmd.token_tx.send(id);
+                tokio::task::yield_now().await;
+            }
+            drop(cmd.token_tx);
+        }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"long sequence test"}],"stream":true,"model":"test-model"}"#,
+        ))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let mut body_stream = res.into_body().into_data_stream();
+    let mut chunk_count = 0;
+    let mut saw_done = false;
+    let mut full_text = String::new();
+
+    while let Some(chunk_res) = body_stream.next().await {
+        let chunk = chunk_res.unwrap();
+        let text = String::from_utf8_lossy(&chunk);
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    saw_done = true;
+                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(content) = val["choices"][0]["delta"]["content"].as_str() {
+                        full_text.push_str(content);
+                        chunk_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = worker.await;
+    assert!(saw_done, "Terminal event must be data: [DONE]");
+    assert_eq!(
+        chunk_count, num_tokens as usize,
+        "Must emit exactly one SSE chunk per generated token"
+    );
+
+    // Verify ActiveGuard (Invariant 5) was dropped and decremented active_requests to 0
+    let mut cleaned_up = false;
+    for _ in 0..100 {
+        if handle.metrics.active_requests.load(Ordering::Relaxed) == 0 {
+            cleaned_up = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        cleaned_up,
+        "Active requests gauge must return to 0 after stream close (Invariant 5)"
+    );
+
+    // Verify tokens were emitted continuously without corruption
+    assert!(full_text.contains("tok1000"));
+    assert!(full_text.contains("tok1099"));
 }

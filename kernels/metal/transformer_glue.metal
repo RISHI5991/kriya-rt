@@ -12,6 +12,39 @@
 using namespace metal;
 
 // ============================================================================
+// Compile-Time Metal Function Constants (Milestone 1 Optimization)
+// ============================================================================
+constant bool fc_has_qkv_bias       [[function_constant(0)]];
+constant uint fc_activation_variant [[function_constant(1)]];
+constant uint fc_head_dim           [[function_constant(2)]];
+constant uint fc_gqa_ratio          [[function_constant(3)]];
+constant bool fc_apply_qk_norm      [[function_constant(4)]];
+constant bool fc_has_logit_softcap  [[function_constant(5)]];
+constant bool fc_zero_centered      [[function_constant(6)]];
+
+inline bool get_fc_has_qkv_bias() {
+    return is_function_constant_defined(fc_has_qkv_bias) ? fc_has_qkv_bias : false;
+}
+inline uint get_fc_activation_variant() {
+    return is_function_constant_defined(fc_activation_variant) ? fc_activation_variant : 0u;
+}
+inline uint get_fc_head_dim() {
+    return is_function_constant_defined(fc_head_dim) ? fc_head_dim : 0u;
+}
+inline uint get_fc_gqa_ratio() {
+    return is_function_constant_defined(fc_gqa_ratio) ? fc_gqa_ratio : 0u;
+}
+inline bool get_fc_apply_qk_norm() {
+    return is_function_constant_defined(fc_apply_qk_norm) ? fc_apply_qk_norm : false;
+}
+inline bool get_fc_has_logit_softcap() {
+    return is_function_constant_defined(fc_has_logit_softcap) ? fc_has_logit_softcap : false;
+}
+inline bool get_fc_zero_centered() {
+    return is_function_constant_defined(fc_zero_centered) ? fc_zero_centered : false;
+}
+
+// ============================================================================
 // 1. Shared Parameter Structures & BF16 Conversion Helpers
 // ============================================================================
 
@@ -176,22 +209,22 @@ kernel void rms_norm_bf16(
 // ============================================================================
 // Fuses residual addition (x = residual + proj) and RMSNorm into a single kernel dispatch.
 // Eliminates 1 full DRAM read of the hidden state and 1 kernel dispatch per norm layer.
-kernel void fused_residual_add_rms_norm_bf16(
-    device ushort*                 residual_inout  [[buffer(0)]], // [num_tokens, hidden_size]
-    device const ushort*           proj_in         [[buffer(1)]], // [num_tokens, hidden_size]
-    device const ushort*           norm_weight     [[buffer(2)]], // [hidden_size]
-    device ushort*                 output_norm     [[buffer(3)]], // [num_tokens, hidden_size]
-    constant RmsNormParams&        params          [[buffer(4)]],
-    uint                           token_idx       [[threadgroup_position_in_grid]],
-    uint                           tid             [[thread_index_in_threadgroup]],
-    uint                           simd_id         [[simdgroup_index_in_threadgroup]],
-    uint                           simd_lane       [[thread_index_in_simdgroup]]
+inline void fused_residual_add_rms_norm_bf16_impl(
+    device ushort*                 residual_inout,
+    device const ushort*           proj_in,
+    device const ushort*           norm_weight,
+    device ushort*                 output_norm,
+    constant RmsNormParams&        params,
+    uint                           token_idx,
+    uint                           tid,
+    uint                           simd_id,
+    uint                           simd_lane,
+    threadgroup float*             simd_partial_sums
 ) {
     if (token_idx >= params.num_tokens) {
         return;
     }
 
-    threadgroup float simd_partial_sums[8];
     const uint row_base = token_idx * params.hidden_size;
 
     float thread_sum_sq = 0.0f;
@@ -221,13 +254,50 @@ kernel void fused_residual_add_rms_norm_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float rms_scale = simd_partial_sums[0];
-    const float w_offset  = (params.zero_centered_offset != 0u) ? 1.0f : 0.0f;
+    const float w_offset  = get_fc_zero_centered() ? 1.0f : ((params.zero_centered_offset != 0u) ? 1.0f : 0.0f);
 
     for (uint d = tid; d < params.hidden_size; d += 256u) {
         float x = bf16_to_f32(residual_inout[row_base + d]);
         float w = bf16_to_f32(norm_weight[d]) + w_offset;
         output_norm[row_base + d] = f32_to_bf16(x * rms_scale * w);
     }
+}
+
+kernel void fused_residual_add_rms_norm_bf16(
+    device ushort*                 residual_inout  [[buffer(0)]], // [num_tokens, hidden_size]
+    device const ushort*           proj_in         [[buffer(1)]], // [num_tokens, hidden_size]
+    device const ushort*           norm_weight     [[buffer(2)]], // [hidden_size]
+    device ushort*                 output_norm     [[buffer(3)]], // [num_tokens, hidden_size]
+    constant RmsNormParams&        params          [[buffer(4)]],
+    uint                           token_idx       [[threadgroup_position_in_grid]],
+    uint                           tid             [[thread_index_in_threadgroup]],
+    uint                           simd_id         [[simdgroup_index_in_threadgroup]],
+    uint                           simd_lane       [[thread_index_in_simdgroup]]
+) {
+    threadgroup float simd_partial_sums[8];
+    fused_residual_add_rms_norm_bf16_impl(
+        residual_inout, proj_in, norm_weight, output_norm,
+        params, token_idx, tid, simd_id, simd_lane, simd_partial_sums
+    );
+}
+
+/// Fused Residual Add + RMSNorm alias.
+kernel void fused_add_rmsnorm(
+    device ushort*                 residual_inout  [[buffer(0)]], // [num_tokens, hidden_size]
+    device const ushort*           proj_in         [[buffer(1)]], // [num_tokens, hidden_size]
+    device const ushort*           norm_weight     [[buffer(2)]], // [hidden_size]
+    device ushort*                 output_norm     [[buffer(3)]], // [num_tokens, hidden_size]
+    constant RmsNormParams&        params          [[buffer(4)]],
+    uint                           token_idx       [[threadgroup_position_in_grid]],
+    uint                           tid             [[thread_index_in_threadgroup]],
+    uint                           simd_id         [[simdgroup_index_in_threadgroup]],
+    uint                           simd_lane       [[thread_index_in_simdgroup]]
+) {
+    threadgroup float simd_partial_sums[8];
+    fused_residual_add_rms_norm_bf16_impl(
+        residual_inout, proj_in, norm_weight, output_norm,
+        params, token_idx, tid, simd_id, simd_lane, simd_partial_sums
+    );
 }
 
 // ============================================================================
@@ -247,11 +317,12 @@ kernel void fused_gated_activation_bf16(
 
     const float g = bf16_to_f32(gate_in[idx]);
     const float u = bf16_to_f32(up_in[idx]);
+    const uint variant = (get_fc_activation_variant() != 0u) ? get_fc_activation_variant() : params.variant;
 
     float act_g = 0.0f;
-    if (params.variant == 0u) {
+    if (variant == 0u) {
         act_g = g / (1.0f + exp(-g));
-    } else if (params.variant == 1u) {
+    } else if (variant == 1u) {
         // GeGLU (tanh approximation with safe argument clamping)
         constexpr float SQRT_2_OVER_PI = 0.7978845608f;
         float cubic = fma(0.044715f * g, g * g, g);

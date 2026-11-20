@@ -3115,3 +3115,172 @@ fn test_moe_router_parallel_simd_prefix_scan_and_scatter() {
         );
     }
 }
+
+#[test]
+fn test_layer_dispatch_count_is_five_per_layer() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+    let desc = miniature_dense_gqa_descriptor();
+    let executor = kriya_backend_metal::encoder::MetalExecutor::allocate_for_descriptor(
+        &device,
+        &desc,
+        workspace_kernels_dir(),
+    )
+    .expect("Failed to create executor");
+
+    let layer_dispatches = executor.measure_dispatches_per_layer();
+    assert_eq!(
+        layer_dispatches, 5,
+        "Expected exactly 5 dispatches per layer, found {layer_dispatches}"
+    );
+}
+
+#[test]
+fn test_pipeline_cache_function_constants_specialization() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+    let mut cache = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device,
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let config = kriya_backend_metal::encoder::PipelineConstantsConfig {
+        has_qkv_bias: false,
+        activation_variant: 0,
+        head_dim: 64,
+        gqa_ratio: 4,
+        apply_qk_norm: false,
+        has_logit_softcap: false,
+        zero_centered: false,
+    };
+    let cv = config.to_constant_values();
+    let key = format!("q4_aligned_decode_qkv_gemv_2row{}", config.cache_suffix());
+    let pso = cache.get_or_compile_specialized("q4_aligned_decode_qkv_gemv_2row", Some(&cv), &key);
+    assert!(pso.is_ok(), "Specialized PSO compilation failed");
+}
+
+#[test]
+fn test_scaled_aligned_q4_block_and_scales_split_parity() {
+    use kriya_core::tensor::{BlockQ4Group64, BlockQ4ScaleBias, ScaledAlignedQ4Block};
+    assert_eq!(std::mem::size_of::<ScaledAlignedQ4Block>(), 32);
+    assert_eq!(std::mem::align_of::<ScaledAlignedQ4Block>(), 16);
+    assert_eq!(std::mem::size_of::<BlockQ4ScaleBias>(), 4);
+
+    let weights: Vec<f32> = (0..128).map(|i| (i as f32 * 0.1).sin()).collect();
+    let blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&weights).unwrap();
+    let (aligned_qs, scale_biases) = BlockQ4Group64::split_slice(&blocks);
+    assert_eq!(aligned_qs.len(), blocks.len());
+    assert_eq!(scale_biases.len(), blocks.len());
+
+    let reconstructed = BlockQ4Group64::from_split(&aligned_qs, &scale_biases);
+    assert_eq!(reconstructed.len(), blocks.len());
+    let deq_original = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
+    let deq_split = kriya_core::quantizer::dequantize_q4_group64_to_f32(&reconstructed);
+    assert_eq!(deq_original, deq_split);
+}
+
+#[test]
+fn test_consolidated_qkv_matches_separate_projections() {
+    let Some(device) = require_metal_device() else {
+        return;
+    };
+    let queue = device.new_command_queue();
+    let mut cache = kriya_backend_metal::encoder::MetalPipelineCache::from_shader_dir(
+        device.clone(),
+        workspace_kernels_dir(),
+    )
+    .unwrap();
+
+    let k = 64u32;
+    let q_dim = 64u32;
+    let kv_dim = 64u32;
+    let total_rows = q_dim + 2 * kv_dim;
+
+    let weights_flat: Vec<f32> = (0..total_rows * k)
+        .map(|idx| ((idx % 31) as f32 - 15.0) * 0.02)
+        .collect();
+    let blocks = kriya_core::quantizer::quantize_f32_to_q4_group64(&weights_flat).unwrap();
+    let (aligned_qs, scale_biases) = kriya_core::tensor::BlockQ4Group64::split_slice(&blocks);
+
+    let shared = metal::MTLResourceOptions::StorageModeShared;
+    let qs_bytes: &[u8] = bytemuck::cast_slice(&aligned_qs);
+    let sb_bytes: &[u8] = bytemuck::cast_slice(&scale_biases);
+    let qkv_weights_buf =
+        device.new_buffer_with_data(qs_bytes.as_ptr() as *const _, qs_bytes.len() as u64, shared);
+    let qkv_scales_buf =
+        device.new_buffer_with_data(sb_bytes.as_ptr() as *const _, sb_bytes.len() as u64, shared);
+
+    let input_f32: Vec<f32> = (0..k).map(|i| (i as f32 * 0.05).sin()).collect();
+    let input_bf16: Vec<u16> = input_f32
+        .iter()
+        .map(|&x| kriya_core::quantizer::f32_to_bf16_bits(x))
+        .collect();
+    let input_bytes: &[u8] = bytemuck::cast_slice(&input_bf16);
+    let input_buf = device.new_buffer_with_data(
+        input_bytes.as_ptr() as *const _,
+        input_bytes.len() as u64,
+        shared,
+    );
+
+    let out_q_buf = device.new_buffer((q_dim * 2) as u64, shared);
+    let out_k_buf = device.new_buffer((kv_dim * 2) as u64, shared);
+    let out_v_buf = device.new_buffer((kv_dim * 2) as u64, shared);
+    let dummy_bias = device.new_buffer(4, shared);
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+
+    let pso = cache
+        .get_or_compile("q4_aligned_decode_qkv_gemv_2row")
+        .unwrap();
+    let params = kriya_backend_metal::encoder::QkvGemmParams {
+        m: 1,
+        k,
+        num_k_blocks: k.div_ceil(64),
+        q_dim,
+        k_dim: kv_dim,
+        v_dim: kv_dim,
+        has_bias: 0,
+        _pad: 0,
+    };
+    enc.set_compute_pipeline_state(&pso);
+    enc.set_buffer(0, Some(&qkv_weights_buf), 0);
+    enc.set_buffer(1, Some(&qkv_scales_buf), 0);
+    enc.set_buffer(2, Some(&input_buf), 0);
+    enc.set_buffer(3, Some(&out_q_buf), 0);
+    enc.set_buffer(4, Some(&out_k_buf), 0);
+    enc.set_buffer(5, Some(&out_v_buf), 0);
+    enc.set_buffer(6, Some(&dummy_bias), 0);
+    enc.set_bytes(
+        7,
+        std::mem::size_of::<kriya_backend_metal::encoder::QkvGemmParams>() as u64,
+        &params as *const _ as *const _,
+    );
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new((total_rows.div_ceil(8) as u64).min(128), 1, 1),
+        metal::MTLSize::new(128, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let out_q =
+        unsafe { std::slice::from_raw_parts(out_q_buf.contents() as *const u16, q_dim as usize) };
+
+    // Reference CPU calculation
+    let cpu_dequant = kriya_core::quantizer::dequantize_q4_group64_to_f32(&blocks);
+    for row in 0..q_dim as usize {
+        let mut dot = 0.0f32;
+        for c in 0..k as usize {
+            dot += cpu_dequant[row * k as usize + c] * input_f32[c];
+        }
+        let gpu_val = kriya_core::quantizer::bf16_bits_to_f32(out_q[row]);
+        assert!(
+            (dot - gpu_val).abs() < 0.05,
+            "Mismatch at Q row {row}: cpu={dot}, gpu={gpu_val}"
+        );
+    }
+}

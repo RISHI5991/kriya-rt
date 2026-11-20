@@ -114,6 +114,102 @@ pub struct BlockQ4Group64 {
     pub qs: [u8; 32],
 }
 
+/// 16-byte aligned 32-byte quantized weight block containing 64 4-bit unsigned nibbles.
+/// Guarantees 100% coalesced 128-bit vector loads (`packed_uint4` / `simdgroup_load`)
+/// on Apple Silicon unified memory controllers without crossing cache line boundaries.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct ScaledAlignedQ4Block {
+    pub qs: [u8; 32],
+}
+
+impl ScaledAlignedQ4Block {
+    #[inline]
+    pub const fn new(qs: [u8; 32]) -> Self {
+        Self { qs }
+    }
+}
+
+/// 4-byte packed multiplicative scale and additive zero-point bias for a 64-element Q4 block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct BlockQ4ScaleBias {
+    /// Raw `bf16` bits for the group multiplicative scale.
+    pub scale_bf16: u16,
+    /// Raw `bf16` bits for the group additive bias / zero-point.
+    pub bias_bf16: u16,
+}
+
+impl BlockQ4ScaleBias {
+    #[inline]
+    pub const fn new(scale_bf16: u16, bias_bf16: u16) -> Self {
+        Self {
+            scale_bf16,
+            bias_bf16,
+        }
+    }
+}
+
+impl BlockQ4Group64 {
+    /// Splits a slice of legacy 36-byte `BlockQ4Group64` blocks into separate 16-byte aligned
+    /// 32-byte weight blocks and 4-byte scale/bias pairs.
+    pub fn split_slice(blocks: &[Self]) -> (Vec<ScaledAlignedQ4Block>, Vec<BlockQ4ScaleBias>) {
+        let mut qs = Vec::with_capacity(blocks.len());
+        let mut scales = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let scale_bf16 = b.scale_bf16;
+            let bias_bf16 = b.bias_bf16;
+            let block_qs = b.qs;
+            qs.push(ScaledAlignedQ4Block { qs: block_qs });
+            scales.push(BlockQ4ScaleBias {
+                scale_bf16,
+                bias_bf16,
+            });
+        }
+        (qs, scales)
+    }
+
+    /// Reconstructs a vector of `BlockQ4Group64` blocks from split weight and scale/bias slices.
+    pub fn from_split(qs: &[ScaledAlignedQ4Block], scales: &[BlockQ4ScaleBias]) -> Vec<Self> {
+        assert_eq!(
+            qs.len(),
+            scales.len(),
+            "Weight and scale/bias slices must have matching lengths"
+        );
+        qs.iter()
+            .zip(scales.iter())
+            .map(|(q, s)| Self {
+                scale_bf16: s.scale_bf16,
+                bias_bf16: s.bias_bf16,
+                qs: q.qs,
+            })
+            .collect()
+    }
+
+    #[inline]
+    pub fn to_split(&self) -> (ScaledAlignedQ4Block, BlockQ4ScaleBias) {
+        let scale_bf16 = self.scale_bf16;
+        let bias_bf16 = self.bias_bf16;
+        let block_qs = self.qs;
+        (
+            ScaledAlignedQ4Block { qs: block_qs },
+            BlockQ4ScaleBias {
+                scale_bf16,
+                bias_bf16,
+            },
+        )
+    }
+
+    #[inline]
+    pub fn from_split_single(q: ScaledAlignedQ4Block, s: BlockQ4ScaleBias) -> Self {
+        Self {
+            scale_bf16: s.scale_bf16,
+            bias_bf16: s.bias_bf16,
+            qs: q.qs,
+        }
+    }
+}
+
 /// 2-bit Group-128 Quantized Block (`Q2_G128`) used for extreme compression inference.
 /// Stores 128 2-bit unsigned codes packed into 32 bytes alongside shared `bf16` scale and bias (36 bytes total).
 #[repr(C, packed)]
@@ -208,6 +304,38 @@ impl<'a> TensorView<'a> {
             )));
         }
         Ok(bytemuck::cast_slice(self.data))
+    }
+
+    /// Safe zero-copy cast into a slice of 16-byte aligned `ScaledAlignedQ4Block` blocks.
+    /// Fails safely with `TensorError::AlignmentError` if pointer is not 16-byte aligned.
+    pub fn as_aligned_q4_blocks(&self) -> Result<&'a [ScaledAlignedQ4Block], TensorError> {
+        let align = std::mem::align_of::<ScaledAlignedQ4Block>();
+        let offset = self.data.as_ptr() as usize;
+        if offset % align != 0 {
+            return Err(TensorError::AlignmentError { offset, align });
+        }
+        bytemuck::try_cast_slice(self.data).map_err(|e| {
+            TensorError::InvalidMetadata(format!("Failed to cast ScaledAlignedQ4Block slice: {e}"))
+        })
+    }
+
+    /// Alias for `as_aligned_q4_blocks`.
+    #[inline]
+    pub fn as_scaled_aligned_q4_blocks(&self) -> Result<&'a [ScaledAlignedQ4Block], TensorError> {
+        self.as_aligned_q4_blocks()
+    }
+
+    /// Safe zero-copy cast into a slice of `BlockQ4ScaleBias` blocks.
+    /// Fails safely with `TensorError::AlignmentError` if pointer is not 2-byte aligned.
+    pub fn as_q4_scale_bias_blocks(&self) -> Result<&'a [BlockQ4ScaleBias], TensorError> {
+        let align = std::mem::align_of::<BlockQ4ScaleBias>();
+        let offset = self.data.as_ptr() as usize;
+        if offset % align != 0 {
+            return Err(TensorError::AlignmentError { offset, align });
+        }
+        bytemuck::try_cast_slice(self.data).map_err(|e| {
+            TensorError::InvalidMetadata(format!("Failed to cast BlockQ4ScaleBias slice: {e}"))
+        })
     }
 
     /// Zero-copy cast into a slice of `BlockQ2Group128` blocks for `Q2Group128` tensors.
@@ -373,5 +501,56 @@ mod tests {
         assert_eq!(DType::FP8E4M3.byte_size_for_elements(100), 100);
         // Q4KvGroup32: 100 elements = ceil(100/32) = 4 blocks * 20 bytes = 80 bytes
         assert_eq!(DType::Q4KvGroup32.byte_size_for_elements(100), 80);
+    }
+
+    #[test]
+    fn test_scaled_aligned_q4_block_memory_alignment() {
+        assert_eq!(std::mem::size_of::<ScaledAlignedQ4Block>(), 32);
+        assert_eq!(std::mem::align_of::<ScaledAlignedQ4Block>(), 16);
+        assert_eq!(std::mem::size_of::<BlockQ4ScaleBias>(), 4);
+        assert_eq!(std::mem::align_of::<BlockQ4ScaleBias>(), 2);
+
+        let blocks: Vec<BlockQ4Group64> = (0..8)
+            .map(|i| BlockQ4Group64 {
+                scale_bf16: (i * 10) as u16,
+                bias_bf16: (i * 5) as u16,
+                qs: [i as u8; 32],
+            })
+            .collect();
+
+        let (split_qs, split_sb) = BlockQ4Group64::split_slice(&blocks);
+        assert_eq!(split_qs.len(), 8);
+        assert_eq!(split_sb.len(), 8);
+        assert_eq!(split_qs[3].qs[0], 3);
+        assert_eq!(split_sb[3].scale_bf16, 30);
+        assert_eq!(split_sb[3].bias_bf16, 15);
+
+        let reconstructed = BlockQ4Group64::from_split(&split_qs, &split_sb);
+        assert_eq!(reconstructed.len(), 8);
+        for i in 0..8 {
+            let rec_s = reconstructed[i].scale_bf16;
+            let rec_b = reconstructed[i].bias_bf16;
+            let rec_qs = reconstructed[i].qs;
+            let orig_s = blocks[i].scale_bf16;
+            let orig_b = blocks[i].bias_bf16;
+            let orig_qs = blocks[i].qs;
+            assert_eq!(rec_s, orig_s);
+            assert_eq!(rec_b, orig_b);
+            assert_eq!(rec_qs, orig_qs);
+        }
+
+        let single = blocks[4].to_split();
+        assert_eq!(single.0.qs[0], 4);
+        assert_eq!(single.1.scale_bf16, 40);
+        let roundtrip_single = BlockQ4Group64::from_split_single(single.0, single.1);
+        let rs_s = roundtrip_single.scale_bf16;
+        let rs_b = roundtrip_single.bias_bf16;
+        let rs_qs = roundtrip_single.qs;
+        let b4_s = blocks[4].scale_bf16;
+        let b4_b = blocks[4].bias_bf16;
+        let b4_qs = blocks[4].qs;
+        assert_eq!(rs_s, b4_s);
+        assert_eq!(rs_b, b4_b);
+        assert_eq!(rs_qs, b4_qs);
     }
 }

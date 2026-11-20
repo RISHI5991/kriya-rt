@@ -6,7 +6,9 @@ pub mod hub_fetcher;
 pub mod runtime;
 pub mod server;
 
-pub use runtime::{BenchmarkReport, BenchmarkSample, EngineRuntime, orca_batch_worker_loop};
+pub use runtime::{
+    BenchmarkReport, BenchmarkSample, Depth2PipelinedWorker, EngineRuntime, orca_batch_worker_loop,
+};
 pub use server::{
     ActiveStreamState, EnqueueRequestCmd, ServerHandle, ServerMetrics, TokenizerService, create_app,
 };

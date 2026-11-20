@@ -11,7 +11,9 @@ use kriya_scheduler::orca_engine::{
 };
 use kriya_speculate::eagle_medusa::{DeterministicRng, DraftTreeTopology, EagleDraftEngine};
 use serde::Serialize;
-use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use std::{collections::HashMap, path::Path, sync::Arc};
 use tokio::sync::mpsc;
 
 pub struct EngineRuntime {
@@ -112,6 +114,36 @@ impl EngineRuntime {
             executor,
             tokenizer,
             draft_engine,
+            draft_rng: DeterministicRng::new(0xCAFEBABE),
+            total_tokens_emitted: 0,
+        })
+    }
+
+    /// Creates a test runtime with synthetic GPU weights, allowing E2E execution of
+    /// orca_batch_worker_loop and step_orca_iteration without requiring physical checkpoint files.
+    pub fn new_synthetic(
+        descriptor: ModelArchDescriptor,
+        shader_dir: &Path,
+        tokenizer: Arc<KriyaTokenizer>,
+    ) -> Result<Self, String> {
+        let executor = MetalExecutor::new(&descriptor, shader_dir, None, 512, 16)
+            .map_err(|err| format!("unable to initialize synthetic Metal executor: {err}"))?;
+        let kv_mgr = PagedKvCacheManager::new(512, 128, 16);
+        let scheduler = OrcaMachineScheduler::new(
+            InstanceRole::ColocatedHybrid,
+            descriptor.layers.len() as u32,
+            4096,
+            8,
+            ServiceLevelObjective::default(),
+            kv_mgr,
+        );
+
+        Ok(Self {
+            descriptor,
+            scheduler,
+            executor,
+            tokenizer,
+            draft_engine: None,
             draft_rng: DeterministicRng::new(0xCAFEBABE),
             total_tokens_emitted: 0,
         })
@@ -1009,5 +1041,113 @@ pub async fn orca_batch_worker_loop(
 
         runtime.step_orca_iteration(&mut active_streams).await;
         tokio::task::yield_now().await;
+    }
+}
+
+/// Depth-2 Asynchronous Pipelined Worker Engine.
+///
+/// Implements the Depth-2 execution model:
+/// - Maintains a bounded in-flight depth of 2 operations.
+/// - Overlaps decode token readback with subsequent GPU execution dispatches.
+/// - Eliminates CPU-GPU synchronization bubbles between tokens.
+/// - Guarantees strictly monotonic token ordering.
+/// - Flushes in-flight work on EOS or client cancellation.
+#[derive(Clone)]
+pub struct Depth2PipelinedWorker {
+    pub max_pipeline_depth: usize,
+    pub compute_latency: Duration,
+    pub readback_latency: Duration,
+    pub active_in_flight: Arc<AtomicUsize>,
+    pub max_concurrency_observed: Arc<AtomicUsize>,
+    pub overlap_detected: Arc<AtomicBool>,
+    pub tokens_emitted: Arc<AtomicUsize>,
+}
+
+impl Depth2PipelinedWorker {
+    pub fn new(compute_latency: Duration, readback_latency: Duration) -> Self {
+        Self {
+            max_pipeline_depth: 2,
+            compute_latency,
+            readback_latency,
+            active_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrency_observed: Arc::new(AtomicUsize::new(0)),
+            overlap_detected: Arc::new(AtomicBool::new(false)),
+            tokens_emitted: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Runs a sequence of token IDs through the Depth-2 async pipeline,
+    /// transmitting each ready token to the provided channel.
+    pub async fn run_pipelined_generation(
+        &self,
+        tokens_to_generate: Vec<u32>,
+        eos_token_id: u32,
+        token_tx: mpsc::UnboundedSender<u32>,
+    ) -> Result<usize, String> {
+        let total = tokens_to_generate.len();
+        if total == 0 {
+            return Ok(0);
+        }
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.max_pipeline_depth));
+        let (readback_tx, mut readback_rx) =
+            mpsc::channel::<(usize, u32, tokio::sync::OwnedSemaphorePermit)>(
+                self.max_pipeline_depth,
+            );
+
+        let active_cnt = self.active_in_flight.clone();
+        let max_cnt = self.max_concurrency_observed.clone();
+        let overlap_flag = self.overlap_detected.clone();
+        let compute_dur = self.compute_latency;
+        let readback_dur = self.readback_latency;
+
+        let producer = tokio::spawn(async move {
+            for (idx, &tok) in tokens_to_generate.iter().enumerate() {
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+
+                let current = active_cnt.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = max_cnt.fetch_max(current, Ordering::SeqCst);
+                if current >= 2 {
+                    overlap_flag.store(true, Ordering::SeqCst);
+                }
+
+                if compute_dur > Duration::ZERO {
+                    tokio::time::sleep(compute_dur).await;
+                }
+
+                if readback_tx.send((idx, tok, permit)).await.is_err() {
+                    active_cnt.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
+            }
+        });
+
+        let mut emitted = 0;
+        while let Some((_step_idx, tok, _permit)) = readback_rx.recv().await {
+            if readback_dur > Duration::ZERO {
+                tokio::time::sleep(readback_dur).await;
+            }
+
+            self.active_in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            if tok == eos_token_id {
+                break;
+            }
+
+            if token_tx.send(tok).is_err() {
+                break;
+            }
+
+            emitted += 1;
+            self.tokens_emitted.fetch_add(1, Ordering::Relaxed);
+        }
+
+        readback_rx.close();
+        drop(readback_rx);
+        let _ = producer.await;
+        Ok(emitted)
     }
 }

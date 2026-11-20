@@ -34,3 +34,6 @@ models/
 # Benchmark outputs
 benchmarks/reports/*.json
 
+# Agent coordinator artifacts
+.agents/
+

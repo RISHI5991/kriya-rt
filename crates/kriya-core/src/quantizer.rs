@@ -7,7 +7,10 @@ use crate::descriptor::{
     ModelArchDescriptor, NormVariant, PhaseRoutingPolicy, PositionalEncoding,
     SequenceMixerDescriptor,
 };
-use crate::tensor::{BlockQ2Group128, BlockQ3Group64, BlockQ4Group64, DType, TensorError};
+use crate::tensor::{
+    BlockQ2Group128, BlockQ3Group64, BlockQ4Group64, BlockQ4ScaleBias, DType, ScaledAlignedQ4Block,
+    TensorError,
+};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -529,6 +532,10 @@ pub enum SavedTensorPayload {
     Bf16(Vec<u16>),
     /// 4-bit Group-64 affine quantized blocks (used for 2D projection & embedding matrices).
     Q4Group64(Vec<BlockQ4Group64>),
+    /// 16-byte aligned 4-bit Group-64 quantized weights (32 bytes per block).
+    Q4SplitWeights(Vec<ScaledAlignedQ4Block>),
+    /// 4-byte packed scale and bias headers (4 bytes per block).
+    Q4SplitScales(Vec<BlockQ4ScaleBias>),
     /// 2-bit Group-128 affine quantized blocks.
     Q2Group128(Vec<BlockQ2Group128>),
     /// 3-bit Group-64 affine quantized blocks.
@@ -556,6 +563,14 @@ pub fn write_mixed_safetensors<P: AsRef<Path>>(
             SavedTensorPayload::Q4Group64(blocks) => (
                 "Q4_G64",
                 blocks.len() * std::mem::size_of::<BlockQ4Group64>(),
+            ),
+            SavedTensorPayload::Q4SplitWeights(blocks) => (
+                "Q4_G64_WEIGHTS",
+                blocks.len() * std::mem::size_of::<ScaledAlignedQ4Block>(),
+            ),
+            SavedTensorPayload::Q4SplitScales(blocks) => (
+                "Q4_G64_SCALES",
+                blocks.len() * std::mem::size_of::<BlockQ4ScaleBias>(),
             ),
             SavedTensorPayload::Q2Group128(blocks) => (
                 "Q2_G128",
@@ -614,6 +629,14 @@ pub fn write_mixed_safetensors<P: AsRef<Path>>(
             SavedTensorPayload::Q4Group64(blocks) => (
                 bytemuck::cast_slice(blocks.as_slice()),
                 blocks.len() * std::mem::size_of::<BlockQ4Group64>(),
+            ),
+            SavedTensorPayload::Q4SplitWeights(blocks) => (
+                bytemuck::cast_slice(blocks.as_slice()),
+                blocks.len() * std::mem::size_of::<ScaledAlignedQ4Block>(),
+            ),
+            SavedTensorPayload::Q4SplitScales(blocks) => (
+                bytemuck::cast_slice(blocks.as_slice()),
+                blocks.len() * std::mem::size_of::<BlockQ4ScaleBias>(),
             ),
             SavedTensorPayload::Q2Group128(blocks) => (
                 bytemuck::cast_slice(blocks.as_slice()),

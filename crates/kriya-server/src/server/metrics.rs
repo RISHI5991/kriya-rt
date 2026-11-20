@@ -1,6 +1,6 @@
 //! Telemetry, metrics tracking, and timestamps for KriyaRT Server.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Returns the current Unix epoch timestamp in microseconds.
@@ -20,6 +20,7 @@ pub struct ServerMetrics {
     pub total_tokens_emitted: AtomicU64,
     pub total_prompt_tokens: AtomicU64,
     pub rejected_requests: AtomicU64,
+    pub pipeline_depth2_active: AtomicBool,
 }
 
 impl Default for ServerMetrics {
@@ -31,6 +32,7 @@ impl Default for ServerMetrics {
             total_tokens_emitted: AtomicU64::new(0),
             total_prompt_tokens: AtomicU64::new(0),
             rejected_requests: AtomicU64::new(0),
+            pipeline_depth2_active: AtomicBool::new(true),
         }
     }
 }

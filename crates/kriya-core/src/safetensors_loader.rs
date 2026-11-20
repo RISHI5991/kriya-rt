@@ -5,7 +5,8 @@
 //! MLX 4-bit affine Q4 group-64 repacking into [`BlockQ4Group64`].
 
 use crate::tensor::{
-    BlockQ4Group64, DType, MappedWeightArchive, PlacementUnit, TensorDescriptor, TensorError,
+    BlockQ4Group64, BlockQ4ScaleBias, DType, MappedWeightArchive, PlacementUnit,
+    ScaledAlignedQ4Block, TensorDescriptor, TensorError,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -271,6 +272,16 @@ impl ShardedCheckpointLoader {
         Ok(packed_blocks)
     }
 
+    /// Packs MLX-style 4-bit affine quantized data into separate 16-byte aligned 32B weights
+    /// and 4B scale/bias headers for zero-copy 16-byte coalesced GPU loads.
+    pub fn pack_mlx_affine_q4_split(
+        &self,
+        prefix: &str,
+    ) -> Result<(Vec<ScaledAlignedQ4Block>, Vec<BlockQ4ScaleBias>), TensorError> {
+        let blocks = self.pack_mlx_affine_q4_group64(prefix)?;
+        Ok(BlockQ4Group64::split_slice(&blocks))
+    }
+
     /// Asynchronously prefetches all tensors belonging to a specific transformer layer from SSD (`MADV_WILLNEED`).
     pub fn prefetch_layer(&self, layer_idx: usize) {
         let prefix = format!("model.layers.{layer_idx}.");
@@ -330,6 +341,16 @@ pub fn pack_mlx_affine_q4_group64(
             }
         })
         .collect()
+}
+
+/// Packs MLX-style 4-bit affine quantized data into separate [`ScaledAlignedQ4Block`] and [`BlockQ4ScaleBias`] slices.
+pub fn pack_mlx_affine_q4_split(
+    weight_nibbles: &[u8],
+    scales_bf16_raw: &[u16],
+    biases_bf16_raw: &[u16],
+) -> (Vec<ScaledAlignedQ4Block>, Vec<BlockQ4ScaleBias>) {
+    let blocks = pack_mlx_affine_q4_group64(weight_nibbles, scales_bf16_raw, biases_bf16_raw);
+    BlockQ4Group64::split_slice(&blocks)
 }
 
 /// Computes the SHA-256 checksum hex string of a file on disk.
