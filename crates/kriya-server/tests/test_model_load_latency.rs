@@ -20,11 +20,12 @@ fn test_cold_start_model_load_latency() {
     let model_dir = root.join("models/qwen2.5-0.5b-instruct-kriya-q4");
     let kernels_dir = root.join("kernels/metal");
 
-    let has_weights = model_dir.join("model.safetensors").exists()
-        || model_dir.join("model.safetensors.index.json").exists();
+    let has_weights = (model_dir.join("model.safetensors").exists()
+        || model_dir.join("model.safetensors.index.json").exists())
+        && model_dir.join("tokenizer.json").exists();
     if !has_weights {
         println!(
-            "Model checkpoint weights not found in {}, skipping.",
+            "Model checkpoint weights or tokenizer not found in {}, skipping.",
             model_dir.display()
         );
         return;
